@@ -237,4 +237,25 @@ echo exit=0 expected=0
 linuxemu_dynamic_smoke_failures=0
 ```
 
-This establishes a real musl dynamic-linker path for the pinned BusyBox commands. General shared-library file mapping, rootfs path translation, guest threading, guest signals, decoded instruction boundaries, and the broader Linux syscall surface remain outstanding.
+This establishes a real musl dynamic-linker path for the pinned BusyBox commands. General shared-library file mapping, rootfs path translation, guest threading, guest signals, and the broader Linux syscall surface remain outstanding.
+
+## Phase 1 execution-core hardening
+
+The initial single-file prototype was divided into explicit ELF loading, guest memory, ARM patching, trap/TLS, syscall, runtime/process-entry, and main modules. This keeps host state ownership and ABI translation boundaries visible before the syscall surface grows.
+
+Loader hardening now includes:
+
+- requesting every guest mapping without `MAP_FIXED` and rejecting any address QNX cannot place exactly, preventing an occupied host range from being overwritten;
+- validating ELF identity/version/header sizes, machine and type, program-header file bounds, segment flags, W+X segments, power-of-two alignment and virtual/file congruence;
+- rejecting Thumb entry points until Thumb decoding exists;
+- accepting only one absolute, normalized interpreter path and verifying its resolved host path remains beneath `LINUXEMU_ROOT`;
+- requiring section headers and patching only aligned `SHT_PROGBITS | SHF_EXECINSTR` ranges whose file and virtual offsets match an executable `PT_LOAD`;
+- validating entry points against mapped executable ranges before changing mappings to their final permissions.
+
+The negative loader suite rejects corrupted magic and machine fields, Thumb entry, missing section metadata, truncated headers, invalid alignment, out-of-file segments, W+X segments, mismatched executable-section metadata, overlapping load ranges, a relative interpreter path, and an intentionally occupied static guest address. Its result is:
+
+```text
+linuxemu_loader_negative_failures=0
+```
+
+The original four static guests and the pinned Alpine dynamic `true` and `echo` guests continue to pass after the refactor.

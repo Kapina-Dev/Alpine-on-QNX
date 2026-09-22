@@ -1,0 +1,67 @@
+#ifndef LINUXEMU_H
+#define LINUXEMU_H
+
+#define _QNX_SOURCE 1
+#include <sys/elf.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <ucontext.h>
+
+#define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
+#define MAX_LOAD_SEGMENTS 32
+#define MAX_PATCHES 4096
+#define GUEST_MIN_ADDRESS 0x00010000u
+#define GUEST_MAX_ADDRESS 0x70000000u
+#define GUEST_STACK_SIZE (1024u * 1024u)
+#define MAIN_ET_DYN_BIAS 0x20000000u
+#define INTERPRETER_BIAS 0x60000000u
+
+struct guest_image {
+    uintptr_t entry;
+    uintptr_t start_entry;
+    uintptr_t interpreter_base;
+    uintptr_t program_headers;
+    uint32_t program_header_size;
+    uint32_t program_header_count;
+};
+
+struct elf_object {
+    uintptr_t entry;
+    uintptr_t load_bias;
+    uintptr_t program_headers;
+    uint32_t program_header_size;
+    uint32_t program_header_count;
+};
+
+uintptr_t align_down(uintptr_t value, uintptr_t alignment);
+uintptr_t align_up(uintptr_t value, uintptr_t alignment);
+int read_exact_at(int fd, void *buffer, size_t length, off_t offset);
+
+int guest_memory_initialize(long page_size);
+int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
+    uintptr_t load_bias, off_t file_size);
+int guest_memory_finalize(void);
+int guest_memory_is_executable(uintptr_t address, size_t length);
+size_t guest_memory_segment_count(void);
+
+int arm_patch_range(uintptr_t start, size_t length);
+const uint32_t *arm_patch_original(uintptr_t address);
+size_t arm_patch_count(void);
+
+int load_guest_image(const char *path, struct guest_image *image);
+
+void runtime_initialize(long page_size, int trace_enabled);
+long runtime_page_size(void);
+int runtime_trace_enabled(void);
+uint32_t runtime_guest_tls(void);
+void runtime_set_guest_tls(uint32_t value);
+uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
+    const struct guest_image *image);
+void linuxemu_enter_guest(uintptr_t entry, uintptr_t stack_pointer);
+
+void linux_syscall_dispatch(ucontext_t *context);
+int install_guest_traps(void);
+
+#endif

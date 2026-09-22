@@ -37,6 +37,12 @@ Run the minimal Linux guest suite:
 sh scripts/run-linuxemu-smoke.sh
 ```
 
+Run malformed-ELF and occupied-address rejection tests:
+
+```sh
+sh scripts/run-loader-negative-tests.sh
+```
+
 Fetch the pinned Alpine 3.24.2 armhf fixture on the laptop:
 
 ```sh
@@ -51,6 +57,16 @@ sh scripts/run-dynamic-smoke.sh
 
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
+## Execution-core layout
+
+- `elf_loader.c`: ELF and interpreter validation, executable-section selection, and load orchestration.
+- `guest_memory.c`: guest address ownership, collision-safe mappings, final permissions, and cache synchronization.
+- `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
+- `trap.c`: SIGILL/SIGSEGV dispatch and Linux ARM kuser helpers.
+- `linux_syscall.c`: the currently supported Linux syscall translations.
+- `runtime.c`: process entry, guest stack, auxiliary vectors, and single-thread TLS state.
+- `linuxemu.c`: initialization and handoff only.
+
 ## Current limits
 
 - Dynamic support is currently limited to the pinned musl/BusyBox smoke path; shared-library file mapping and general rootfs path translation remain incomplete.
@@ -58,4 +74,5 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
 - Initial `argc`/`argv`/`envp` and core auxiliary vectors.
 - Only `write`, `exit`, and `exit_group` are translated.
-- Executable-segment scanning currently targets the exact ARM `svc #0` word. A section-aware or decoded patch pass is required before accepting general binaries.
+- ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
+- Section headers are currently required so the loader can avoid patching embedded data in executable segments.

@@ -60,8 +60,14 @@ set -x
     "$project_dir/native-probes/emulated-tls-read.c"
 "$cc" $common_flags -o "$build_dir/mprotect-subrange" \
     "$project_dir/native-probes/mprotect-subrange.c"
-"$cc" $common_flags -std=gnu99 -marm -o "$project_dir/build/linuxemu" \
-    "$project_dir/src/linuxemu.c"
+"$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \
+    -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c
+"$cc" $common_flags -std=gnu99 -marm -DLINUXEMU_TESTING=1 \
+    -I"$project_dir/src" -o "$project_dir/build/linuxemu-loader-test" \
+    "$project_dir"/src/*.c
+"$cc" $common_flags -std=gnu99 -marm \
+    -o "$project_dir/build/elf-fixture-tool" \
+    "$project_dir/tests/elf-fixture-tool.c"
 
 mkdir -p "$project_dir/build/guest-tests"
 for guest in write-exit unknown-syscall exit-status initial-stack; do
@@ -87,4 +93,6 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-thumb"
 "$sdk_root/bin/readelf" -h "$build_dir/mprotect-subrange"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
+"$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu-loader-test"
+"$sdk_root/bin/readelf" -h "$project_dir/build/elf-fixture-tool"
 "$sdk_root/bin/readelf" -l "$project_dir/build/guest-tests/write-exit"
