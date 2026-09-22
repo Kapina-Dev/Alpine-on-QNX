@@ -32,6 +32,12 @@ static int trace_enabled;
 static uint32_t guest_tls_pointer;
 extern char **environ;
 
+static int guest_environment_entry(const char *value)
+{
+    return strncmp(value, "LINUXEMU_", 9) != 0 &&
+        strncmp(value, "LD_LIBRARY_PATH=", 16) != 0;
+}
+
 __asm__(
     ".text\n"
     ".align 2\n"
@@ -126,7 +132,8 @@ uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
     lower_bound = (uintptr_t)mapping;
     cursor = lower_bound + GUEST_STACK_SIZE;
 
-    while (environ[environment_count] != 0) environment_count++;
+    for (i = 0; environ[i] != 0; ++i)
+        if (guest_environment_entry(environ[i])) environment_count++;
     argument_addresses = calloc((size_t)guest_argc,
         sizeof(*argument_addresses));
     environment_addresses = calloc(environment_count,
@@ -134,11 +141,14 @@ uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
     if (argument_addresses == 0 ||
         (environment_count != 0 && environment_addresses == 0)) goto fail;
 
-    for (i = environment_count; i != 0; --i) {
-        uintptr_t address = push_bytes(&cursor, lower_bound, environ[i - 1],
-            strlen(environ[i - 1]) + 1);
+    environment_count = 0;
+    for (i = 0; environ[i] != 0; ++i) {
+        uintptr_t address;
+        if (!guest_environment_entry(environ[i])) continue;
+        address = push_bytes(&cursor, lower_bound, environ[i],
+            strlen(environ[i]) + 1);
         if (address == 0) goto fail;
-        environment_addresses[i - 1] = (uint32_t)address;
+        environment_addresses[environment_count++] = (uint32_t)address;
     }
     for (i = (size_t)guest_argc; i != 0; --i) {
         uintptr_t address = push_bytes(&cursor, lower_bound, guest_argv[i - 1],

@@ -12,6 +12,24 @@ static char guest_cwd[PATH_MAX] = "/";
 
 static int normalize_guest_path(const char *path, char *output, size_t size);
 
+static int resolve_guest_device(const char *guest_path, char *host_path,
+    size_t host_path_size)
+{
+    static const char *const devices[] = { "/dev/null" };
+    size_t i;
+
+    for (i = 0; i != ARRAY_COUNT(devices); ++i) {
+        if (strcmp(guest_path, devices[i]) != 0) continue;
+        if (strlen(devices[i]) + 1 > host_path_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        strcpy(host_path, devices[i]);
+        return 1;
+    }
+    return 0;
+}
+
 static int resolve_guest_symlinks(const char *normalized, int allow_missing_leaf,
     char *resolved, size_t resolved_size)
 {
@@ -173,6 +191,8 @@ int guest_path_resolve(const char *path, int allow_missing_leaf,
 
     if (root_path[0] == '\0' ||
         normalize_guest_path(path, guest_path, sizeof(guest_path)) != 0) return -1;
+    length = resolve_guest_device(guest_path, host_path, host_path_size);
+    if (length != 0) return length > 0 ? 0 : -1;
     if (resolve_guest_symlinks(guest_path, allow_missing_leaf,
             resolved_guest_path, sizeof(resolved_guest_path)) != 0) return -1;
     length = snprintf(candidate, sizeof(candidate), "%s%s", root_path,
@@ -202,6 +222,8 @@ int guest_path_resolve_nofollow(const char *path, char *host_path,
     if (root_path[0] == '\0' ||
         normalize_guest_path(path, guest_path, sizeof(guest_path)) != 0)
         return -1;
+    length = resolve_guest_device(guest_path, host_path, host_path_size);
+    if (length != 0) return length > 0 ? 0 : -1;
     if (strcmp(guest_path, "/") == 0) {
         if (strlen(root_path) + 1 > host_path_size) {
             errno = ENAMETOOLONG;
@@ -287,4 +309,58 @@ int guest_path_readlink(const char *path, char *buffer, size_t size)
         return -1;
     count = readlink(candidate, buffer, size);
     return count < 0 ? -1 : (int)count;
+}
+
+int guest_path_chdir(const char *path)
+{
+    char normalized[PATH_MAX];
+    char resolved[PATH_MAX];
+    char host_path[PATH_MAX];
+    struct stat status;
+    int length;
+
+    if (normalize_guest_path(path, normalized, sizeof(normalized)) != 0 ||
+        resolve_guest_symlinks(normalized, 0, resolved, sizeof(resolved)) != 0)
+        return -1;
+    length = snprintf(host_path, sizeof(host_path), "%s%s", root_path,
+        resolved);
+    if (length < 0 || (size_t)length >= sizeof(host_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (stat(host_path, &status) != 0) return -1;
+    if (!S_ISDIR(status.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    strcpy(guest_cwd, resolved);
+    return 0;
+}
+
+int guest_path_fchdir(const char *host_path)
+{
+    size_t root_length;
+
+    if (host_path == 0 || root_path[0] == '\0') {
+        errno = EBADF;
+        return -1;
+    }
+    root_length = strlen(root_path);
+    if (strncmp(host_path, root_path, root_length) != 0 ||
+        (host_path[root_length] != '\0' && host_path[root_length] != '/')) {
+        errno = EACCES;
+        return -1;
+    }
+    return guest_path_chdir(host_path[root_length] == '\0' ? "/" :
+        host_path + root_length);
+}
+
+const char *guest_path_root(void)
+{
+    return root_path;
+}
+
+const char *guest_path_cwd(void)
+{
+    return guest_cwd;
 }

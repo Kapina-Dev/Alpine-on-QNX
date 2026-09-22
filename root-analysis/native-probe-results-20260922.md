@@ -272,6 +272,27 @@ redirected-cat exit=0 expected=0
 linuxemu_filesystem_smoke_failures=0
 ```
 
+## Phase 3 process and shell foundation
+
+Linuxemu now translates legacy `pipe` plus `pipe2`, fork, fork-style `clone`, `vfork`, `execve`, `wait4`, `chdir`, `fchdir`, `getppid`, process-group queries, and the descriptor operations used to assemble pipelines. The exec trampoline restarts Linuxemu with the resolved guest executable while preserving the guest argv, cwd, rootfs, ordinary environment, inherited descriptors, and close-on-exec behavior. Host `LINUXEMU_ROOT` and `LD_LIBRARY_PATH` values are not copied into the guest environment.
+
+QNX keeps the currently handled SIGILL blocked across an `execve` issued from the syscall trap, so the trampoline explicitly unblocks Linuxemu's SIGILL/SIGSEGV trap signals before exec and restores the old mask if exec fails. BusyBox background waits also require its SIGCHLD handler to run after `rt_sigsuspend`; this bounded path invokes the registered one-argument guest SIGCHLD handler before returning `EINTR`. This is evidence for noninteractive child waiting, not general Linux signal-frame support.
+
+The process suite passed pipelines, a three-process pipeline, cwd preservation across exec, child and subshell status propagation, exec failure status 127, background execution plus `wait`, environment preservation/filtering, and an outer shell exit status of 37:
+
+```text
+pipeline exit=0 expected=0
+multipipe exit=0 expected=0
+cwd-exec exit=0 expected=0
+child-status exit=0 expected=0
+subshell-status exit=0 expected=0
+exec-failure exit=0 expected=0
+background-wait exit=0 expected=0
+environment exit=0 expected=0
+shell-exit exit=37 expected=37
+linuxemu_process_smoke_failures=0
+```
+
 ## Phase 1 execution-core hardening
 
 The initial single-file prototype was divided into explicit ELF loading, guest memory, ARM patching, trap/TLS, syscall, runtime/process-entry, and main modules. This keeps host state ownership and ABI translation boundaries visible before the syscall surface grows.

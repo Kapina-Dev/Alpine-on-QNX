@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -29,15 +30,34 @@ int main(int argc, char **argv)
     uintptr_t stack_pointer;
     long page_size;
     const char *root;
+    const char *load_path;
+    const char *initial_cwd = 0;
+    char **guest_argv;
+    int guest_argc;
 
-    if (argc < 2) {
+    if (argc >= 6 && strcmp(argv[1], "--linuxemu-exec") == 0) {
+        root = argv[2];
+        initial_cwd = argv[3];
+        load_path = argv[4];
+        guest_argv = &argv[5];
+        guest_argc = argc - 5;
+    } else if (argc >= 2) {
+        root = getenv("LINUXEMU_ROOT");
+        load_path = argv[1];
+        guest_argv = &argv[1];
+        guest_argc = argc - 1;
+    } else {
         fprintf(stderr, "usage: %s ARM_LINUX_ELF [ARG ...]\n", argv[0]);
         return 2;
     }
     page_size = sysconf(_SC_PAGESIZE);
     runtime_initialize(page_size, getenv("LINUXEMU_SYSTRACE") != 0);
-    root = getenv("LINUXEMU_ROOT");
-    if (root != 0 && guest_path_initialize(root) != 0) {
+    if (guest_process_initialize(argv[0]) != 0) {
+        perror("linuxemu executable");
+        return 1;
+    }
+    if (root != 0 && (guest_path_initialize(root) != 0 ||
+            (initial_cwd != 0 && guest_path_chdir(initial_cwd) != 0))) {
         perror("linuxemu rootfs");
         return 1;
     }
@@ -51,21 +71,23 @@ int main(int argc, char **argv)
         return 1;
     }
 #endif
-    if (load_guest_image(argv[1], &image) != 0) {
+    if (load_guest_image(load_path, &image) != 0) {
         perror("linuxemu load");
         return 1;
     }
-    stack_pointer = create_guest_stack(argc - 1, &argv[1], &image);
+    stack_pointer = create_guest_stack(guest_argc, guest_argv, &image);
     if (stack_pointer == 0) {
         perror("linuxemu stack");
         return 1;
     }
 
-    printf("linuxemu: entry=%p start=%p segments=%u patches=%u stack=%p\n",
-        (void *)image.entry, (void *)image.start_entry,
-        (unsigned)guest_memory_segment_count(), (unsigned)arm_patch_count(),
-        (void *)stack_pointer);
-    fflush(stdout);
+    if (getenv("LINUXEMU_VERBOSE") != 0) {
+        printf("linuxemu: entry=%p start=%p segments=%u patches=%u stack=%p\n",
+            (void *)image.entry, (void *)image.start_entry,
+            (unsigned)guest_memory_segment_count(), (unsigned)arm_patch_count(),
+            (void *)stack_pointer);
+        fflush(stdout);
+    }
     linuxemu_enter_guest(image.start_entry, stack_pointer);
     return 126;
 }

@@ -147,3 +147,23 @@ void linux_stat64_store(void *guest_buffer, const struct stat *status)
     store_u32(buffer, 80, (uint32_t)status->st_ctime);
     store_u64(buffer, 88, (uint64_t)status->st_ino);
 }
+
+void linux_rusage_store(void *guest_buffer, const struct rusage *usage)
+{
+    unsigned char *buffer = guest_buffer;
+    const long values[14] = {
+        usage->ru_maxrss, usage->ru_ixrss, usage->ru_idrss, usage->ru_isrss,
+        usage->ru_minflt, usage->ru_majflt, usage->ru_nswap, usage->ru_inblock,
+        usage->ru_oublock, usage->ru_msgsnd, usage->ru_msgrcv,
+        usage->ru_nsignals, usage->ru_nvcsw, usage->ru_nivcsw
+    };
+    size_t i;
+
+    memset(buffer, 0, 72);
+    store_u32(buffer, 0, (uint32_t)usage->ru_utime.tv_sec);
+    store_u32(buffer, 4, (uint32_t)usage->ru_utime.tv_usec);
+    store_u32(buffer, 8, (uint32_t)usage->ru_stime.tv_sec);
+    store_u32(buffer, 12, (uint32_t)usage->ru_stime.tv_usec);
+    for (i = 0; i != 14; ++i)
+        store_u32(buffer, 16 + i * 4, (uint32_t)values[i]);
+}

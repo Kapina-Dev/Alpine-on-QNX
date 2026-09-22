@@ -9,26 +9,44 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #define LINUX_ENOSYS 38
 #define LINUX_NR_EXIT 1
+#define LINUX_NR_FORK 2
 #define LINUX_NR_READ 3
 #define LINUX_NR_WRITE 4
 #define LINUX_NR_OPEN 5
 #define LINUX_NR_CLOSE 6
+#define LINUX_NR_EXECVE 11
+#define LINUX_NR_CHDIR 12
 #define LINUX_NR_LSEEK 19
 #define LINUX_NR_GETPID 20
+#define LINUX_NR_ACCESS 33
+#define LINUX_NR_PIPE 42
 #define LINUX_NR_DUP 41
 #define LINUX_NR_BRK 45
 #define LINUX_NR_DUP2 63
+#define LINUX_NR_GETPPID 64
+#define LINUX_NR_GETPGRP 65
+#define LINUX_NR_SETSID 66
 #define LINUX_NR_READLINK 85
 #define LINUX_NR_MUNMAP 91
+#define LINUX_NR_WAIT4 114
+#define LINUX_NR_CLONE 120
+#define LINUX_NR_UNAME 122
+#define LINUX_NR_FCHDIR 133
 #define LINUX_NR_LLSEEK 140
 #define LINUX_NR_WRITEV 146
+#define LINUX_NR_RT_SIGACTION 174
+#define LINUX_NR_RT_SIGPROCMASK 175
+#define LINUX_NR_RT_SIGSUSPEND 179
 #define LINUX_NR_MPROTECT 125
 #define LINUX_NR_GETCWD 183
+#define LINUX_NR_VFORK 190
 #define LINUX_NR_MMAP2 192
 #define LINUX_NR_STAT64 195
 #define LINUX_NR_LSTAT64 196
@@ -37,6 +55,8 @@
 #define LINUX_NR_GETGID32 200
 #define LINUX_NR_GETEUID32 201
 #define LINUX_NR_GETEGID32 202
+#define LINUX_NR_SETUID32 213
+#define LINUX_NR_SETGID32 214
 #define LINUX_NR_EXIT_GROUP 248
 #define LINUX_NR_SET_TID_ADDRESS 256
 #define LINUX_NR_GETDENTS64 217
@@ -44,6 +64,8 @@
 #define LINUX_NR_OPENAT 322
 #define LINUX_NR_FSTATAT64 327
 #define LINUX_NR_READLINKAT 332
+#define LINUX_NR_DUP3 358
+#define LINUX_NR_PIPE2 359
 #define LINUX_ARM_NR_SET_TLS 0x000f0005u
 #define LINUX_MAP_SHARED 0x00000001u
 #define LINUX_MAP_PRIVATE 0x00000002u
@@ -59,6 +81,11 @@
 #define LINUX_O_CREAT 0x00000040u
 #define LINUX_O_EXCL 0x00000080u
 #define LINUX_O_NOFOLLOW 0x00008000u
+#define LINUX_O_NONBLOCK 0x00000800u
+#define LINUX_O_CLOEXEC 0x00080000u
+#define LINUX_WNOHANG 0x00000001u
+#define LINUX_WUNTRACED 0x00000002u
+#define LINUX_WCONTINUED 0x00000008u
 #define MAX_TRACKED_FDS 256
 
 static DIR *directory_streams[MAX_TRACKED_FDS];
@@ -290,6 +317,130 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     return linux_host_result(result);
 }
 
+static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
+{
+    int descriptors[2];
+    int host_status_flags = 0;
+
+    if ((flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)) != 0) return -EINVAL;
+    if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
+    if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
+    if ((host_status_flags != 0 &&
+            (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
+            fcntl(descriptors[1], F_SETFL, host_status_flags) != 0)) ||
+        ((flags & LINUX_O_CLOEXEC) != 0 &&
+            (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0))) {
+        int saved_errno = errno;
+        close(descriptors[0]);
+        close(descriptors[1]);
+        errno = saved_errno;
+        return -(int32_t)linux_errno_number(errno);
+    }
+    copy_fd_path(-1, descriptors[0]);
+    copy_fd_path(-1, descriptors[1]);
+    memcpy(guest_descriptors, descriptors, sizeof(descriptors));
+    return 0;
+}
+
+static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
+    char *const guest_envp[])
+{
+    char host_path[PATH_MAX];
+
+    if (guest_path_resolve(guest_path, 0, host_path, sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    guest_process_exec(host_path, guest_argv, guest_envp);
+    return -(int32_t)linux_errno_number(errno);
+}
+
+static int host_signal_to_linux(int signal_number)
+{
+    switch (signal_number) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 8: case 9:
+    case 11: case 13: case 14: case 15: return signal_number;
+    case 10: return 7;
+    case 12: return 31;
+    case 16: return 10;
+    case 17: return 12;
+    case 18: return 17;
+    case 19: return 30;
+    case 20: return 28;
+    case 21: return 23;
+    case 22: return 29;
+    case 23: return 19;
+    case 24: return 20;
+    case 25: return 18;
+    case 26: return 21;
+    case 27: return 22;
+    case 28: return 26;
+    case 29: return 27;
+    case 30: return 24;
+    case 31: return 25;
+    default: return signal_number;
+    }
+}
+
+static int linux_wait_status(int host_status)
+{
+    if (WIFSIGNALED(host_status))
+        return host_signal_to_linux(WTERMSIG(host_status)) |
+            (host_status & 0x80);
+    if (WIFSTOPPED(host_status))
+        return (host_signal_to_linux(WSTOPSIG(host_status)) << 8) | 0x7f;
+    return host_status;
+}
+
+static int32_t linux_wait4(int pid, int *guest_status, uint32_t linux_options,
+    void *guest_usage)
+{
+    struct rusage usage;
+    int host_options = 0;
+    int host_status;
+    pid_t result;
+
+    if ((linux_options &
+            ~(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED)) != 0)
+        return -EINVAL;
+    if ((linux_options & LINUX_WNOHANG) != 0) host_options |= WNOHANG;
+    if ((linux_options & LINUX_WUNTRACED) != 0) host_options |= WUNTRACED;
+#ifdef WCONTINUED
+    if ((linux_options & LINUX_WCONTINUED) != 0) host_options |= WCONTINUED;
+#else
+    if ((linux_options & LINUX_WCONTINUED) != 0) return -EINVAL;
+#endif
+    result = waitpid((pid_t)pid, &host_status, host_options);
+    if (result < 0) return -(int32_t)linux_errno_number(errno);
+    if (result != 0 && guest_status != 0)
+        *guest_status = linux_wait_status(host_status);
+    if (result != 0 && guest_usage != 0) {
+        if (getrusage(RUSAGE_CHILDREN, &usage) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        linux_rusage_store(guest_usage, &usage);
+    }
+    return (int32_t)result;
+}
+
+static int32_t linux_uname(void *guest_buffer)
+{
+    struct utsname host;
+    unsigned char *buffer = guest_buffer;
+    const char *fields[6];
+    size_t i;
+
+    if (uname(&host) != 0) return -(int32_t)linux_errno_number(errno);
+    fields[0] = "Linux";
+    fields[1] = host.nodename;
+    fields[2] = "5.15.0-linuxemu";
+    fields[3] = "Linuxemu on BlackBerry 10/QNX";
+    fields[4] = "armv7l";
+    fields[5] = "";
+    memset(buffer, 0, 65 * 6);
+    for (i = 0; i != 6; ++i)
+        strncpy((char *)buffer + i * 65, fields[i], 64);
+    return 0;
+}
+
 static int translate_protection(uint32_t linux_protection,
     int *host_protection)
 {
@@ -336,6 +487,9 @@ void linux_syscall_dispatch(ucontext_t *context)
 
     trace_call(number, context);
     switch (number) {
+    case LINUX_NR_FORK:
+        result = linux_host_result(fork());
+        break;
     case LINUX_NR_READ:
         result = linux_result(read((int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
@@ -366,6 +520,16 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_CLOSE:
         result = linux_close_fd((int)context->uc_mcontext.cpu.gpr[0]);
         break;
+    case LINUX_NR_EXECVE:
+        result = linux_execve((const char *)context->uc_mcontext.cpu.gpr[0],
+            (char *const *)context->uc_mcontext.cpu.gpr[1],
+            (char *const *)context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_CHDIR:
+        result = guest_path_chdir(
+            (const char *)context->uc_mcontext.cpu.gpr[0]) == 0 ? 0 :
+            -(int32_t)linux_errno_number(errno);
+        break;
     case LINUX_NR_LSEEK:
         result = linux_result(lseek((int)context->uc_mcontext.cpu.gpr[0],
             (off_t)(int32_t)context->uc_mcontext.cpu.gpr[1],
@@ -393,8 +557,30 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_DUP2:
         result = linux_host_result(dup2((int)context->uc_mcontext.cpu.gpr[0],
             (int)context->uc_mcontext.cpu.gpr[1]));
-        if (result >= 0) copy_fd_path((int)context->uc_mcontext.cpu.gpr[0],
-            result);
+        if (result >= 0 &&
+            (int)context->uc_mcontext.cpu.gpr[0] != result)
+            copy_fd_path((int)context->uc_mcontext.cpu.gpr[0], result);
+        break;
+    case LINUX_NR_ACCESS: {
+        char host_path[PATH_MAX];
+        if (guest_path_resolve((const char *)context->uc_mcontext.cpu.gpr[0],
+                0, host_path, sizeof(host_path)) != 0)
+            result = -(int32_t)linux_errno_number(errno);
+        else result = linux_host_result(access(host_path,
+            (int)context->uc_mcontext.cpu.gpr[1]));
+        break;
+    }
+    case LINUX_NR_PIPE:
+        result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0], 0);
+        break;
+    case LINUX_NR_GETPPID:
+        result = (int32_t)getppid();
+        break;
+    case LINUX_NR_GETPGRP:
+        result = (int32_t)getpgrp();
+        break;
+    case LINUX_NR_SETSID:
+        result = linux_host_result(setsid());
         break;
     case LINUX_NR_BRK:
         result = (int32_t)guest_brk_set(context->uc_mcontext.cpu.gpr[0]);
@@ -415,11 +601,38 @@ void linux_syscall_dispatch(ucontext_t *context)
             (void *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]));
         break;
+    case LINUX_NR_WAIT4:
+        result = linux_wait4((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2],
+            (void *)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_CLONE:
+        if ((context->uc_mcontext.cpu.gpr[0] & ~0xffu) != 0 ||
+            ((context->uc_mcontext.cpu.gpr[0] & 0xffu) != 0 &&
+            (context->uc_mcontext.cpu.gpr[0] & 0xffu) != 17u))
+            result = -EINVAL;
+        else result = linux_host_result(fork());
+        break;
+    case LINUX_NR_UNAME:
+        result = linux_uname((void *)context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_FCHDIR: {
+        int fd = (int)context->uc_mcontext.cpu.gpr[0];
+        if (fd < 0 || fd >= MAX_TRACKED_FDS || fd_paths[fd] == 0)
+            result = -EBADF;
+        else result = guest_path_fchdir(fd_paths[fd]) == 0 ? 0 :
+            -(int32_t)linux_errno_number(errno);
+        break;
+    }
     case LINUX_NR_GETCWD:
         result = guest_path_getcwd(
             (char *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]);
         if (result < 0) result = -linux_errno_number(errno);
+        break;
+    case LINUX_NR_VFORK:
+        result = linux_host_result(fork());
         break;
     case LINUX_NR_STAT64:
         result = linux_stat_path(LINUX_AT_FDCWD,
@@ -478,6 +691,25 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int)context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2]);
         break;
+    case LINUX_NR_RT_SIGACTION:
+        result = guest_signal_action(
+            (int)context->uc_mcontext.cpu.gpr[0],
+            (const void *)context->uc_mcontext.cpu.gpr[1],
+            (void *)context->uc_mcontext.cpu.gpr[2],
+            (size_t)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_RT_SIGPROCMASK:
+        result = guest_signal_mask(
+            (int)context->uc_mcontext.cpu.gpr[0],
+            (const void *)context->uc_mcontext.cpu.gpr[1],
+            (void *)context->uc_mcontext.cpu.gpr[2],
+            (size_t)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_RT_SIGSUSPEND:
+        result = guest_signal_suspend(
+            (const void *)context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1]);
+        break;
     case LINUX_NR_GETPID:
     case LINUX_NR_SET_TID_ADDRESS:
         result = (int32_t)getpid();
@@ -486,6 +718,33 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_GETGID32: result = (int32_t)getgid(); break;
     case LINUX_NR_GETEUID32: result = (int32_t)geteuid(); break;
     case LINUX_NR_GETEGID32: result = (int32_t)getegid(); break;
+    case LINUX_NR_SETUID32:
+        result = linux_host_result(setuid(
+            (uid_t)context->uc_mcontext.cpu.gpr[0]));
+        break;
+    case LINUX_NR_SETGID32:
+        result = linux_host_result(setgid(
+            (gid_t)context->uc_mcontext.cpu.gpr[0]));
+        break;
+    case LINUX_NR_DUP3: {
+        int source = (int)context->uc_mcontext.cpu.gpr[0];
+        int destination = (int)context->uc_mcontext.cpu.gpr[1];
+        uint32_t flags = context->uc_mcontext.cpu.gpr[2];
+        if (source == destination || (flags & ~LINUX_O_CLOEXEC) != 0)
+            result = -EINVAL;
+        else {
+            result = linux_host_result(dup2(source, destination));
+            if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
+                fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)
+                result = -(int32_t)linux_errno_number(errno);
+            if (result >= 0) copy_fd_path(source, destination);
+        }
+        break;
+    }
+    case LINUX_NR_PIPE2:
+        result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
     case LINUX_NR_EXIT:
     case LINUX_NR_EXIT_GROUP:
         _exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));

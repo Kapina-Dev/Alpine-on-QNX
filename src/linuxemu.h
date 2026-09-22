@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <ucontext.h>
 
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
@@ -67,11 +68,25 @@ int guest_path_resolve_at(const char *host_directory, const char *path,
     size_t host_path_size);
 int guest_path_getcwd(char *buffer, size_t size);
 int guest_path_readlink(const char *path, char *buffer, size_t size);
+int guest_path_chdir(const char *path);
+int guest_path_fchdir(const char *host_path);
+const char *guest_path_root(void);
+const char *guest_path_cwd(void);
+
+int guest_process_initialize(const char *emulator);
+int guest_process_exec(const char *host_executable, char *const guest_argv[],
+    char *const guest_envp[]);
+int32_t guest_signal_action(int linux_signal, const void *guest_action,
+    void *guest_old_action, size_t signal_set_size);
+int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
+    size_t signal_set_size);
+int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
 
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);
 uint32_t linux_status_flags(int host_flags);
 void linux_stat64_store(void *guest_buffer, const struct stat *host_status);
+void linux_rusage_store(void *guest_buffer, const struct rusage *host_usage);
 
 void runtime_initialize(long page_size, int trace_enabled);
 long runtime_page_size(void);
