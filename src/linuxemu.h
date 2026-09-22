@@ -81,6 +81,13 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
 int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
     size_t signal_set_size);
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
+int32_t guest_signal_send(pid_t process, int linux_signal);
+int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
+    sigset_t *host_set);
+
+int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
+int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
+int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
 
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);

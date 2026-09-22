@@ -313,3 +313,24 @@ linuxemu_loader_negative_failures=0
 ```
 
 The original four static guests and the pinned Alpine dynamic `true` and `echo` guests continue to pass after the refactor.
+
+## Phase 4 terminal, polling, and time foundation
+
+Linuxemu now converts Linux ARM time32 and time64 structures for `time`, `gettimeofday`, `clock_gettime`, `clock_getres`, `nanosleep`, and `clock_nanosleep`. Linux realtime, monotonic, process CPU, and thread CPU clock IDs are mapped explicitly to their different QNX values. BusyBox `date +%s` returned a plausible current epoch and `sleep 0.01` completed successfully.
+
+Readiness support covers `poll`, `ppoll`, old `select`, `_newselect`, and `pselect6`, including their time64 forms. Linux and QNX poll bits are translated rather than passed through. Guest descriptor sets are copied bit by bit into QNX's 256-descriptor `fd_set`. A synthetic ARM guest verifies time32/time64 queries and clock sleeps, resolution, pipe readiness through poll plus both ppoll layouts, and readiness through old/new select plus both pselect6 layouts.
+
+Terminal handling explicitly converts the 36-byte Linux ARM `termios` structure to QNX's larger structure, including its separate numeric speeds and different control-character indices. It also translates window size, terminal process-group queries, `FIONREAD`, and `FIONBIO`. QNX 10.3's `getpgid()` libc entry returns `ENOSYS`, so the Linux `getpgid(0)` case used during interactive shell startup is supplied by working `getpgrp()` state.
+
+The pseudo-terminal suite passed the direct syscall probe, BusyBox date and sleep, interactive shell startup, `stty -a`, and an `echo` flag disable/read/restore round trip:
+
+```text
+syscall-probe exit=0 expected=0
+busybox_epoch=1790100848
+sleep exit=0 expected=0
+interactive_shell_ok
+speed 38400 baud; rows 24; columns 80; line = 0;
+linuxemu_terminal_time_smoke_failures=0
+```
+
+After the Phase 4 changes, the native contract, static guest, dynamic musl, loader-negative, filesystem, process, and terminal/time suites all completed with zero failures on the device at `192.168.0.3`.

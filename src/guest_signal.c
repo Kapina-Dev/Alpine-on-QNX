@@ -67,6 +67,18 @@ static int linux_signal_to_host(int number)
     }
 }
 
+int32_t guest_signal_send(pid_t process, int linux_signal)
+{
+    int host_signal;
+    if (linux_signal == 0) host_signal = 0;
+    else {
+        host_signal = linux_signal_to_host(linux_signal);
+        if (host_signal == 0) return -EINVAL;
+    }
+    return kill(process, host_signal) == 0 ? 0 :
+        -(int32_t)linux_errno_number(errno);
+}
+
 static uint32_t load_u32(const unsigned char *buffer)
 {
     uint32_t value;
@@ -123,6 +135,16 @@ static void linux_set_to_host(const uint32_t words[2], sigset_t *host_set)
     }
     sigdelset(host_set, SIGILL);
     sigdelset(host_set, SIGSEGV);
+}
+
+int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
+    sigset_t *host_set)
+{
+    uint32_t words[2];
+    if (guest_set == 0 || signal_set_size != sizeof(words)) return -EINVAL;
+    memcpy(words, guest_set, sizeof(words));
+    linux_set_to_host(words, host_set);
+    return 0;
 }
 
 static void host_set_to_linux(const sigset_t *host_set, uint32_t words[2])

@@ -26,6 +26,12 @@
 #define LINUX_NR_LSEEK 19
 #define LINUX_NR_GETPID 20
 #define LINUX_NR_ACCESS 33
+#define LINUX_NR_KILL 37
+#define LINUX_NR_IOCTL 54
+#define LINUX_NR_SETPGID 57
+#define LINUX_NR_SELECT 82
+#define LINUX_NR_GETTIMEOFDAY 78
+#define LINUX_NR_TIME 13
 #define LINUX_NR_PIPE 42
 #define LINUX_NR_DUP 41
 #define LINUX_NR_BRK 45
@@ -39,8 +45,12 @@
 #define LINUX_NR_CLONE 120
 #define LINUX_NR_UNAME 122
 #define LINUX_NR_FCHDIR 133
+#define LINUX_NR_GETPGID 132
 #define LINUX_NR_LLSEEK 140
 #define LINUX_NR_WRITEV 146
+#define LINUX_NR_NEWSELECT 142
+#define LINUX_NR_NANOSLEEP 162
+#define LINUX_NR_POLL 168
 #define LINUX_NR_RT_SIGACTION 174
 #define LINUX_NR_RT_SIGPROCMASK 175
 #define LINUX_NR_RT_SIGSUSPEND 179
@@ -61,11 +71,21 @@
 #define LINUX_NR_SET_TID_ADDRESS 256
 #define LINUX_NR_GETDENTS64 217
 #define LINUX_NR_FCNTL64 221
+#define LINUX_NR_CLOCK_GETTIME 263
+#define LINUX_NR_CLOCK_GETRES 264
+#define LINUX_NR_CLOCK_NANOSLEEP 265
 #define LINUX_NR_OPENAT 322
 #define LINUX_NR_FSTATAT64 327
 #define LINUX_NR_READLINKAT 332
+#define LINUX_NR_PSELECT6 335
+#define LINUX_NR_PPOLL 336
 #define LINUX_NR_DUP3 358
 #define LINUX_NR_PIPE2 359
+#define LINUX_NR_CLOCK_GETTIME64 403
+#define LINUX_NR_CLOCK_GETRES_TIME64 406
+#define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
+#define LINUX_NR_PSELECT6_TIME64 413
+#define LINUX_NR_PPOLL_TIME64 414
 #define LINUX_ARM_NR_SET_TLS 0x000f0005u
 #define LINUX_MAP_SHARED 0x00000001u
 #define LINUX_MAP_PRIVATE 0x00000002u
@@ -293,6 +313,15 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     int result;
     switch (command) {
     case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
+    case 1030:
+        result = fcntl(fd, F_DUPFD, (int)argument);
+        if (result >= 0 && fcntl(result, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(result);
+            errno = saved_errno;
+            result = -1;
+        }
+        break;
     case 1: result = fcntl(fd, F_GETFD); break;
     case 2: result = fcntl(fd, F_SETFD,
         (argument & 1u) != 0 ? FD_CLOEXEC : 0); break;
@@ -313,7 +342,8 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     }
     default: return -EINVAL;
     }
-    if (command == 0 && result >= 0) copy_fd_path(fd, result);
+    if ((command == 0 || command == 1030) && result >= 0)
+        copy_fd_path(fd, result);
     return linux_host_result(result);
 }
 
@@ -570,6 +600,11 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int)context->uc_mcontext.cpu.gpr[1]));
         break;
     }
+    case LINUX_NR_IOCTL:
+        result = linux_ioctl((int)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1],
+            (void *)context->uc_mcontext.cpu.gpr[2]);
+        break;
     case LINUX_NR_PIPE:
         result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0], 0);
         break;
@@ -578,6 +613,23 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     case LINUX_NR_GETPGRP:
         result = (int32_t)getpgrp();
+        break;
+    case LINUX_NR_GETPGID:
+        if ((int32_t)context->uc_mcontext.cpu.gpr[0] == 0 ||
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0] == getpid())
+            result = (int32_t)getpgrp();
+        else result = linux_host_result(getpgid(
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0]));
+        break;
+    case LINUX_NR_SETPGID:
+        result = linux_host_result(setpgid(
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0],
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[1]));
+        break;
+    case LINUX_NR_KILL:
+        result = guest_signal_send(
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int)context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_SETSID:
         result = linux_host_result(setsid());
@@ -709,6 +761,26 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = guest_signal_suspend(
             (const void *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_TIME:
+    case LINUX_NR_GETTIMEOFDAY:
+    case LINUX_NR_NANOSLEEP:
+    case LINUX_NR_CLOCK_GETTIME:
+    case LINUX_NR_CLOCK_GETRES:
+    case LINUX_NR_CLOCK_NANOSLEEP:
+    case LINUX_NR_CLOCK_GETTIME64:
+    case LINUX_NR_CLOCK_GETRES_TIME64:
+    case LINUX_NR_CLOCK_NANOSLEEP_TIME64:
+        result = linux_time_syscall(number, context->uc_mcontext.cpu.gpr);
+        break;
+    case LINUX_NR_SELECT:
+    case LINUX_NR_NEWSELECT:
+    case LINUX_NR_POLL:
+    case LINUX_NR_PSELECT6:
+    case LINUX_NR_PPOLL:
+    case LINUX_NR_PSELECT6_TIME64:
+    case LINUX_NR_PPOLL_TIME64:
+        result = linux_poll_syscall(number, context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_GETPID:
     case LINUX_NR_SET_TID_ADDRESS:
