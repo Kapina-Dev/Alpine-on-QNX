@@ -70,7 +70,8 @@ set -x
     "$project_dir/tests/elf-fixture-tool.c"
 
 mkdir -p "$project_dir/build/guest-tests"
-for guest in write-exit unknown-syscall exit-status initial-stack; do
+for guest in write-exit unknown-syscall exit-status initial-stack \
+    memory-syscalls file-syscalls; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \

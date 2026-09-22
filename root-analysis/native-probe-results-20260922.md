@@ -237,7 +237,40 @@ echo exit=0 expected=0
 linuxemu_dynamic_smoke_failures=0
 ```
 
-This establishes a real musl dynamic-linker path for the pinned BusyBox commands. General shared-library file mapping, rootfs path translation, guest threading, guest signals, and the broader Linux syscall surface remain outstanding.
+This established a real musl dynamic-linker path for the pinned BusyBox commands. At that checkpoint, rootfs path translation and the broader Linux syscall surface remained outstanding.
+
+## Phase 2 file and memory foundation
+
+The device moved to `192.168.0.3`; the `ssh bb10` alias was used for this phase. Linuxemu now translates the core file-descriptor, metadata, directory, path, and memory calls needed by the pinned Alpine BusyBox. Linux flags, errno values, and ARM `stat64` layout are converted explicitly instead of passing QNX ABI values through to the guest.
+
+Rootfs paths are normalized from guest `/`, clamp `..` at that root, and resolve both relative and absolute symlinks using guest semantics. A fixture symlink aimed directly at a real file outside `test-rootfs` returned guest `ENOENT`; its host-only marker was not exposed. Absolute and over-deep relative symlinks that resolve to `/etc/alpine-release` inside the guest both returned `3.24.2`.
+
+The synthetic `memory-syscalls` guest verifies `brk` query/growth and writable heap memory, anonymous `mmap2`, `mprotect`, and `munmap`. The static suite result is:
+
+```text
+memory-syscalls exit=0 expected=0
+file-syscalls exit=0 expected=0
+linuxemu_smoke_failures=0
+```
+
+The `file-syscalls` guest directly covers directory-relative `openat`, `read`, `lseek`, `fstat64`, `fstatat64`, `readlinkat`, and `close`. It also exercises a valid ELF containing a pure BSS segment with no file bytes.
+
+The filesystem suite verifies `pwd`, `cat`, `ls`, `readlink`, missing-file errno behavior, path and symlink containment, shell output redirection, and reading the resulting file back through the guest:
+
+```text
+pwd exit=0 expected=0
+cat-release exit=0 expected=0
+lexical-clamp exit=0 expected=0
+list-etc exit=0 expected=0
+readlink exit=0 expected=0
+absolute-symlink exit=0 expected=0
+relative-symlink exit=0 expected=0
+missing-file exit=1 expected=1
+host-escape exit=1 expected=1
+redirect exit=0 expected=0
+redirected-cat exit=0 expected=0
+linuxemu_filesystem_smoke_failures=0
+```
 
 ## Phase 1 execution-core hardening
 

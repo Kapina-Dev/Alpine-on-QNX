@@ -25,7 +25,9 @@ static int validate_program_header(const Elf32_Phdr *header, off_t file_size)
 {
     if (header->p_type == PT_LOAD && header->p_memsz != 0) {
         if (header->p_memsz < header->p_filesz ||
-            !range_in_file(header->p_offset, header->p_filesz, file_size) ||
+            (header->p_filesz != 0 &&
+                !range_in_file(header->p_offset, header->p_filesz,
+                    file_size)) ||
             !valid_alignment(header->p_align) ||
             (header->p_align > 1 &&
                 ((header->p_vaddr - header->p_offset) &
@@ -156,6 +158,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
     int fd = -1;
     int result = -1;
     uintptr_t load_bias;
+    uintptr_t data_end = 0;
 
     memset(object, 0, sizeof(*object));
     if (interpreter != 0 && interpreter_capacity != 0) interpreter[0] = '\0';
@@ -216,6 +219,9 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
         if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
             guest_memory_map_load_segment(fd, header, load_bias,
                 file_status.st_size) != 0) goto done;
+        if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
+            load_bias + header->p_vaddr + header->p_memsz > data_end)
+            data_end = load_bias + header->p_vaddr + header->p_memsz;
     }
     if (guest_memory_segment_count() == loads_before ||
         patch_executable_sections(fd, &elf_header, program_headers, load_bias,
@@ -229,6 +235,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
     object->load_bias = load_bias;
     object->program_header_size = elf_header.e_phentsize;
     object->program_header_count = elf_header.e_phnum;
+    object->data_end = data_end;
     for (i = 0; i < elf_header.e_phnum; ++i) {
         Elf32_Phdr *header = &program_headers[i];
         Elf32_Off delta;
@@ -254,10 +261,6 @@ int load_guest_image(const char *path, struct guest_image *image)
     struct elf_object interpreter_object;
     char interpreter[PATH_MAX];
     char interpreter_path[PATH_MAX];
-    char canonical_root[PATH_MAX];
-    char canonical_interpreter[PATH_MAX];
-    const char *root;
-    int length;
 
     memset(image, 0, sizeof(*image));
     if (load_elf_object(path, MAIN_ET_DYN_BIAS, 1, &main_object,
@@ -267,28 +270,12 @@ int load_guest_image(const char *path, struct guest_image *image)
     image->program_headers = main_object.program_headers;
     image->program_header_size = main_object.program_header_size;
     image->program_header_count = main_object.program_header_count;
+    image->initial_brk = main_object.data_end;
 
     if (interpreter[0] != '\0') {
-        root = getenv("LINUXEMU_ROOT");
-        if (root == 0 || root[0] == '\0') {
-            errno = ENOENT;
-            return -1;
-        }
-        length = snprintf(interpreter_path, sizeof(interpreter_path),
-            "%s%s", root, interpreter);
-        if (length < 0 || (size_t)length >= sizeof(interpreter_path)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        if (realpath(root, canonical_root) == 0 ||
-            realpath(interpreter_path, canonical_interpreter) == 0) return -1;
-        length = (int)strlen(canonical_root);
-        if (strncmp(canonical_root, canonical_interpreter, (size_t)length) != 0 ||
-            (canonical_root[1] != '\0' && canonical_interpreter[length] != '/')) {
-            errno = EACCES;
-            return -1;
-        }
-        if (load_elf_object(canonical_interpreter, INTERPRETER_BIAS, 0,
+        if (guest_path_resolve(interpreter, 0, interpreter_path,
+                sizeof(interpreter_path)) != 0 ||
+            load_elf_object(interpreter_path, INTERPRETER_BIAS, 0,
                 &interpreter_object, 0, 0) != 0) return -1;
         image->start_entry = interpreter_object.entry;
         image->interpreter_base = interpreter_object.load_bias;
@@ -297,6 +284,7 @@ int load_guest_image(const char *path, struct guest_image *image)
     if (arm_patch_count() == 0 ||
         !guest_memory_is_executable(image->entry, 4) ||
         !guest_memory_is_executable(image->start_entry, 4) ||
+        guest_brk_initialize(image->initial_brk) != 0 ||
         guest_memory_finalize() != 0) {
         if (errno == 0) errno = ENOEXEC;
         return -1;

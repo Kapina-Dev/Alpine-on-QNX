@@ -13,6 +13,9 @@ struct load_segment {
 static struct load_segment load_segments[MAX_LOAD_SEGMENTS];
 static size_t load_segment_count;
 static uintptr_t page_size;
+static uintptr_t current_break;
+static uintptr_t minimum_break;
+static uintptr_t break_mapping_end;
 
 static int ranges_overlap(uintptr_t first_start, uintptr_t first_end,
     uintptr_t second_start, uintptr_t second_end)
@@ -71,9 +74,10 @@ int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
     void *mapping;
 
     if (header->p_memsz < header->p_filesz || file_size < 0 ||
-        (uint64_t)header->p_offset > (uint64_t)file_size ||
-        (uint64_t)header->p_filesz >
-            (uint64_t)file_size - (uint64_t)header->p_offset ||
+        (header->p_filesz != 0 &&
+            ((uint64_t)header->p_offset > (uint64_t)file_size ||
+            (uint64_t)header->p_filesz >
+                (uint64_t)file_size - (uint64_t)header->p_offset)) ||
         load_bias > UINTPTR_MAX - (uintptr_t)header->p_vaddr) {
         errno = ENOEXEC;
         return -1;
@@ -169,4 +173,51 @@ int guest_memory_is_executable(uintptr_t address, size_t length)
 size_t guest_memory_segment_count(void)
 {
     return load_segment_count;
+}
+
+int guest_brk_initialize(uintptr_t initial_break)
+{
+    if (initial_break < GUEST_MIN_ADDRESS || initial_break >= GUEST_MAX_ADDRESS) {
+        errno = ENOEXEC;
+        return -1;
+    }
+    current_break = initial_break;
+    minimum_break = initial_break;
+    break_mapping_end = align_up(initial_break, page_size);
+    return 0;
+}
+
+uintptr_t guest_brk_set(uintptr_t requested)
+{
+    uintptr_t requested_mapping_end;
+    void *mapping;
+
+    if (requested == 0) return current_break;
+    if (requested < minimum_break) return current_break;
+    if (requested < current_break) {
+        requested_mapping_end = align_up(requested, page_size);
+        if (requested_mapping_end < break_mapping_end) {
+            munmap((void *)requested_mapping_end,
+                break_mapping_end - requested_mapping_end);
+            break_mapping_end = requested_mapping_end;
+        }
+        current_break = requested;
+        return current_break;
+    }
+    if (requested >= GUEST_MAX_ADDRESS ||
+        requested > UINTPTR_MAX - (page_size - 1u)) return current_break;
+    requested_mapping_end = align_up(requested, page_size);
+    if (requested_mapping_end > break_mapping_end) {
+        mapping = mmap((void *)break_mapping_end,
+            requested_mapping_end - break_mapping_end,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mapping == MAP_FAILED) return current_break;
+        if ((uintptr_t)mapping != break_mapping_end) {
+            munmap(mapping, requested_mapping_end - break_mapping_end);
+            return current_break;
+        }
+        break_mapping_end = requested_mapping_end;
+    }
+    current_break = requested;
+    return current_break;
 }

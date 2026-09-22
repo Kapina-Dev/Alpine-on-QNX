@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <ucontext.h>
 
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
@@ -25,6 +26,7 @@ struct guest_image {
     uintptr_t program_headers;
     uint32_t program_header_size;
     uint32_t program_header_count;
+    uintptr_t initial_brk;
 };
 
 struct elf_object {
@@ -33,6 +35,7 @@ struct elf_object {
     uintptr_t program_headers;
     uint32_t program_header_size;
     uint32_t program_header_count;
+    uintptr_t data_end;
 };
 
 uintptr_t align_down(uintptr_t value, uintptr_t alignment);
@@ -45,12 +48,30 @@ int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
 int guest_memory_finalize(void);
 int guest_memory_is_executable(uintptr_t address, size_t length);
 size_t guest_memory_segment_count(void);
+int guest_brk_initialize(uintptr_t initial_break);
+uintptr_t guest_brk_set(uintptr_t requested);
 
 int arm_patch_range(uintptr_t start, size_t length);
 const uint32_t *arm_patch_original(uintptr_t address);
 size_t arm_patch_count(void);
 
 int load_guest_image(const char *path, struct guest_image *image);
+
+int guest_path_initialize(const char *root);
+int guest_path_resolve(const char *path, int allow_missing_leaf,
+    char *host_path, size_t host_path_size);
+int guest_path_resolve_nofollow(const char *path, char *host_path,
+    size_t host_path_size);
+int guest_path_resolve_at(const char *host_directory, const char *path,
+    int allow_missing_leaf, int nofollow, char *host_path,
+    size_t host_path_size);
+int guest_path_getcwd(char *buffer, size_t size);
+int guest_path_readlink(const char *path, char *buffer, size_t size);
+
+int linux_errno_number(int host_errno);
+int linux_open_flags(uint32_t linux_flags, int *host_flags);
+uint32_t linux_status_flags(int host_flags);
+void linux_stat64_store(void *guest_buffer, const struct stat *host_status);
 
 void runtime_initialize(long page_size, int trace_enabled);
 long runtime_page_size(void);
