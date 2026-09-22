@@ -12,9 +12,14 @@ run_guest()
 {
     guest=$1
     expected=$2
+    shift 2
 
     echo "=== guest: $guest ==="
-    "$timeout_command" 10 "$linuxemu" "$guest_dir/$guest"
+    if [ "$#" -eq 0 ]; then
+        "$timeout_command" 10 "$linuxemu" "$guest_dir/$guest"
+    else
+        "$timeout_command" 10 "$linuxemu" "$guest_dir/$guest" "$@"
+    fi
     status=$?
     echo "$guest exit=$status expected=$expected"
     if [ "$status" -ne "$expected" ]; then
@@ -25,6 +30,7 @@ run_guest()
 run_guest write-exit 0
 run_guest unknown-syscall 0
 run_guest exit-status 37
+run_guest initial-stack 0 alpha beta
 
 echo "linuxemu_smoke_failures=$failures"
 test "$failures" -eq 0

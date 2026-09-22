@@ -10,7 +10,7 @@ The current rebuild has a verified native contract and a minimal static ARM exec
 - Concurrent pthread TLS and directed signal delivery.
 - Writable-to-executable memory transitions with QNX instruction-cache synchronization.
 - Trap-emulated per-thread guest TLS reads in ARM and Thumb modes.
-- Static ARM ELF validation, segment mapping, tracked ARM `svc #0` patching, and guest-stack entry.
+- Static ARM ELF validation, segment mapping, tracked ARM `svc #0` patching, and Linux process-entry stack construction.
 - Linux ARM `write`, `exit`, `exit_group`, and `-ENOSYS` for unsupported calls.
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
@@ -42,6 +42,6 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 
 - Static ARM `ET_EXEC` guests only.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
-- Minimal initial stack; dynamic interpreter loading and full auxiliary vectors remain to be added.
+- Initial `argc`/`argv`/`envp` and core auxiliary vectors; dynamic interpreter loading remains to be added.
 - Only `write`, `exit`, and `exit_group` are translated.
 - Executable-segment scanning currently targets the exact ARM `svc #0` word. A section-aware or decoded patch pass is required before accepting general binaries.

@@ -24,6 +24,19 @@
 #define LINUX_NR_EXIT 1
 #define LINUX_NR_WRITE 4
 #define LINUX_NR_EXIT_GROUP 248
+#define LINUX_AT_NULL 0
+#define LINUX_AT_PHDR 3
+#define LINUX_AT_PHENT 4
+#define LINUX_AT_PHNUM 5
+#define LINUX_AT_PAGESZ 6
+#define LINUX_AT_ENTRY 9
+#define LINUX_AT_UID 11
+#define LINUX_AT_EUID 12
+#define LINUX_AT_GID 13
+#define LINUX_AT_EGID 14
+#define LINUX_AT_SECURE 23
+#define LINUX_AT_RANDOM 25
+#define LINUX_AT_EXECFN 31
 
 struct load_segment {
     uintptr_t map_start;
@@ -41,6 +54,19 @@ static size_t load_segment_count;
 static struct patch_record patches[MAX_PATCHES];
 static size_t patch_count;
 static long host_page_size;
+extern char **environ;
+
+struct guest_image {
+    uintptr_t entry;
+    uintptr_t program_headers;
+    uint32_t program_header_size;
+    uint32_t program_header_count;
+};
+
+struct guest_auxv {
+    uint32_t type;
+    uint32_t value;
+};
 
 extern void linuxemu_enter_guest(uintptr_t entry, uintptr_t stack_pointer);
 
@@ -328,28 +354,170 @@ static int install_syscall_handler(void)
     return sigaction(SIGILL, &action, 0);
 }
 
-static uintptr_t create_guest_stack(void)
+static int fill_random_bytes(void *buffer, size_t length)
 {
-    uintptr_t *stack_pointer;
+    unsigned char *cursor = buffer;
+    int fd;
+
+    fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    while (length != 0) {
+        ssize_t count = read(fd, cursor, length);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            close(fd);
+            errno = EIO;
+            return -1;
+        }
+        cursor += count;
+        length -= (size_t)count;
+    }
+    close(fd);
+    return 0;
+}
+
+static uintptr_t push_stack_bytes(uintptr_t *cursor, uintptr_t lower_bound,
+    const void *source, size_t length)
+{
+    if (length > *cursor - lower_bound) {
+        errno = E2BIG;
+        return 0;
+    }
+    *cursor -= length;
+    memcpy((void *)*cursor, source, length);
+    return *cursor;
+}
+
+static uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
+    const struct guest_image *image)
+{
     void *mapping;
+    uintptr_t lower_bound;
+    uintptr_t cursor;
+    uintptr_t vector_start;
+    uint32_t *words;
+    uint32_t *argument_addresses;
+    uint32_t *environment_addresses;
+    struct guest_auxv auxiliary[12];
+    unsigned char random_bytes[16];
+    uintptr_t random_address;
+    uintptr_t executable_address;
+    size_t environment_count = 0;
+    size_t auxiliary_count = 0;
+    size_t word_count;
+    size_t i;
 
     mapping = mmap(0, GUEST_STACK_SIZE, PROT_READ | PROT_WRITE,
         MAP_PRIVATE | MAP_ANON | MAP_STACK, -1, 0);
     if (mapping == MAP_FAILED) {
         return 0;
     }
-    stack_pointer = (uintptr_t *)align_down(
-        (uintptr_t)mapping + GUEST_STACK_SIZE, 16);
+    lower_bound = (uintptr_t)mapping;
+    cursor = lower_bound + GUEST_STACK_SIZE;
 
-    *--stack_pointer = 0; /* AT_NULL value */
-    *--stack_pointer = 0; /* AT_NULL type */
-    *--stack_pointer = 0; /* envp terminator */
-    *--stack_pointer = 0; /* argv terminator */
-    *--stack_pointer = 0; /* argc */
-    return (uintptr_t)stack_pointer;
+    while (environ[environment_count] != 0) {
+        environment_count++;
+    }
+    argument_addresses = calloc((size_t)guest_argc, sizeof(*argument_addresses));
+    environment_addresses = calloc(environment_count,
+        sizeof(*environment_addresses));
+    if ((guest_argc != 0 && argument_addresses == 0) ||
+        (environment_count != 0 && environment_addresses == 0)) {
+        goto fail;
+    }
+
+    for (i = environment_count; i != 0; --i) {
+        uintptr_t address = push_stack_bytes(&cursor, lower_bound,
+            environ[i - 1], strlen(environ[i - 1]) + 1);
+        if (address == 0) {
+            goto fail;
+        }
+        environment_addresses[i - 1] = (uint32_t)address;
+    }
+    for (i = (size_t)guest_argc; i != 0; --i) {
+        uintptr_t address = push_stack_bytes(&cursor, lower_bound,
+            guest_argv[i - 1], strlen(guest_argv[i - 1]) + 1);
+        if (address == 0) {
+            goto fail;
+        }
+        argument_addresses[i - 1] = (uint32_t)address;
+    }
+    executable_address = argument_addresses[0];
+
+    if (fill_random_bytes(random_bytes, sizeof(random_bytes)) != 0) {
+        goto fail;
+    }
+    cursor = align_down(cursor, 16);
+    random_address = push_stack_bytes(&cursor, lower_bound, random_bytes,
+        sizeof(random_bytes));
+    if (random_address == 0) {
+        goto fail;
+    }
+
+#define ADD_AUXILIARY(aux_type, aux_value) do { \
+    auxiliary[auxiliary_count].type = (aux_type); \
+    auxiliary[auxiliary_count].value = (uint32_t)(aux_value); \
+    auxiliary_count++; \
+} while (0)
+    if (image->program_headers != 0) {
+        ADD_AUXILIARY(LINUX_AT_PHDR, image->program_headers);
+    }
+    ADD_AUXILIARY(LINUX_AT_PHENT, image->program_header_size);
+    ADD_AUXILIARY(LINUX_AT_PHNUM, image->program_header_count);
+    ADD_AUXILIARY(LINUX_AT_PAGESZ, host_page_size);
+    ADD_AUXILIARY(LINUX_AT_ENTRY, image->entry);
+    ADD_AUXILIARY(LINUX_AT_UID, getuid());
+    ADD_AUXILIARY(LINUX_AT_EUID, geteuid());
+    ADD_AUXILIARY(LINUX_AT_GID, getgid());
+    ADD_AUXILIARY(LINUX_AT_EGID, getegid());
+    ADD_AUXILIARY(LINUX_AT_SECURE, 0);
+    ADD_AUXILIARY(LINUX_AT_RANDOM, random_address);
+    ADD_AUXILIARY(LINUX_AT_EXECFN, executable_address);
+#undef ADD_AUXILIARY
+
+    word_count = 1 + (size_t)guest_argc + 1 + environment_count + 1 +
+        (auxiliary_count + 1) * 2;
+    if (word_count * sizeof(*words) > cursor - lower_bound) {
+        errno = E2BIG;
+        goto fail;
+    }
+    vector_start = align_down(cursor - word_count * sizeof(*words), 16);
+    if (vector_start < lower_bound) {
+        errno = E2BIG;
+        goto fail;
+    }
+    words = (uint32_t *)vector_start;
+    *words++ = (uint32_t)guest_argc;
+    for (i = 0; i < (size_t)guest_argc; ++i) {
+        *words++ = argument_addresses[i];
+    }
+    *words++ = 0;
+    for (i = 0; i < environment_count; ++i) {
+        *words++ = environment_addresses[i];
+    }
+    *words++ = 0;
+    for (i = 0; i < auxiliary_count; ++i) {
+        *words++ = auxiliary[i].type;
+        *words++ = auxiliary[i].value;
+    }
+    *words++ = LINUX_AT_NULL;
+    *words++ = 0;
+
+    free(argument_addresses);
+    free(environment_addresses);
+    return vector_start;
+fail:
+    free(argument_addresses);
+    free(environment_addresses);
+    munmap(mapping, GUEST_STACK_SIZE);
+    return 0;
 }
 
-static int load_guest(const char *path, uintptr_t *entry)
+static int load_guest(const char *path, struct guest_image *image)
 {
     Elf32_Ehdr elf_header;
     Elf32_Phdr *program_headers = 0;
@@ -409,7 +577,22 @@ static int load_guest(const char *path, uintptr_t *entry)
         goto done;
     }
 
-    *entry = elf_header.e_entry;
+    image->entry = elf_header.e_entry;
+    image->program_headers = 0;
+    image->program_header_size = elf_header.e_phentsize;
+    image->program_header_count = elf_header.e_phnum;
+    for (i = 0; i < elf_header.e_phnum; ++i) {
+        Elf32_Phdr *header = &program_headers[i];
+        if (header->p_type == PT_LOAD &&
+            elf_header.e_phoff >= header->p_offset &&
+            elf_header.e_phoff - header->p_offset <= header->p_filesz &&
+            headers_size <= header->p_filesz -
+                (elf_header.e_phoff - header->p_offset)) {
+            image->program_headers = header->p_vaddr +
+                (elf_header.e_phoff - header->p_offset);
+            break;
+        }
+    }
     result = 0;
 done:
     free(program_headers);
@@ -421,11 +604,11 @@ done:
 
 int main(int argc, char **argv)
 {
-    uintptr_t entry;
+    struct guest_image image;
     uintptr_t stack_pointer;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s STATIC_ARM_LINUX_ELF\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s STATIC_ARM_LINUX_ELF [ARG ...]\n", argv[0]);
         return 2;
     }
     host_page_size = sysconf(_SC_PAGESIZE);
@@ -433,20 +616,21 @@ int main(int argc, char **argv)
         perror("linuxemu initialization");
         return 1;
     }
-    if (load_guest(argv[1], &entry) != 0) {
+    if (load_guest(argv[1], &image) != 0) {
         perror("linuxemu load");
         return 1;
     }
-    stack_pointer = create_guest_stack();
+    stack_pointer = create_guest_stack(argc - 1, &argv[1], &image);
     if (stack_pointer == 0) {
         perror("linuxemu stack");
         return 1;
     }
 
     printf("linuxemu: entry=%p segments=%u patches=%u stack=%p\n",
-        (void *)entry, (unsigned)load_segment_count, (unsigned)patch_count,
+        (void *)image.entry, (unsigned)load_segment_count,
+        (unsigned)patch_count,
         (void *)stack_pointer);
     fflush(stdout);
-    linuxemu_enter_guest(entry, stack_pointer);
+    linuxemu_enter_guest(image.entry, stack_pointer);
     return 126;
 }

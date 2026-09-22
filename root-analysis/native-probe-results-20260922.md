@@ -185,24 +185,27 @@ The rebuild now includes `src/linuxemu.c`, a deliberately narrow first execution
 - tracks and replaces exact ARM `svc #0` words in executable segments;
 - changes mappings to final permissions and synchronizes executable pages with `MS_INVALIDATE_ICACHE`;
 - installs a `SA_SIGINFO` SIGILL dispatcher;
-- creates a separate one-megabyte guest stack and enters the guest through an ARM trampoline;
+- creates a separate one-megabyte guest stack with `argc`, `argv`, `envp`, and core Linux auxiliary vectors, then enters through an ARM trampoline;
 - translates Linux ARM `write`, `exit`, and `exit_group`;
 - returns Linux `-ENOSYS` for unsupported calls.
 
-Three synthetic static ARM guests are built from source with the recovered SDK. The bounded smoke suite passed:
+Four synthetic static ARM guests are built from source with the recovered SDK. The fourth validates 16-byte stack alignment, forwarded arguments, environment traversal, and `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`, and `AT_EXECFN`. The bounded smoke suite passed:
 
 ```text
 === guest: write-exit ===
-linuxemu: entry=100000 segments=2 patches=2 stack=1023afec
+linuxemu: entry=100000 segments=2 patches=2 stack=104bad90
 hello from Linux ARM guest
 write-exit exit=0 expected=0
 === guest: unknown-syscall ===
-linuxemu: entry=100000 segments=1 patches=2 stack=10cfbfec
+linuxemu: entry=100000 segments=1 patches=2 stack=105ead90
 unknown-syscall exit=0 expected=0
 === guest: exit-status ===
-linuxemu: entry=100000 segments=1 patches=1 stack=10480fec
+linuxemu: entry=100000 segments=1 patches=1 stack=1066cd90
 exit-status exit=37 expected=37
+=== guest: initial-stack ===
+linuxemu: entry=100000 segments=1 patches=1 stack=1042dd70
+initial-stack exit=0 expected=0
 linuxemu_smoke_failures=0
 ```
 
-This is application-level evidence for the first static execution path, not a general ELF loader. Dynamic musl loading, complete initial stack/auxiliary vectors, Thumb guest patching, decoded instruction boundaries, address collision handling, and broader syscall semantics remain outstanding.
+This is application-level evidence for the first static execution path, not a general ELF loader. Dynamic musl loading, additional auxiliary vectors, Thumb guest patching, decoded instruction boundaries, address collision handling, and broader syscall semantics remain outstanding.
