@@ -39,6 +39,42 @@ static generated_function callable_address(void *mapping)
     return conversion.function;
 }
 
+static int set_protection(void *mapping, size_t length, int protection,
+    const char *stage)
+{
+    int result;
+    int saved_errno;
+
+    printf("mode=%s stage=%s_begin protection=0x%x\n",
+        PROBE_MODE, stage, protection);
+    fflush(stdout);
+    errno = 0;
+    result = mprotect(mapping, length, protection);
+    saved_errno = errno;
+    printf("mode=%s stage=%s_end result=%d errno=%d\n",
+        PROBE_MODE, stage, result, saved_errno);
+    fflush(stdout);
+    return result;
+}
+
+static int sync_instruction_cache(void *mapping, size_t length,
+    const char *stage)
+{
+    int result;
+    int saved_errno;
+
+    printf("mode=%s stage=%s_begin flags=0x%x\n",
+        PROBE_MODE, stage, MS_INVALIDATE_ICACHE);
+    fflush(stdout);
+    errno = 0;
+    result = msync(mapping, length, MS_INVALIDATE_ICACHE);
+    saved_errno = errno;
+    printf("mode=%s stage=%s_end result=%d errno=%d\n",
+        PROBE_MODE, stage, result, saved_errno);
+    fflush(stdout);
+    return result;
+}
+
 int main(void)
 {
     long page_size = sysconf(_SC_PAGESIZE);
@@ -48,14 +84,12 @@ int main(void)
     int first;
     int second;
 
+    alarm(10);
     if (page_size <= 0) {
         perror("sysconf");
         return 1;
     }
 
-#if defined(INITIAL_RWX)
-    initial_protection |= PROT_EXEC;
-#endif
     mapping = mmap(0, (size_t)page_size, initial_protection,
         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mapping == MAP_FAILED) {
@@ -68,15 +102,17 @@ int main(void)
         PROBE_MODE, mapping, initial_protection);
     fflush(stdout);
     emit_function(mapping, 42);
-    __builtin___clear_cache(mapping, (char *)mapping + 8);
-#if !defined(INITIAL_RWX)
-    if (mprotect(mapping, (size_t)page_size, PROT_READ | PROT_EXEC) != 0) {
-        printf("mode=%s first_mprotect_rx_error=%d %s\n", PROBE_MODE,
-            errno, strerror(errno));
+    printf("mode=%s stage=first_write_complete\n", PROBE_MODE);
+    fflush(stdout);
+    if (set_protection(mapping, (size_t)page_size,
+            PROT_READ | PROT_EXEC, "first_mprotect_rx") != 0) {
         munmap(mapping, (size_t)page_size);
         return 1;
     }
-#endif
+    if (sync_instruction_cache(mapping, 8, "first_cache_sync") != 0) {
+        munmap(mapping, (size_t)page_size);
+        return 1;
+    }
 
     function = callable_address(mapping);
     printf("mode=%s stage=first_call address=%p\n", PROBE_MODE,
@@ -86,17 +122,20 @@ int main(void)
     printf("mode=%s stage=first_return value=%d\n", PROBE_MODE, first);
     fflush(stdout);
 
-    if (mprotect(mapping, (size_t)page_size, PROT_READ | PROT_WRITE) != 0) {
-        printf("mode=%s mprotect_rw_error=%d %s first=%d\n", PROBE_MODE,
-            errno, strerror(errno), first);
+    if (set_protection(mapping, (size_t)page_size,
+            PROT_READ | PROT_WRITE, "second_mprotect_rw") != 0) {
         munmap(mapping, (size_t)page_size);
         return 1;
     }
     emit_function(mapping, 43);
-    __builtin___clear_cache(mapping, (char *)mapping + 8);
-    if (mprotect(mapping, (size_t)page_size, PROT_READ | PROT_EXEC) != 0) {
-        printf("mode=%s second_mprotect_rx_error=%d %s first=%d\n",
-            PROBE_MODE, errno, strerror(errno), first);
+    printf("mode=%s stage=second_write_complete\n", PROBE_MODE);
+    fflush(stdout);
+    if (set_protection(mapping, (size_t)page_size,
+            PROT_READ | PROT_EXEC, "second_mprotect_rx") != 0) {
+        munmap(mapping, (size_t)page_size);
+        return 1;
+    }
+    if (sync_instruction_cache(mapping, 8, "second_cache_sync") != 0) {
         munmap(mapping, (size_t)page_size);
         return 1;
     }

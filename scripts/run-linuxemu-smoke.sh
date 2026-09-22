@@ -1,0 +1,30 @@
+#!/bin/sh
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+linuxemu="$project_dir/build/linuxemu"
+guest_dir="$project_dir/build/guest-tests"
+timeout_command=${TIMEOUT_COMMAND:-timeout}
+failures=0
+
+run_guest()
+{
+    guest=$1
+    expected=$2
+
+    echo "=== guest: $guest ==="
+    "$timeout_command" 10 "$linuxemu" "$guest_dir/$guest"
+    status=$?
+    echo "$guest exit=$status expected=$expected"
+    if [ "$status" -ne "$expected" ]; then
+        failures=$((failures + 1))
+    fi
+}
+
+run_guest write-exit 0
+run_guest unknown-syscall 0
+run_guest exit-status 37
+
+echo "linuxemu_smoke_failures=$failures"
+test "$failures" -eq 0

@@ -47,13 +47,28 @@ set -x
 "$cc" $common_flags -DGENERATED_THUMB=1 -DPROBE_MODE='"thumb"' \
     -o "$build_dir/executable-memory-thumb" \
     "$project_dir/native-probes/executable-memory.c"
-"$cc" $common_flags -DINITIAL_RWX=1 -DPROBE_MODE='"arm-rwx"' \
-    -o "$build_dir/executable-memory-arm-rwx" \
-    "$project_dir/native-probes/executable-memory.c"
-"$cc" $common_flags -DINITIAL_RWX=1 -DGENERATED_THUMB=1 \
-    -DPROBE_MODE='"thumb-rwx"' \
-    -o "$build_dir/executable-memory-thumb-rwx" \
-    "$project_dir/native-probes/executable-memory.c"
+"$cc" $common_flags -marm -o "$build_dir/tls-registers" \
+    "$project_dir/native-probes/tls-registers.c"
+"$cc" $common_flags -marm -o "$build_dir/tpidrurw-switch" \
+    "$project_dir/native-probes/tpidrurw-switch.c"
+"$cc" $common_flags -marm -o "$build_dir/tpidrurw-cleanup" \
+    "$project_dir/native-probes/tpidrurw-cleanup.c"
+"$cc" $common_flags -marm -o "$build_dir/emulated-tls-read-arm" \
+    "$project_dir/native-probes/emulated-tls-read.c"
+"$cc" $common_flags -mthumb -DPROBE_THUMB=1 \
+    -o "$build_dir/emulated-tls-read-thumb" \
+    "$project_dir/native-probes/emulated-tls-read.c"
+"$cc" $common_flags -std=gnu99 -marm -o "$project_dir/build/linuxemu" \
+    "$project_dir/src/linuxemu.c"
+
+mkdir -p "$project_dir/build/guest-tests"
+for guest in write-exit unknown-syscall exit-status; do
+    "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
+        "$project_dir/guest-tests/$guest.S"
+    "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \
+        -o "$project_dir/build/guest-tests/$guest" \
+        "$project_dir/build/guest-tests/$guest.o"
+done
 set +x
 
 "$sdk_root/bin/readelf" -h "$build_dir/hello"
@@ -63,5 +78,10 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/instruction-trap-thumb"
 "$sdk_root/bin/readelf" -h "$build_dir/executable-memory-arm"
 "$sdk_root/bin/readelf" -h "$build_dir/executable-memory-thumb"
-"$sdk_root/bin/readelf" -h "$build_dir/executable-memory-arm-rwx"
-"$sdk_root/bin/readelf" -h "$build_dir/executable-memory-thumb-rwx"
+"$sdk_root/bin/readelf" -h "$build_dir/tls-registers"
+"$sdk_root/bin/readelf" -h "$build_dir/tpidrurw-switch"
+"$sdk_root/bin/readelf" -h "$build_dir/tpidrurw-cleanup"
+"$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-arm"
+"$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-thumb"
+"$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
+"$sdk_root/bin/readelf" -l "$project_dir/build/guest-tests/write-exit"
