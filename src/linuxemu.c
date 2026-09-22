@@ -2,6 +2,7 @@
 #include <sys/elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,22 +14,49 @@
 #include <unistd.h>
 
 #define ARRAY_COUNT(array) (sizeof(array) / sizeof((array)[0]))
-#define MAX_LOAD_SEGMENTS 16
-#define MAX_PATCHES 256
+#define MAX_LOAD_SEGMENTS 32
+#define MAX_PATCHES 4096
 #define GUEST_MIN_ADDRESS 0x00010000u
-#define GUEST_MAX_ADDRESS 0x08000000u
+#define GUEST_MAX_ADDRESS 0x70000000u
 #define GUEST_STACK_SIZE (1024u * 1024u)
+#define MAIN_ET_DYN_BIAS 0x20000000u
+#define INTERPRETER_BIAS 0x60000000u
 #define ARM_LINUX_SVC_0 0xef000000u
+#define ARM_TPIDRURO_MASK 0xffff0fffu
+#define ARM_TPIDRURO_READ 0xee1d0f70u
 #define ARM_UDF_TRAP 0xe7f000f0u
 #define LINUX_ENOSYS 38
 #define LINUX_NR_EXIT 1
 #define LINUX_NR_WRITE 4
+#define LINUX_NR_GETPID 20
+#define LINUX_NR_MPROTECT 125
+#define LINUX_NR_MMAP2 192
+#define LINUX_NR_GETUID32 199
+#define LINUX_NR_GETGID32 200
+#define LINUX_NR_GETEUID32 201
+#define LINUX_NR_GETEGID32 202
+#define LINUX_NR_SET_TID_ADDRESS 256
 #define LINUX_NR_EXIT_GROUP 248
+#define LINUX_ARM_NR_SET_TLS 0x000f0005u
+#define LINUX_KUSER_MEMORY_BARRIER 0xffff0fa0u
+#define LINUX_KUSER_CMPXCHG 0xffff0fc0u
+#define LINUX_KUSER_GET_TLS 0xffff0fe0u
+#define LINUX_KUSER_VERSION_ADDRESS 0xffff0ffcu
+#define LINUX_KUSER_VERSION 5u
+#define ARM_KUSER_VERSION_LOAD 0xe51cc003u
+#define LINUX_MAP_SHARED 0x00000001u
+#define LINUX_MAP_PRIVATE 0x00000002u
+#define LINUX_MAP_FIXED 0x00000010u
+#define LINUX_MAP_ANONYMOUS 0x00000020u
+#define LINUX_PROT_READ 0x1u
+#define LINUX_PROT_WRITE 0x2u
+#define LINUX_PROT_EXEC 0x4u
 #define LINUX_AT_NULL 0
 #define LINUX_AT_PHDR 3
 #define LINUX_AT_PHENT 4
 #define LINUX_AT_PHNUM 5
 #define LINUX_AT_PAGESZ 6
+#define LINUX_AT_BASE 7
 #define LINUX_AT_ENTRY 9
 #define LINUX_AT_UID 11
 #define LINUX_AT_EUID 12
@@ -54,10 +82,14 @@ static size_t load_segment_count;
 static struct patch_record patches[MAX_PATCHES];
 static size_t patch_count;
 static long host_page_size;
+static uint32_t guest_tls_pointer;
+static int trace_syscalls;
 extern char **environ;
 
 struct guest_image {
     uintptr_t entry;
+    uintptr_t start_entry;
+    uintptr_t interpreter_base;
     uintptr_t program_headers;
     uint32_t program_header_size;
     uint32_t program_header_count;
@@ -66,6 +98,14 @@ struct guest_image {
 struct guest_auxv {
     uint32_t type;
     uint32_t value;
+};
+
+struct elf_object {
+    uintptr_t entry;
+    uintptr_t load_bias;
+    uintptr_t program_headers;
+    uint32_t program_header_size;
+    uint32_t program_header_count;
 };
 
 extern void linuxemu_enter_guest(uintptr_t entry, uintptr_t stack_pointer);
@@ -171,7 +211,7 @@ static int validate_load_range(uintptr_t start, uintptr_t end)
     return 0;
 }
 
-static int patch_arm_syscalls(uintptr_t start, size_t length)
+static int patch_arm_instructions(uintptr_t start, size_t length)
 {
     uintptr_t address;
     uintptr_t end = start + length;
@@ -179,7 +219,8 @@ static int patch_arm_syscalls(uintptr_t start, size_t length)
 
     for (address = align_up(start, 4); address + 4 <= end; address += 4) {
         instruction = (uint32_t *)address;
-        if (*instruction != ARM_LINUX_SVC_0) {
+        if (*instruction != ARM_LINUX_SVC_0 &&
+            (*instruction & ARM_TPIDRURO_MASK) != ARM_TPIDRURO_READ) {
             continue;
         }
         if (patch_count == ARRAY_COUNT(patches)) {
@@ -194,10 +235,11 @@ static int patch_arm_syscalls(uintptr_t start, size_t length)
     return 0;
 }
 
-static int map_load_segment(int fd, const Elf32_Phdr *header)
+static int map_load_segment(int fd, const Elf32_Phdr *header,
+    uintptr_t load_bias)
 {
     uintptr_t page = (uintptr_t)host_page_size;
-    uintptr_t segment_start = (uintptr_t)header->p_vaddr;
+    uintptr_t segment_start;
     uintptr_t segment_end;
     uintptr_t map_start;
     uintptr_t map_end;
@@ -207,7 +249,13 @@ static int map_load_segment(int fd, const Elf32_Phdr *header)
 
     if (header->p_memsz < header->p_filesz ||
         header->p_vaddr + header->p_memsz < header->p_vaddr ||
-        header->p_offset + header->p_filesz < header->p_offset) {
+        header->p_offset + header->p_filesz < header->p_offset ||
+        load_bias > UINTPTR_MAX - (uintptr_t)header->p_vaddr) {
+        errno = ENOEXEC;
+        return -1;
+    }
+    segment_start = load_bias + (uintptr_t)header->p_vaddr;
+    if ((uintptr_t)header->p_memsz > UINTPTR_MAX - segment_start) {
         errno = ENOEXEC;
         return -1;
     }
@@ -244,7 +292,7 @@ static int map_load_segment(int fd, const Elf32_Phdr *header)
     }
 
     if ((header->p_flags & PF_X) != 0 &&
-        patch_arm_syscalls(segment_start, header->p_filesz) != 0) {
+        patch_arm_instructions(segment_start, header->p_filesz) != 0) {
         return -1;
     }
 
@@ -276,13 +324,13 @@ static int finalize_segments(void)
     return 0;
 }
 
-static int is_patched_address(uintptr_t address)
+static const struct patch_record *find_patch(uintptr_t address)
 {
     size_t i;
 
     for (i = 0; i < patch_count; ++i) {
         if (patches[i].address == address) {
-            return 1;
+            return &patches[i];
         }
     }
     return 0;
@@ -311,19 +359,201 @@ static int32_t linux_result(ssize_t result)
     return (int32_t)result;
 }
 
+static int translate_linux_protection(uint32_t linux_protection,
+    int *host_protection)
+{
+    if ((linux_protection &
+            ~(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC)) != 0) {
+        return -1;
+    }
+    *host_protection = PROT_NONE;
+    if ((linux_protection & LINUX_PROT_READ) != 0) {
+        *host_protection |= PROT_READ;
+    }
+    if ((linux_protection & LINUX_PROT_WRITE) != 0) {
+        *host_protection |= PROT_WRITE;
+    }
+    if ((linux_protection & LINUX_PROT_EXEC) != 0) {
+        *host_protection |= PROT_EXEC;
+    }
+    return 0;
+}
+
+static int32_t linux_mmap2(ucontext_t *context)
+{
+    uint32_t linux_flags = context->uc_mcontext.cpu.gpr[3];
+    int host_flags = 0;
+    int host_protection;
+    void *result;
+    off_t offset;
+
+    if (translate_linux_protection(context->uc_mcontext.cpu.gpr[2],
+            &host_protection) != 0) {
+        return -EINVAL;
+    }
+    if ((linux_flags & LINUX_MAP_SHARED) != 0) {
+        host_flags |= MAP_SHARED;
+    } else if ((linux_flags & LINUX_MAP_PRIVATE) != 0) {
+        host_flags |= MAP_PRIVATE;
+    } else {
+        return -EINVAL;
+    }
+    if ((linux_flags & LINUX_MAP_FIXED) != 0) {
+        host_flags |= MAP_FIXED;
+    }
+    if ((linux_flags & LINUX_MAP_ANONYMOUS) != 0) {
+        host_flags |= MAP_ANON;
+    }
+    offset = (off_t)context->uc_mcontext.cpu.gpr[5] * 4096;
+    result = mmap((void *)context->uc_mcontext.cpu.gpr[0],
+        (size_t)context->uc_mcontext.cpu.gpr[1],
+        host_protection, host_flags,
+        (int)context->uc_mcontext.cpu.gpr[4], offset);
+    if (result == MAP_FAILED) {
+        return -(int32_t)errno;
+    }
+    return (int32_t)(uintptr_t)result;
+}
+
+static int32_t linux_mprotect(uintptr_t address, size_t length, int protection)
+{
+    if (mprotect((void *)address, length, protection) == 0) {
+        return 0;
+    }
+    return -(int32_t)errno;
+}
+
+static size_t append_text(char *buffer, size_t position, const char *text)
+{
+    while (*text != '\0') {
+        buffer[position++] = *text++;
+    }
+    return position;
+}
+
+static size_t append_hex32(char *buffer, size_t position, uint32_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    int shift;
+
+    for (shift = 28; shift >= 0; shift -= 4) {
+        buffer[position++] = digits[(value >> shift) & 15u];
+    }
+    return position;
+}
+
+static void trace_guest_syscall(uint32_t number, const ucontext_t *context)
+{
+    char message[160];
+    size_t length = 0;
+    unsigned i;
+
+    if (!trace_syscalls) {
+        return;
+    }
+    length = append_text(message, length, "linuxemu: syscall=0x");
+    length = append_hex32(message, length, number);
+    for (i = 0; i != 6; ++i) {
+        length = append_text(message, length, " r");
+        message[length++] = (char)('0' + i);
+        length = append_text(message, length, "=0x");
+        length = append_hex32(message, length,
+            context->uc_mcontext.cpu.gpr[i]);
+    }
+    message[length++] = '\n';
+    write(STDERR_FILENO, message, length);
+}
+
+static void trace_guest_result(uint32_t result)
+{
+    char message[40];
+    size_t length = 0;
+
+    if (!trace_syscalls) {
+        return;
+    }
+    length = append_text(message, length, "linuxemu: result=0x");
+    length = append_hex32(message, length, result);
+    message[length++] = '\n';
+    write(STDERR_FILENO, message, length);
+}
+
+static void fatal_guest_signal(int sig, siginfo_t *info, uintptr_t pc)
+{
+    char message[80];
+    size_t length = 0;
+
+    length = append_text(message, length, "linuxemu: fatal signal=0x");
+    length = append_hex32(message, length, (uint32_t)sig);
+    length = append_text(message, length, " pc=0x");
+    length = append_hex32(message, length, (uint32_t)pc);
+    length = append_text(message, length, " address=0x");
+    length = append_hex32(message, length, (uint32_t)(uintptr_t)info->si_addr);
+    message[length++] = '\n';
+    write(STDERR_FILENO, message, length);
+    _exit(125);
+}
+
 static void syscall_handler(int sig, siginfo_t *info, void *argument)
 {
     ucontext_t *context = argument;
     uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
+    const struct patch_record *patch = find_patch(pc);
     uint32_t syscall_number;
     int32_t result;
 
-    (void)info;
-    if (sig != SIGILL || !is_patched_address(pc)) {
-        _exit(125);
+    if (sig == SIGSEGV) {
+        if (pc == LINUX_KUSER_GET_TLS) {
+            context->uc_mcontext.cpu.gpr[0] = guest_tls_pointer;
+            context->uc_mcontext.cpu.gpr[15] =
+                context->uc_mcontext.cpu.gpr[14];
+            return;
+        }
+        if (pc == LINUX_KUSER_MEMORY_BARRIER) {
+            __sync_synchronize();
+            context->uc_mcontext.cpu.gpr[15] =
+                context->uc_mcontext.cpu.gpr[14];
+            return;
+        }
+        if (pc == LINUX_KUSER_CMPXCHG) {
+            volatile uint32_t *address = (volatile uint32_t *)
+                context->uc_mcontext.cpu.gpr[2];
+            uint32_t old_value = context->uc_mcontext.cpu.gpr[0];
+            if (__sync_val_compare_and_swap(address, old_value,
+                    context->uc_mcontext.cpu.gpr[1]) == old_value) {
+                context->uc_mcontext.cpu.gpr[0] = 0;
+            } else {
+                context->uc_mcontext.cpu.gpr[0] = (uint32_t)-1;
+            }
+            context->uc_mcontext.cpu.gpr[15] =
+                context->uc_mcontext.cpu.gpr[14];
+            return;
+        }
+        if ((uintptr_t)info->si_addr == LINUX_KUSER_VERSION_ADDRESS &&
+            is_executable_address(pc) &&
+            *(const uint32_t *)pc == ARM_KUSER_VERSION_LOAD) {
+            context->uc_mcontext.cpu.gpr[12] = LINUX_KUSER_VERSION;
+            context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
+            return;
+        }
+        fatal_guest_signal(sig, info, pc);
+    }
+    if (sig != SIGILL || patch == 0) {
+        fatal_guest_signal(sig, info, pc);
+    }
+
+    if ((patch->original & ARM_TPIDRURO_MASK) == ARM_TPIDRURO_READ) {
+        unsigned destination_register = (patch->original >> 12) & 15u;
+        context->uc_mcontext.cpu.gpr[destination_register] = guest_tls_pointer;
+        context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
+        return;
+    }
+    if (patch->original != ARM_LINUX_SVC_0) {
+        fatal_guest_signal(sig, info, pc);
     }
 
     syscall_number = context->uc_mcontext.cpu.gpr[7];
+    trace_guest_syscall(syscall_number, context);
     switch (syscall_number) {
     case LINUX_NR_WRITE:
         result = linux_result(write(
@@ -332,14 +562,50 @@ static void syscall_handler(int sig, siginfo_t *info, void *argument)
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         context->uc_mcontext.cpu.gpr[0] = (uint32_t)result;
         break;
+    case LINUX_NR_MMAP2:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)linux_mmap2(context);
+        break;
+    case LINUX_NR_GETPID:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)getpid();
+        break;
+    case LINUX_NR_GETUID32:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)getuid();
+        break;
+    case LINUX_NR_GETGID32:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)getgid();
+        break;
+    case LINUX_NR_GETEUID32:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)geteuid();
+        break;
+    case LINUX_NR_GETEGID32:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)getegid();
+        break;
+    case LINUX_NR_MPROTECT:
+        if (translate_linux_protection(context->uc_mcontext.cpu.gpr[2],
+                &result) != 0) {
+            result = -EINVAL;
+        } else {
+            result = linux_mprotect(context->uc_mcontext.cpu.gpr[0],
+                (size_t)context->uc_mcontext.cpu.gpr[1], result);
+        }
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)result;
+        break;
+    case LINUX_NR_SET_TID_ADDRESS:
+        context->uc_mcontext.cpu.gpr[0] = (uint32_t)getpid();
+        break;
     case LINUX_NR_EXIT:
     case LINUX_NR_EXIT_GROUP:
         _exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));
+        break;
+    case LINUX_ARM_NR_SET_TLS:
+        guest_tls_pointer = context->uc_mcontext.cpu.gpr[0];
+        context->uc_mcontext.cpu.gpr[0] = 0;
         break;
     default:
         context->uc_mcontext.cpu.gpr[0] = (uint32_t)-LINUX_ENOSYS;
         break;
     }
+    trace_guest_result(context->uc_mcontext.cpu.gpr[0]);
     context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
 }
 
@@ -351,7 +617,10 @@ static int install_syscall_handler(void)
     action.sa_sigaction = syscall_handler;
     action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
-    return sigaction(SIGILL, &action, 0);
+    if (sigaction(SIGILL, &action, 0) != 0) {
+        return -1;
+    }
+    return sigaction(SIGSEGV, &action, 0);
 }
 
 static int fill_random_bytes(void *buffer, size_t length)
@@ -402,7 +671,7 @@ static uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
     uint32_t *words;
     uint32_t *argument_addresses;
     uint32_t *environment_addresses;
-    struct guest_auxv auxiliary[12];
+    struct guest_auxv auxiliary[16];
     unsigned char random_bytes[16];
     uintptr_t random_address;
     uintptr_t executable_address;
@@ -469,6 +738,7 @@ static uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
     ADD_AUXILIARY(LINUX_AT_PHENT, image->program_header_size);
     ADD_AUXILIARY(LINUX_AT_PHNUM, image->program_header_count);
     ADD_AUXILIARY(LINUX_AT_PAGESZ, host_page_size);
+    ADD_AUXILIARY(LINUX_AT_BASE, image->interpreter_base);
     ADD_AUXILIARY(LINUX_AT_ENTRY, image->entry);
     ADD_AUXILIARY(LINUX_AT_UID, getuid());
     ADD_AUXILIARY(LINUX_AT_EUID, geteuid());
@@ -517,7 +787,9 @@ fail:
     return 0;
 }
 
-static int load_guest(const char *path, struct guest_image *image)
+static int load_elf_object(const char *path, uintptr_t dynamic_bias,
+    int allow_executable, struct elf_object *object,
+    char *interpreter, size_t interpreter_capacity)
 {
     Elf32_Ehdr elf_header;
     Elf32_Phdr *program_headers = 0;
@@ -526,6 +798,12 @@ static int load_guest(const char *path, struct guest_image *image)
     size_t i;
     int fd = -1;
     int result = -1;
+    uintptr_t load_bias;
+
+    memset(object, 0, sizeof(*object));
+    if (interpreter != 0 && interpreter_capacity != 0) {
+        interpreter[0] = '\0';
+    }
 
     fd = open(path, O_RDONLY);
     if (fd < 0 || fstat(fd, &file_status) != 0 ||
@@ -536,13 +814,15 @@ static int load_guest(const char *path, struct guest_image *image)
         elf_header.e_ident[EI_CLASS] != ELFCLASS32 ||
         elf_header.e_ident[EI_DATA] != ELFDATA2LSB ||
         elf_header.e_machine != EM_ARM ||
-        elf_header.e_type != ET_EXEC ||
+        (elf_header.e_type != ET_DYN &&
+            !(allow_executable && elf_header.e_type == ET_EXEC)) ||
         elf_header.e_phentsize != sizeof(Elf32_Phdr) ||
         elf_header.e_phnum == 0 || elf_header.e_phnum > MAX_LOAD_SEGMENTS ||
         elf_header.e_phoff > (Elf32_Off)file_status.st_size) {
         errno = ENOEXEC;
         goto done;
     }
+    load_bias = elf_header.e_type == ET_DYN ? dynamic_bias : 0;
     headers_size = (size_t)elf_header.e_phnum * sizeof(Elf32_Phdr);
     if (headers_size > (size_t)file_status.st_size - elf_header.e_phoff) {
         errno = ENOEXEC;
@@ -557,30 +837,37 @@ static int load_guest(const char *path, struct guest_image *image)
 
     for (i = 0; i < elf_header.e_phnum; ++i) {
         if (program_headers[i].p_type == PT_INTERP) {
-            errno = ENOTSUP;
-            goto done;
+            if (interpreter == 0 || interpreter_capacity == 0 ||
+                program_headers[i].p_filesz == 0 ||
+                program_headers[i].p_filesz > interpreter_capacity ||
+                read_exact_at(fd, interpreter, program_headers[i].p_filesz,
+                    (off_t)program_headers[i].p_offset) != 0) {
+                if (errno == 0) {
+                    errno = ENOEXEC;
+                }
+                goto done;
+            }
+            if (interpreter[program_headers[i].p_filesz - 1] != '\0') {
+                errno = ENOEXEC;
+                goto done;
+            }
         }
         if (program_headers[i].p_type == PT_LOAD &&
             program_headers[i].p_memsz != 0 &&
-            map_load_segment(fd, &program_headers[i]) != 0) {
+            map_load_segment(fd, &program_headers[i], load_bias) != 0) {
             goto done;
         }
     }
-    if (load_segment_count == 0 || patch_count == 0 ||
-        elf_header.e_entry < GUEST_MIN_ADDRESS ||
-        elf_header.e_entry >= GUEST_MAX_ADDRESS ||
-        !is_executable_address(elf_header.e_entry) ||
-        finalize_segments() != 0) {
-        if (errno == 0) {
-            errno = ENOEXEC;
-        }
+    if (load_bias > UINTPTR_MAX - elf_header.e_entry) {
+        errno = ENOEXEC;
         goto done;
     }
 
-    image->entry = elf_header.e_entry;
-    image->program_headers = 0;
-    image->program_header_size = elf_header.e_phentsize;
-    image->program_header_count = elf_header.e_phnum;
+    object->entry = load_bias + elf_header.e_entry;
+    object->load_bias = load_bias;
+    object->program_headers = 0;
+    object->program_header_size = elf_header.e_phentsize;
+    object->program_header_count = elf_header.e_phnum;
     for (i = 0; i < elf_header.e_phnum; ++i) {
         Elf32_Phdr *header = &program_headers[i];
         if (header->p_type == PT_LOAD &&
@@ -588,7 +875,7 @@ static int load_guest(const char *path, struct guest_image *image)
             elf_header.e_phoff - header->p_offset <= header->p_filesz &&
             headers_size <= header->p_filesz -
                 (elf_header.e_phoff - header->p_offset)) {
-            image->program_headers = header->p_vaddr +
+            object->program_headers = load_bias + header->p_vaddr +
                 (elf_header.e_phoff - header->p_offset);
             break;
         }
@@ -602,16 +889,74 @@ done:
     return result;
 }
 
+static int load_guest(const char *path, struct guest_image *image)
+{
+    struct elf_object main_object;
+    struct elf_object interpreter_object;
+    char interpreter[PATH_MAX];
+    char interpreter_path[PATH_MAX];
+    const char *root;
+    int length;
+
+    memset(image, 0, sizeof(*image));
+    if (load_elf_object(path, MAIN_ET_DYN_BIAS, 1, &main_object,
+            interpreter, sizeof(interpreter)) != 0) {
+        return -1;
+    }
+
+    image->entry = main_object.entry;
+    image->start_entry = main_object.entry;
+    image->program_headers = main_object.program_headers;
+    image->program_header_size = main_object.program_header_size;
+    image->program_header_count = main_object.program_header_count;
+
+    if (interpreter[0] != '\0') {
+        root = getenv("LINUXEMU_ROOT");
+        if (root == 0 || root[0] == '\0' || interpreter[0] != '/') {
+            errno = ENOENT;
+            return -1;
+        }
+        length = snprintf(interpreter_path, sizeof(interpreter_path),
+            "%s%s", root, interpreter);
+        if (length < 0 || (size_t)length >= sizeof(interpreter_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (load_elf_object(interpreter_path, INTERPRETER_BIAS, 0,
+                &interpreter_object, 0, 0) != 0) {
+            return -1;
+        }
+        image->start_entry = interpreter_object.entry;
+        image->interpreter_base = interpreter_object.load_bias;
+    }
+
+    if (load_segment_count == 0 || patch_count == 0 ||
+        image->entry < GUEST_MIN_ADDRESS ||
+        image->entry >= GUEST_MAX_ADDRESS ||
+        image->start_entry < GUEST_MIN_ADDRESS ||
+        image->start_entry >= GUEST_MAX_ADDRESS ||
+        !is_executable_address(image->entry) ||
+        !is_executable_address(image->start_entry) ||
+        finalize_segments() != 0) {
+        if (errno == 0) {
+            errno = ENOEXEC;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct guest_image image;
     uintptr_t stack_pointer;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s STATIC_ARM_LINUX_ELF [ARG ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s ARM_LINUX_ELF [ARG ...]\n", argv[0]);
         return 2;
     }
     host_page_size = sysconf(_SC_PAGESIZE);
+    trace_syscalls = getenv("LINUXEMU_SYSTRACE") != 0;
     if (host_page_size <= 0 || install_syscall_handler() != 0) {
         perror("linuxemu initialization");
         return 1;
@@ -626,11 +971,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("linuxemu: entry=%p segments=%u patches=%u stack=%p\n",
-        (void *)image.entry, (unsigned)load_segment_count,
+    printf("linuxemu: entry=%p start=%p segments=%u patches=%u stack=%p\n",
+        (void *)image.entry, (void *)image.start_entry,
+        (unsigned)load_segment_count,
         (unsigned)patch_count,
         (void *)stack_pointer);
     fflush(stdout);
-    linuxemu_enter_guest(image.entry, stack_pointer);
+    linuxemu_enter_guest(image.start_entry, stack_pointer);
     return 126;
 }

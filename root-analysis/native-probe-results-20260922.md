@@ -208,4 +208,33 @@ initial-stack exit=0 expected=0
 linuxemu_smoke_failures=0
 ```
 
-This is application-level evidence for the first static execution path, not a general ELF loader. Dynamic musl loading, additional auxiliary vectors, Thumb guest patching, decoded instruction boundaries, address collision handling, and broader syscall semantics remain outstanding.
+This is application-level evidence for the first static execution path, not a general ELF loader. At this checkpoint, dynamic musl loading was the next milestone.
+
+## Initial dynamic musl execution
+
+The pinned dynamic fixture is the official Alpine 3.24.2 armhf minirootfs:
+
+```text
+file=alpine-minirootfs-3.24.2-armhf.tar.gz
+sha256=d86af88b58954d8a90c211004f1e61f208a62d1bb5a2f525f0c1cc26408ab92b
+interpreter=/lib/ld-musl-armhf.so.1
+```
+
+The loader now accepts PIE main executables and their `PT_INTERP`, maps them at separate fixed biases, supplies `AT_BASE`, and begins execution at the interpreter entry while keeping the main entry in `AT_ENTRY`. The executable patch pass handles both ARM `svc #0` and direct TPIDRURO reads. The latter return the current guest TLS pointer; Linux ARM `set_tls` updates it.
+
+Musl also probes the Linux ARM kuser page, which does not exist on QNX. The signal dispatcher narrowly emulates the kuser version word and the `get_tls`, memory-barrier, and 32-bit compare-exchange helper entries. Linux `mmap2` and `mprotect` protection flags are translated explicitly because Linux uses bits `1/2/4` while this QNX ABI uses `0x100/0x200/0x400`. A native subrange probe confirms QNX can change a single page within a two-page mapping for `PROT_NONE` to read/write, read/write to `PROT_NONE`, and read/write to read/execute.
+
+The full native, static, and dynamic suites passed. The dynamic result was:
+
+```text
+=== dynamic guest: true ===
+linuxemu: entry=2000fe48 start=60067b8c segments=4 patches=604 stack=1059dd40
+true exit=0 expected=0
+=== dynamic guest: echo ===
+linuxemu: entry=2000fe48 start=60067b8c segments=4 patches=604 stack=10aaed30
+dynamic-musl-ok
+echo exit=0 expected=0
+linuxemu_dynamic_smoke_failures=0
+```
+
+This establishes a real musl dynamic-linker path for the pinned BusyBox commands. General shared-library file mapping, rootfs path translation, guest threading, guest signals, decoded instruction boundaries, and the broader Linux syscall surface remain outstanding.

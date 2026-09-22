@@ -58,6 +58,8 @@ set -x
 "$cc" $common_flags -mthumb -DPROBE_THUMB=1 \
     -o "$build_dir/emulated-tls-read-thumb" \
     "$project_dir/native-probes/emulated-tls-read.c"
+"$cc" $common_flags -o "$build_dir/mprotect-subrange" \
+    "$project_dir/native-probes/mprotect-subrange.c"
 "$cc" $common_flags -std=gnu99 -marm -o "$project_dir/build/linuxemu" \
     "$project_dir/src/linuxemu.c"
 
@@ -83,5 +85,6 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/tpidrurw-cleanup"
 "$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-arm"
 "$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-thumb"
+"$sdk_root/bin/readelf" -h "$build_dir/mprotect-subrange"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
 "$sdk_root/bin/readelf" -l "$project_dir/build/guest-tests/write-exit"

@@ -28,6 +28,7 @@ run_probe executable-memory-thumb
 run_probe tls-registers
 run_probe emulated-tls-read-arm
 run_probe emulated-tls-read-thumb
+run_probe mprotect-subrange
 
 echo "native_probe_suite_failures=$failures"
 test "$failures" -eq 0
