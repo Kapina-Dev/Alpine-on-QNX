@@ -61,7 +61,9 @@ int main(int argc, char **argv)
         perror("linuxemu rootfs");
         return 1;
     }
-    if (guest_memory_initialize(page_size) != 0 || install_guest_traps() != 0) {
+    if (guest_thread_initialize() != 0 ||
+            guest_memory_initialize(page_size) != 0 ||
+            install_guest_traps() != 0) {
         perror("linuxemu initialization");
         return 1;
     }

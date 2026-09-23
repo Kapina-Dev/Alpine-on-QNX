@@ -416,3 +416,48 @@ current `flock` translation uses QNX `fcntl` record locks.
 After the final Phase 6 build, the native, static guest, dynamic musl,
 loader-negative, filesystem, process, terminal/time, network, and package
 suites all completed with zero failures on the device at `192.168.0.3`.
+
+## Phase 7 threads and futexes
+
+Linux thread clones now run as detached QNX pthreads with pthread-specific
+Linuxemu state. Each state owns its guest TLS value, synthetic Linux TID,
+clear-child-TID address, saved guest registers, and a native-stack retirement
+context. A child begins on the Linux guest stack supplied to `clone`, while a
+thread exit jumps back to its suspended native QNX stack before clearing the
+TID, waking joiners, freeing host state, and returning from the QNX pthread.
+This avoids retaining guest TLS or stack mappings after Linux join completion.
+
+The futex registry performs the expected-value check and waiter insertion while
+holding the same lock used by wake and requeue operations. It covers wait,
+wake, requeue, compare-and-requeue, bitset selection, relative waits, and
+absolute monotonic/realtime deadlines. A direct guest checks `EAGAIN`, timeout,
+bidirectional wakeup, distinct TLS, TID stores, and clear-child-TID behavior.
+A four-thread test performs 2,000 mutex-protected updates, while a lifecycle
+test creates and retires 2,000 sequential threads using the same guest stack.
+
+The Alpine 3.24 musl integration fixture was built inside Linuxemu with GCC
+15.2.0 and musl 1.2.6. Its first condition-variable run found that musl uses
+`FUTEX_REQUEUE_PRIVATE`; implementing that operation released the queued
+workers. The final fixture passed four pthreads, condition wait/broadcast,
+mutex contention, joins, and a timed condition wait:
+
+```text
+thread-futex-syscalls exit=0 expected=0
+clone-vfork-syscalls exit=0 expected=0
+futex-contention-stress exit=0 expected=0
+thread-lifecycle-stress exit=0 expected=0
+pthread_smoke=PASS threads=4 iterations=100 counter=400
+pthread-smoke-musl exit=0 expected=0
+linuxemu_thread_smoke_failures=0
+```
+
+The build also accepts musl's `CLONE_VM | CLONE_VFORK | SIGCHLD` process form
+and used it to run the guest compiler subprocesses. General asynchronous guest
+signal frames and cancellation, priority-inheritance and robust futexes, and
+futex sharing across separate host processes remain unsupported.
+
+After the final Phase 7 build, the native, static guest, dynamic musl,
+loader-negative, filesystem, process, terminal/time, network, package, and
+thread suites all completed with zero failures on the device at
+`192.168.0.3`. Package and compiler setup was removed afterward; the rootfs
+world file, resolver state, and installed package set returned to baseline.

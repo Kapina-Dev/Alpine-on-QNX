@@ -179,6 +179,15 @@ Phase 6 HTTPS and package status recorded on 2026-09-23:
 - `apk update` reads both pinned repositories. A clean nano transaction installs three packages, executes the BusyBox trigger and nano binary, removes all three packages, and restores the original world file with zero failures.
 - Apk runs in explicit unprivileged `--no-chown` mode. QNX timestamp support currently preserves seconds, and `flock` uses QNX record locking rather than Linux open-file-description semantics.
 
+Phase 7 thread and futex status recorded on 2026-09-23:
+- Replaced the process-global guest TLS word with QNX pthread-specific runtime state and synthetic Linux TIDs. Thread clone preserves the guest register set, starts on the requested guest stack, and keeps QNX thread retirement on the native stack.
+- Implemented `gettid`, real `set_tid_address`, clone parent/child TID stores, and clear-and-wake behavior for `clear_child_tid`.
+- Implemented futex wait/wake, requeue/compare-requeue, bitset waits/wakes, and timeouts with the value check and waiter insertion protected by one registry lock.
+- A four-thread synthetic mutex test completed 2,000 protected updates, and 2,000 sequential clone/exit cycles completed without lost wakeups, TLS cross-talk, or creation exhaustion.
+- A pinned Alpine musl fixture passes four pthreads, mutex contention, condition wait/broadcast, joins, and a timed condition wait. Musl condition broadcast exposed and now covers `FUTEX_REQUEUE_PRIVATE`.
+- Added the process-clone form used by musl `posix_spawn`; the Alpine guest compiler successfully built the pthread fixture inside Linuxemu.
+- General asynchronous guest signal frames, cancellation signals, priority-inheritance futexes, robust lists, and cross-process shared futexes remain outside the verified surface.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.

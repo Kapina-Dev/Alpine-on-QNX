@@ -29,7 +29,6 @@ struct guest_auxv {
 
 static long host_page_size;
 static int trace_enabled;
-static uint32_t guest_tls_pointer;
 extern char **environ;
 
 static int guest_environment_entry(const char *value)
@@ -68,9 +67,6 @@ void runtime_initialize(long page_size, int enable_trace)
 
 long runtime_page_size(void) { return host_page_size; }
 int runtime_trace_enabled(void) { return trace_enabled; }
-uint32_t runtime_guest_tls(void) { return guest_tls_pointer; }
-void runtime_set_guest_tls(uint32_t value) { guest_tls_pointer = value; }
-
 static int fill_random_bytes(void *buffer, size_t length)
 {
     unsigned char *cursor = buffer;

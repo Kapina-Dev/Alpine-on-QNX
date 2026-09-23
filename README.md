@@ -26,6 +26,8 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - HTTPS through Alpine's OpenSSL-backed `ssl_client`, including device entropy through Linux `getrandom` and certificate-chain rejection. The pinned Alpine package index downloads and validates as gzip data.
 - Alpine `apk` repository refresh, package extraction, BusyBox trigger scripts, installed dynamic applications, and package removal. A clean nano transaction restores the original world file.
 - Contained rootfs mutation through legacy and directory-relative mkdir, unlink/rmdir, rename, link, symlink, chmod, access, and timestamp calls. Linux shebang execution restarts Linuxemu with the guest interpreter and argv layout.
+- Thread-style `clone` backed by detached QNX pthreads, with separate host lifecycle state, synthetic Linux TIDs, per-thread guest TLS, parent/child TID stores, and `clear_child_tid` wakeup after returning to the native QNX stack.
+- Futex wait, wake, requeue, compare-and-requeue, bitset selection, and relative/absolute timeout paths. Alpine musl pthread creation, joins, mutex contention, condition broadcast, and timed condition waits pass on the device.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
 - PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
 
@@ -109,6 +111,17 @@ sh scripts/run-package-smoke.sh
 This suite temporarily writes the configured resolver into the guest rootfs and
 restores the prior resolver and package world state on exit.
 
+Run synthetic thread/futex races, 2,000 thread lifecycle cycles, and the pinned
+Alpine musl pthread fixture:
+
+```sh
+sh scripts/run-thread-smoke.sh
+```
+
+The fixture source is `guest-tests/pthread-smoke.c`. To rebuild its ARM binary,
+temporarily install Alpine `build-base` in the test rootfs and run
+`sh scripts/build-pthread-fixture.sh`.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -118,6 +131,8 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `guest_path.c`: rootfs path normalization, contained symlink resolution, and guest working-directory state.
 - `linux_abi.c`: explicit Linux errno, open-flag, status-flag, and `stat64` conversion.
 - `guest_process.c`: contained ELF/shebang exec trampoline and guest-to-host process environment boundary.
+- `guest_thread.c`: per-QNX-thread guest state, Linux clone/TID behavior, native-stack retirement, and fork reset.
+- `linux_futex.c`: locked futex waiter registry, wake/requeue operations, and timeout conversion.
 - `guest_signal.c`: signal-number/mask conversion and the bounded SIGCHLD wait path.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
 - `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
@@ -126,15 +141,16 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
 - `trap.c`: SIGILL/SIGSEGV dispatch and Linux ARM kuser helpers.
 - `linux_syscall.c`: the currently supported Linux syscall translations.
-- `runtime.c`: process entry, guest stack, auxiliary vectors, and single-thread TLS state.
+- `runtime.c`: process entry, initial guest stack, and auxiliary vectors.
 - `linuxemu.c`: initialization and handoff only.
 
 ## Current limits
 
 - Dynamic support is currently limited to the pinned Alpine musl/BusyBox path.
-- Thread-style `clone`, guest threading, and general asynchronous signal frames are not implemented; the current kuser and TLS state covers one guest thread per process.
+- General asynchronous guest signal frames and pthread cancellation signals are not implemented.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
-- `vfork` and fork-style `clone` currently use host `fork`; clone flags for shared-memory threads are rejected.
+- `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
+- Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.
 - `ppoll` and `pselect6` install the requested host signal mask around the wait, but QNX 10.3 lacks native entry points that make the mask replacement and wait one atomic operation.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
 - Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.

@@ -85,7 +85,9 @@
 #define LINUX_NR_EXIT_GROUP 248
 #define LINUX_NR_SET_TID_ADDRESS 256
 #define LINUX_NR_GETDENTS64 217
+#define LINUX_NR_GETTID 224
 #define LINUX_NR_FCNTL64 221
+#define LINUX_NR_FUTEX 240
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
@@ -151,6 +153,9 @@
 #define LINUX_WNOHANG 0x00000001u
 #define LINUX_WUNTRACED 0x00000002u
 #define LINUX_WCONTINUED 0x00000008u
+#define LINUX_CLONE_VM 0x00000100u
+#define LINUX_CLONE_VFORK 0x00004000u
+#define LINUX_SIGCHLD 17u
 #define MAX_TRACKED_FDS 256
 
 static DIR *directory_streams[MAX_TRACKED_FDS];
@@ -209,6 +214,18 @@ static int32_t linux_result(ssize_t result)
 static int32_t linux_host_result(int result)
 {
     return result < 0 ? -(int32_t)linux_errno_number(errno) : result;
+}
+
+static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
+{
+    pid_t process = fork();
+    if (process < 0) return -(int32_t)linux_errno_number(errno);
+    if (process == 0) {
+        guest_thread_after_fork();
+        if (child_stack != 0)
+            context->uc_mcontext.cpu.gpr[13] = child_stack;
+    }
+    return (int32_t)process;
 }
 
 static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
@@ -790,7 +807,7 @@ void linux_syscall_dispatch(ucontext_t *context)
     trace_call(number, context);
     switch (number) {
     case LINUX_NR_FORK:
-        result = linux_host_result(fork());
+        result = linux_fork_process(context, 0);
         break;
     case LINUX_NR_READ:
         result = linux_result(read((int)context->uc_mcontext.cpu.gpr[0],
@@ -1055,11 +1072,18 @@ void linux_syscall_dispatch(ucontext_t *context)
             (void *)context->uc_mcontext.cpu.gpr[3]);
         break;
     case LINUX_NR_CLONE:
-        if ((context->uc_mcontext.cpu.gpr[0] & ~0xffu) != 0 ||
+        if ((context->uc_mcontext.cpu.gpr[0] & ~0xffu) == 0 &&
             ((context->uc_mcontext.cpu.gpr[0] & 0xffu) != 0 &&
             (context->uc_mcontext.cpu.gpr[0] & 0xffu) != 17u))
             result = -EINVAL;
-        else result = linux_host_result(fork());
+        else if ((context->uc_mcontext.cpu.gpr[0] & ~0xffu) == 0)
+            result = linux_fork_process(context, 0);
+        else if (context->uc_mcontext.cpu.gpr[0] ==
+                (LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD)) {
+            result = linux_fork_process(context,
+                context->uc_mcontext.cpu.gpr[1]);
+        }
+        else result = guest_thread_clone(context);
         break;
     case LINUX_NR_UNAME:
         result = linux_uname((void *)context->uc_mcontext.cpu.gpr[0]);
@@ -1079,7 +1103,7 @@ void linux_syscall_dispatch(ucontext_t *context)
         if (result < 0) result = -linux_errno_number(errno);
         break;
     case LINUX_NR_VFORK:
-        result = linux_host_result(fork());
+        result = linux_fork_process(context, 0);
         break;
     case LINUX_NR_STAT64:
         result = linux_stat_path(LINUX_AT_FDCWD,
@@ -1178,8 +1202,23 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_poll_syscall(number, context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_GETPID:
-    case LINUX_NR_SET_TID_ADDRESS:
         result = (int32_t)getpid();
+        break;
+    case LINUX_NR_GETTID:
+        result = guest_thread_tid();
+        break;
+    case LINUX_NR_SET_TID_ADDRESS:
+        result = guest_thread_set_tid_address(
+            (uint32_t *)context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_FUTEX:
+        result = linux_futex(
+            (uint32_t *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2],
+            (const void *)context->uc_mcontext.cpu.gpr[3],
+            (uint32_t *)context->uc_mcontext.cpu.gpr[4],
+            context->uc_mcontext.cpu.gpr[5]);
         break;
     case LINUX_NR_GETUID32: result = (int32_t)getuid(); break;
     case LINUX_NR_GETGID32: result = (int32_t)getgid(); break;
@@ -1212,9 +1251,11 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);
         break;
-    case LINUX_NR_EXIT:
     case LINUX_NR_EXIT_GROUP:
         _exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));
+        return;
+    case LINUX_NR_EXIT:
+        guest_thread_exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));
         return;
     case LINUX_ARM_NR_SET_TLS:
         runtime_set_guest_tls(context->uc_mcontext.cpu.gpr[0]);

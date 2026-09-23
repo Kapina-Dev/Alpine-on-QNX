@@ -89,6 +89,17 @@ int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
 int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6]);
+int32_t linux_futex(uint32_t *address, uint32_t operation, uint32_t value,
+    const void *guest_timeout, uint32_t *second_address, uint32_t bitset);
+int32_t linux_futex_wake(uint32_t *address, int count, uint32_t bitset);
+void linux_futex_after_fork(void);
+
+int guest_thread_initialize(void);
+int32_t guest_thread_clone(ucontext_t *context);
+int32_t guest_thread_tid(void);
+int32_t guest_thread_set_tid_address(uint32_t *address);
+void guest_thread_after_fork(void);
+void guest_thread_exit(int status) __attribute__((noreturn));
 
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);
