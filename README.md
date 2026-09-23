@@ -23,6 +23,9 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - Linux ARM wall and monotonic clocks, resolution queries, `time`, `gettimeofday`, `nanosleep`, and `clock_nanosleep`, with explicit time32/time64 layouts. BusyBox `date` and `sleep` work against the pinned rootfs.
 - Linux ARM socket calls for UNIX, IPv4, and IPv6 endpoints, including explicit address, type/descriptor flag, message flag, socket option, and network errno conversion. Both direct ARM socket syscalls and legacy `socketcall` are accepted.
 - Blocking and nonblocking TCP connections, UDP datagrams, socket pairs, DNS queries, and BusyBox HTTP downloads. Numeric IPv4 and `localhost` over IPv6 are covered on the device.
+- HTTPS through Alpine's OpenSSL-backed `ssl_client`, including device entropy through Linux `getrandom` and certificate-chain rejection. The pinned Alpine package index downloads and validates as gzip data.
+- Alpine `apk` repository refresh, package extraction, BusyBox trigger scripts, installed dynamic applications, and package removal. A clean nano transaction restores the original world file.
+- Contained rootfs mutation through legacy and directory-relative mkdir, unlink/rmdir, rename, link, symlink, chmod, access, and timestamp calls. Linux shebang execution restarts Linuxemu with the guest interpreter and argv layout.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
 - PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
 
@@ -96,6 +99,16 @@ The DNS test defaults to resolver `192.168.0.1` and name `example.com`.
 Override them with `DNS_SERVER` and `DNS_NAME` when the device is on another
 network.
 
+Run HTTPS certificate, repository refresh, package install/trigger/execute/remove,
+and cleanup tests:
+
+```sh
+sh scripts/run-package-smoke.sh
+```
+
+This suite temporarily writes the configured resolver into the guest rootfs and
+restores the prior resolver and package world state on exit.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -104,7 +117,7 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `guest_memory.c`: guest address ownership, collision-safe mappings, `brk`, final permissions, and cache synchronization.
 - `guest_path.c`: rootfs path normalization, contained symlink resolution, and guest working-directory state.
 - `linux_abi.c`: explicit Linux errno, open-flag, status-flag, and `stat64` conversion.
-- `guest_process.c`: contained exec trampoline and guest-to-host process environment boundary.
+- `guest_process.c`: contained ELF/shebang exec trampoline and guest-to-host process environment boundary.
 - `guest_signal.c`: signal-number/mask conversion and the bounded SIGCHLD wait path.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
 - `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
@@ -121,10 +134,10 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - Dynamic support is currently limited to the pinned Alpine musl/BusyBox path.
 - Thread-style `clone`, guest threading, and general asynchronous signal frames are not implemented; the current kuser and TLS state covers one guest thread per process.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
-- Directory mutation calls beyond `chdir`/`fchdir` are not implemented yet.
 - `vfork` and fork-style `clone` currently use host `fork`; clone flags for shared-memory threads are rejected.
 - `ppoll` and `pselect6` install the requested host signal mask around the wait, but QNX 10.3 lacks native entry points that make the mask replacement and wait one atomic operation.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
 - Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
+- Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
 - ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.

@@ -33,6 +33,7 @@ run_guest unknown-syscall 0
 run_guest exit-status 37
 run_guest initial-stack 0 alpha beta
 run_guest memory-syscalls 0
+run_guest entropy-syscalls 0
 
 echo "=== guest: file-syscalls ==="
 LINUXEMU_ROOT="$alpine_root" "$timeout_command" 10 \

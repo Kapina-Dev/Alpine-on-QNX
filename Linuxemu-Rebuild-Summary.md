@@ -170,6 +170,15 @@ Phase 5 networking status recorded on 2026-09-23:
 - BusyBox `wget` passes against native loopback HTTP servers through numeric IPv4 and `localhost` IPv6. BusyBox `nslookup` resolves through the configurable LAN resolver, and a refused connection reports Linux `ECONNREFUSED`.
 - Ancillary/control messages and socket options outside the explicit compatibility table remain unsupported.
 
+Phase 6 HTTPS and package status recorded on 2026-09-23:
+- Corrected the ARM `stat64` alignment gap before `st_size`; the earlier layout corrupted sizes and final inode values, causing musl to mistake `libcrypto` for an already loaded library.
+- Added `readv`, a QNX-compatible gathered `writev`, `getrandom` backed by the device entropy source, `fstatfs64`, `umask`, and unprivileged advisory locking.
+- Added contained legacy and at-family directory, unlink, rename, hard-link, symlink, chmod, access, and timestamp operations required by package extraction and database updates.
+- Guest `execve` recognizes shebang files, resolves the interpreter inside the rootfs, and constructs interpreter/optional-argument/script argv entries. Optional syscall tracing survives the host-side exec trampoline without entering the guest environment.
+- BusyBox HTTPS downloads the pinned Alpine 3.24 ARM index through OpenSSL and rejects the same server certificate when given an empty trust store.
+- `apk update` reads both pinned repositories. A clean nano transaction installs three packages, executes the BusyBox trigger and nano binary, removes all three packages, and restores the original world file with zero failures.
+- Apk runs in explicit unprivileged `--no-chown` mode. QNX timestamp support currently preserves seconds, and `flock` uses QNX record locking rather than Linux open-file-description semantics.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.

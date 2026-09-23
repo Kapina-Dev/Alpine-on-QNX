@@ -41,11 +41,30 @@ _start:
     bne fail_lseek
 
     mov r0, r5
+    ldr r1, =read_iov
+    mov r2, #2
+    mov r7, #145
+    svc #0
+    cmp r0, #7
+    bne fail_readv
+
+    mov r0, r5
     ldr r1, =stat_buffer
     mov r7, #197
     svc #0
     cmp r0, #0
     bne fail_fstat
+    ldr r2, =stat_buffer
+    ldr r0, [r2, #48]
+    cmp r0, #7
+    bne fail_fstat_layout
+    ldr r0, [r2, #52]
+    cmp r0, #0
+    bne fail_fstat_layout
+    ldr r0, [r2, #96]
+    ldr r1, [r2, #100]
+    orrs r0, r0, r1
+    beq fail_fstat_layout
 
     mov r0, r4
     ldr r1, =release_name
@@ -55,6 +74,10 @@ _start:
     svc #0
     cmp r0, #0
     bne fail_fstatat
+    ldr r2, =stat_buffer
+    ldr r0, [r2, #48]
+    cmp r0, #7
+    bne fail_fstatat_layout
 
     mov r0, r5
     mov r7, #6
@@ -106,14 +129,23 @@ fail_lseek:
 fail_fstat:
     mov r0, #65
     b exit_guest
+fail_fstat_layout:
+    mov r0, #69
+    b exit_guest
 fail_fstatat:
     mov r0, #66
+    b exit_guest
+fail_fstatat_layout:
+    mov r0, #70
     b exit_guest
 fail_close:
     mov r0, #67
     b exit_guest
 fail_readlinkat:
     mov r0, #68
+    b exit_guest
+fail_readv:
+    mov r0, #71
 exit_guest:
     mov r7, #1
     svc #0
@@ -135,6 +167,16 @@ sh_name:
     .section .bss
     .align 3
 stat_buffer:
-    .space 96
+    .space 104
 read_buffer:
     .space 64
+readv_first:
+    .space 3
+readv_second:
+    .space 4
+
+    .section .data
+    .align 2
+read_iov:
+    .word readv_first, 3
+    .word readv_second, 4

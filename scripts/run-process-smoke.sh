@@ -15,6 +15,11 @@ if [ ! -f "$busybox" ]; then
     exit 2
 fi
 mkdir -p "$output_dir"
+guest_shebang="/tmp/linuxemu-shebang-smoke-$$"
+host_shebang="$alpine_root$guest_shebang"
+printf '%s\n' '#!/bin/sh' 'echo phase6_shebang_ok' >"$host_shebang"
+chmod 755 "$host_shebang"
+trap 'rm -f "$host_shebang"' EXIT HUP INT TERM
 
 run_shell()
 {
@@ -64,6 +69,8 @@ if grep -q '^LINUXEMU_ROOT=\|^LD_LIBRARY_PATH=' \
     echo "environment exposed a host-only variable" >&2
     failures=$((failures + 1))
 fi
+run_shell shebang-exec 0 "$guest_shebang"
+require_line shebang-exec '^phase6_shebang_ok$'
 run_shell shell-exit 37 'exit 37'
 
 echo "linuxemu_process_smoke_failures=$failures"

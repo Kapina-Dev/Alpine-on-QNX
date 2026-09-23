@@ -74,7 +74,7 @@ set -x
 mkdir -p "$project_dir/build/guest-tests"
 for guest in write-exit unknown-syscall exit-status initial-stack \
     memory-syscalls file-syscalls terminal-time-syscalls socket-syscalls \
-    network-connect-syscalls; do
+    network-connect-syscalls entropy-syscalls; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \

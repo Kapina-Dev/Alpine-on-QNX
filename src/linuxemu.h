@@ -74,8 +74,8 @@ const char *guest_path_root(void);
 const char *guest_path_cwd(void);
 
 int guest_process_initialize(const char *emulator);
-int guest_process_exec(const char *host_executable, char *const guest_argv[],
-    char *const guest_envp[]);
+int guest_process_exec(const char *host_executable, const char *guest_executable,
+    char *const guest_argv[], char *const guest_envp[]);
 int32_t guest_signal_action(int linux_signal, const void *guest_action,
     void *guest_old_action, size_t signal_set_size);
 int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,

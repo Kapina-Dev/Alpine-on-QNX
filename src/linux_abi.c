@@ -163,7 +163,7 @@ static void store_u64(unsigned char *buffer, size_t offset, uint64_t value)
 void linux_stat64_store(void *guest_buffer, const struct stat *status)
 {
     unsigned char *buffer = guest_buffer;
-    memset(buffer, 0, 96);
+    memset(buffer, 0, 104);
     store_u64(buffer, 0, (uint64_t)status->st_dev);
     store_u32(buffer, 12, (uint32_t)status->st_ino);
     store_u32(buffer, 16, (uint32_t)status->st_mode);
@@ -171,13 +171,13 @@ void linux_stat64_store(void *guest_buffer, const struct stat *status)
     store_u32(buffer, 24, (uint32_t)status->st_uid);
     store_u32(buffer, 28, (uint32_t)status->st_gid);
     store_u64(buffer, 32, (uint64_t)status->st_rdev);
-    store_u64(buffer, 44, (uint64_t)status->st_size);
-    store_u32(buffer, 52, (uint32_t)status->st_blksize);
-    store_u64(buffer, 56, (uint64_t)status->st_blocks);
-    store_u32(buffer, 64, (uint32_t)status->st_atime);
-    store_u32(buffer, 72, (uint32_t)status->st_mtime);
-    store_u32(buffer, 80, (uint32_t)status->st_ctime);
-    store_u64(buffer, 88, (uint64_t)status->st_ino);
+    store_u64(buffer, 48, (uint64_t)status->st_size);
+    store_u32(buffer, 56, (uint32_t)status->st_blksize);
+    store_u64(buffer, 64, (uint64_t)status->st_blocks);
+    store_u32(buffer, 72, (uint32_t)status->st_atime);
+    store_u32(buffer, 80, (uint32_t)status->st_mtime);
+    store_u32(buffer, 88, (uint32_t)status->st_ctime);
+    store_u64(buffer, 96, (uint64_t)status->st_ino);
 }
 
 void linux_rusage_store(void *guest_buffer, const struct rusage *usage)

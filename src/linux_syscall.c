@@ -7,27 +7,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/uio.h>
+#include <utime.h>
 #include <unistd.h>
 
 #define LINUX_ENOSYS 38
+#define LINUX_EOPNOTSUPP 95
 #define LINUX_NR_EXIT 1
 #define LINUX_NR_FORK 2
 #define LINUX_NR_READ 3
 #define LINUX_NR_WRITE 4
 #define LINUX_NR_OPEN 5
 #define LINUX_NR_CLOSE 6
+#define LINUX_NR_LINK 9
+#define LINUX_NR_UNLINK 10
 #define LINUX_NR_EXECVE 11
 #define LINUX_NR_CHDIR 12
+#define LINUX_NR_CHMOD 15
 #define LINUX_NR_LSEEK 19
 #define LINUX_NR_GETPID 20
 #define LINUX_NR_ACCESS 33
 #define LINUX_NR_KILL 37
+#define LINUX_NR_RENAME 38
+#define LINUX_NR_MKDIR 39
+#define LINUX_NR_RMDIR 40
 #define LINUX_NR_IOCTL 54
+#define LINUX_NR_UMASK 60
 #define LINUX_NR_SETPGID 57
 #define LINUX_NR_SELECT 82
 #define LINUX_NR_GETTIMEOFDAY 78
@@ -40,6 +51,7 @@
 #define LINUX_NR_GETPGRP 65
 #define LINUX_NR_SETSID 66
 #define LINUX_NR_READLINK 85
+#define LINUX_NR_SYMLINK 83
 #define LINUX_NR_MUNMAP 91
 #define LINUX_NR_SOCKETCALL 102
 #define LINUX_NR_WAIT4 114
@@ -48,6 +60,8 @@
 #define LINUX_NR_FCHDIR 133
 #define LINUX_NR_GETPGID 132
 #define LINUX_NR_LLSEEK 140
+#define LINUX_NR_FLOCK 143
+#define LINUX_NR_READV 145
 #define LINUX_NR_WRITEV 146
 #define LINUX_NR_NEWSELECT 142
 #define LINUX_NR_NANOSLEEP 162
@@ -75,6 +89,7 @@
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
+#define LINUX_NR_FSTATFS64 267
 #define LINUX_NR_SOCKET 281
 #define LINUX_NR_BIND 282
 #define LINUX_NR_CONNECT 283
@@ -93,13 +108,22 @@
 #define LINUX_NR_SENDMSG 296
 #define LINUX_NR_RECVMSG 297
 #define LINUX_NR_OPENAT 322
+#define LINUX_NR_MKDIRAT 323
 #define LINUX_NR_FSTATAT64 327
+#define LINUX_NR_UNLINKAT 328
+#define LINUX_NR_RENAMEAT 329
+#define LINUX_NR_LINKAT 330
+#define LINUX_NR_SYMLINKAT 331
 #define LINUX_NR_READLINKAT 332
+#define LINUX_NR_FCHMODAT 333
+#define LINUX_NR_FACCESSAT 334
+#define LINUX_NR_UTIMENSAT 348
 #define LINUX_NR_PSELECT6 335
 #define LINUX_NR_PPOLL 336
 #define LINUX_NR_DUP3 358
 #define LINUX_NR_PIPE2 359
 #define LINUX_NR_ACCEPT4 366
+#define LINUX_NR_GETRANDOM 384
 #define LINUX_NR_CLOCK_GETTIME64 403
 #define LINUX_NR_CLOCK_GETRES_TIME64 406
 #define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
@@ -117,6 +141,8 @@
 #define LINUX_PROT_EXEC 0x4u
 #define LINUX_AT_FDCWD (-100)
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100u
+#define LINUX_AT_REMOVEDIR 0x200u
+#define LINUX_AT_SYMLINK_FOLLOW 0x400u
 #define LINUX_O_CREAT 0x00000040u
 #define LINUX_O_EXCL 0x00000080u
 #define LINUX_O_NOFOLLOW 0x00008000u
@@ -185,6 +211,33 @@ static int32_t linux_host_result(int result)
     return result < 0 ? -(int32_t)linux_errno_number(errno) : result;
 }
 
+static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
+    int count)
+{
+    unsigned char *buffer;
+    size_t total = 0;
+    size_t position = 0;
+    int index;
+    ssize_t result;
+
+    if (count < 0 || count > 1024) return -EINVAL;
+    for (index = 0; index != count; ++index) {
+        if (vectors[index].iov_len > (size_t)INT_MAX - total) return -EINVAL;
+        total += vectors[index].iov_len;
+    }
+    if (total == 0) return 0;
+    buffer = malloc(total);
+    if (buffer == 0) return -ENOMEM;
+    for (index = 0; index != count; ++index) {
+        memcpy(buffer + position, vectors[index].iov_base,
+            vectors[index].iov_len);
+        position += vectors[index].iov_len;
+    }
+    result = write(descriptor, buffer, total);
+    free(buffer);
+    return linux_result(result);
+}
+
 static int directory_path(int directory_fd, const char *guest_path,
     const char **host_directory)
 {
@@ -249,6 +302,169 @@ static int32_t linux_stat_path(int directory_fd, const char *guest_path,
     result = follow ? stat(host_path, &status) : lstat(host_path, &status);
     if (result != 0) return -(int32_t)linux_errno_number(errno);
     linux_stat64_store(guest_status, &status);
+    return 0;
+}
+
+static int32_t linux_mkdirat(int directory_fd, const char *guest_path,
+    uint32_t mode)
+{
+    char host_path[PATH_MAX];
+    if (resolve_at(directory_fd, guest_path, 1, 1, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(mkdir(host_path, (mode_t)(mode & 07777u)));
+}
+
+static int32_t linux_unlinkat(int directory_fd, const char *guest_path,
+    uint32_t flags)
+{
+    char host_path[PATH_MAX];
+    if ((flags & ~LINUX_AT_REMOVEDIR) != 0) return -EINVAL;
+    if (resolve_at(directory_fd, guest_path, 0, 1, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result((flags & LINUX_AT_REMOVEDIR) != 0 ?
+        rmdir(host_path) : unlink(host_path));
+}
+
+static int32_t linux_renameat(int old_directory_fd, const char *old_guest_path,
+    int new_directory_fd, const char *new_guest_path)
+{
+    char old_host_path[PATH_MAX];
+    char new_host_path[PATH_MAX];
+    if (resolve_at(old_directory_fd, old_guest_path, 0, 1, old_host_path,
+            sizeof(old_host_path)) != 0 ||
+        resolve_at(new_directory_fd, new_guest_path, 1, 1, new_host_path,
+            sizeof(new_host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(rename(old_host_path, new_host_path));
+}
+
+static int32_t linux_faccessat(int directory_fd, const char *guest_path,
+    uint32_t mode)
+{
+    char host_path[PATH_MAX];
+    if ((mode & ~7u) != 0) return -EINVAL;
+    if (resolve_at(directory_fd, guest_path, 0, 0, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(access(host_path, (int)mode));
+}
+
+static int32_t linux_linkat(int old_directory_fd, const char *old_guest_path,
+    int new_directory_fd, const char *new_guest_path, uint32_t flags)
+{
+    char old_host_path[PATH_MAX];
+    char new_host_path[PATH_MAX];
+    if ((flags & ~LINUX_AT_SYMLINK_FOLLOW) != 0) return -EINVAL;
+    if (resolve_at(old_directory_fd, old_guest_path, 0,
+            (flags & LINUX_AT_SYMLINK_FOLLOW) == 0, old_host_path,
+            sizeof(old_host_path)) != 0 ||
+        resolve_at(new_directory_fd, new_guest_path, 1, 1, new_host_path,
+            sizeof(new_host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(link(old_host_path, new_host_path));
+}
+
+static int32_t linux_symlinkat(const char *guest_target, int directory_fd,
+    const char *guest_link)
+{
+    char host_link[PATH_MAX];
+    if (guest_target == 0) return -EFAULT;
+    if (resolve_at(directory_fd, guest_link, 1, 1, host_link,
+            sizeof(host_link)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(symlink(guest_target, host_link));
+}
+
+static int32_t linux_chmodat(int directory_fd, const char *guest_path,
+    uint32_t mode)
+{
+    char host_path[PATH_MAX];
+    if (resolve_at(directory_fd, guest_path, 0, 0, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(chmod(host_path, (mode_t)(mode & 07777u)));
+}
+
+static int32_t linux_utimensat(int directory_fd, const char *guest_path,
+    const uint32_t *guest_times, uint32_t flags)
+{
+    char host_path[PATH_MAX];
+    struct stat status;
+    struct utimbuf times;
+    time_t now;
+    size_t index;
+
+    if ((flags & ~LINUX_AT_SYMLINK_NOFOLLOW) != 0) return -EINVAL;
+    if (resolve_at(directory_fd, guest_path, 0,
+            (flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    if (guest_times == 0) return linux_host_result(utime(host_path, 0));
+    if ((flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
+        if (lstat(host_path, &status) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        if (S_ISLNK(status.st_mode)) return -LINUX_EOPNOTSUPP;
+    } else if (stat(host_path, &status) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    now = time(0);
+    if (now == (time_t)-1) return -(int32_t)linux_errno_number(errno);
+    times.actime = status.st_atime;
+    times.modtime = status.st_mtime;
+    for (index = 0; index != 2; ++index) {
+        uint32_t nanoseconds = guest_times[index * 2 + 1];
+        time_t seconds;
+        if (nanoseconds == 0x3fffffffu) seconds = now;
+        else if (nanoseconds == 0x3ffffffeu) continue;
+        else {
+            if (nanoseconds >= 1000000000u) return -EINVAL;
+            seconds = (time_t)(int32_t)guest_times[index * 2];
+        }
+        if (index == 0) times.actime = seconds;
+        else times.modtime = seconds;
+    }
+    return linux_host_result(utime(host_path, &times));
+}
+
+static void store_guest_u32(unsigned char *buffer, size_t offset,
+    uint32_t value)
+{
+    memcpy(buffer + offset, &value, sizeof(value));
+}
+
+static void store_guest_u64(unsigned char *buffer, size_t offset,
+    uint64_t value)
+{
+    memcpy(buffer + offset, &value, sizeof(value));
+}
+
+static int32_t linux_fstatfs64(int descriptor, size_t guest_size,
+    void *guest_buffer)
+{
+    struct statvfs status;
+    unsigned char *buffer = guest_buffer;
+    uint32_t flags = 0;
+
+    if (guest_size < 88) return -EINVAL;
+    if (fstatvfs(descriptor, &status) != 0)
+        return -(int32_t)linux_errno_number(errno);
+#ifdef ST_RDONLY
+    if ((status.f_flag & ST_RDONLY) != 0) flags |= 1u;
+#endif
+#ifdef ST_NOSUID
+    if ((status.f_flag & ST_NOSUID) != 0) flags |= 2u;
+#endif
+    memset(buffer, 0, 88);
+    store_guest_u32(buffer, 4, (uint32_t)status.f_bsize);
+    store_guest_u64(buffer, 8, (uint64_t)status.f_blocks);
+    store_guest_u64(buffer, 16, (uint64_t)status.f_bfree);
+    store_guest_u64(buffer, 24, (uint64_t)status.f_bavail);
+    store_guest_u64(buffer, 32, (uint64_t)status.f_files);
+    store_guest_u64(buffer, 40, (uint64_t)status.f_ffree);
+    store_guest_u32(buffer, 56, (uint32_t)status.f_namemax);
+    store_guest_u32(buffer, 60, (uint32_t)status.f_frsize);
+    store_guest_u32(buffer, 64, flags);
     return 0;
 }
 
@@ -399,7 +615,7 @@ static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
 
     if (guest_path_resolve(guest_path, 0, host_path, sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
-    guest_process_exec(host_path, guest_argv, guest_envp);
+    guest_process_exec(host_path, guest_path, guest_argv, guest_envp);
     return -(int32_t)linux_errno_number(errno);
 }
 
@@ -529,6 +745,43 @@ static int32_t linux_mmap2(ucontext_t *context)
         -(int32_t)linux_errno_number(errno) : (int32_t)(uintptr_t)result;
 }
 
+static int32_t linux_getrandom(void *buffer, size_t length, uint32_t flags)
+{
+    int descriptor;
+    int open_flags = O_RDONLY;
+    ssize_t result;
+
+    if ((flags & ~3u) != 0) return -EINVAL;
+    if (length == 0) return 0;
+    if ((flags & 1u) != 0) open_flags |= O_NONBLOCK;
+    descriptor = open((flags & 2u) != 0 ? "/dev/random" : "/dev/urandom",
+        open_flags);
+    if (descriptor < 0) return -(int32_t)linux_errno_number(errno);
+    result = read(descriptor, buffer, length);
+    if (result < 0) {
+        int saved_errno = errno;
+        close(descriptor);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    close(descriptor);
+    return (int32_t)result;
+}
+
+static int32_t linux_flock(int descriptor, uint32_t operation)
+{
+    struct flock lock;
+    int command;
+
+    if ((operation & ~4u) != 1u && (operation & ~4u) != 2u &&
+        (operation & ~4u) != 8u) return -EINVAL;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = (operation & ~4u) == 1u ? F_RDLCK :
+        (operation & ~4u) == 2u ? F_WRLCK : F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    command = (operation & 4u) != 0 ? F_SETLK : F_SETLKW;
+    return linux_host_result(fcntl(descriptor, command, &lock));
+}
+
 void linux_syscall_dispatch(ucontext_t *context)
 {
     uint32_t number = context->uc_mcontext.cpu.gpr[7];
@@ -549,10 +802,23 @@ void linux_syscall_dispatch(ucontext_t *context)
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         break;
-    case LINUX_NR_WRITEV:
-        result = linux_result(writev((int)context->uc_mcontext.cpu.gpr[0],
+    case LINUX_NR_READV:
+        result = linux_result(readv((int)context->uc_mcontext.cpu.gpr[0],
             (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
             (int)context->uc_mcontext.cpu.gpr[2]));
+        break;
+    case LINUX_NR_WRITEV:
+        result = linux_writev_compat(
+            (int)context->uc_mcontext.cpu.gpr[0],
+            (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_UMASK:
+        result = (int32_t)umask((mode_t)context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_FLOCK:
+        result = linux_flock((int)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_OPEN:
         result = linux_open_path(LINUX_AT_FDCWD,
@@ -560,10 +826,89 @@ void linux_syscall_dispatch(ucontext_t *context)
             context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2]);
         break;
+    case LINUX_NR_LINK:
+        result = linux_linkat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0], LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[1], 0);
+        break;
+    case LINUX_NR_UNLINK:
+        result = linux_unlinkat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0], 0);
+        break;
+    case LINUX_NR_SYMLINK:
+        result = linux_symlinkat(
+            (const char *)context->uc_mcontext.cpu.gpr[0], LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_RENAME:
+        result = linux_renameat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0], LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_MKDIR:
+        result = linux_mkdirat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_RMDIR:
+        result = linux_unlinkat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            LINUX_AT_REMOVEDIR);
+        break;
+    case LINUX_NR_CHMOD:
+        result = linux_chmodat(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
     case LINUX_NR_OPENAT:
         result = linux_open_path((int32_t)context->uc_mcontext.cpu.gpr[0],
             (const char *)context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2],
+            context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_MKDIRAT:
+        result = linux_mkdirat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_UNLINKAT:
+        result = linux_unlinkat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_RENAMEAT:
+        result = linux_renameat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            (int32_t)context->uc_mcontext.cpu.gpr[2],
+            (const char *)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_LINKAT:
+        result = linux_linkat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            (int32_t)context->uc_mcontext.cpu.gpr[2],
+            (const char *)context->uc_mcontext.cpu.gpr[3],
+            context->uc_mcontext.cpu.gpr[4]);
+        break;
+    case LINUX_NR_SYMLINKAT:
+        result = linux_symlinkat(
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            (int32_t)context->uc_mcontext.cpu.gpr[1],
+            (const char *)context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_FCHMODAT:
+        result = linux_chmodat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_FACCESSAT:
+        result = linux_faccessat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_UTIMENSAT:
+        result = linux_utimensat((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            (const uint32_t *)context->uc_mcontext.cpu.gpr[2],
             context->uc_mcontext.cpu.gpr[3]);
         break;
     case LINUX_NR_CLOSE:
@@ -692,6 +1037,16 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_RECVMSG:
     case LINUX_NR_ACCEPT4:
         result = linux_socket_syscall(number, context->uc_mcontext.cpu.gpr);
+        break;
+    case LINUX_NR_GETRANDOM:
+        result = linux_getrandom((void *)context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_FSTATFS64:
+        result = linux_fstatfs64((int)context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1],
+            (void *)context->uc_mcontext.cpu.gpr[2]);
         break;
     case LINUX_NR_WAIT4:
         result = linux_wait4((int32_t)context->uc_mcontext.cpu.gpr[0],

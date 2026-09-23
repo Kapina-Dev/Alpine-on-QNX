@@ -371,3 +371,48 @@ After the final socket-option and `SO_ERROR` conversion changes, the native,
 static guest, dynamic musl, loader-negative, filesystem, process,
 terminal/time, and network suites all completed with zero failures on the
 device at `192.168.0.3`.
+
+## Phase 6 HTTPS and package workflow
+
+The initial OpenSSL load exposed an ARM `stat64` layout error: Linuxemu omitted
+the alignment gap before `st_size`, shifting every later field four bytes.
+BusyBox `stat` consequently reported 16 TiB for both TLS libraries and corrupt
+final inode values, and musl skipped `libcrypto.so.3` as an apparent duplicate.
+After correction it reported distinct inode and size values and loaded both
+OpenSSL libraries.
+
+OpenSSL then required Linux `getrandom`, supplied from the device's native
+`/dev/urandom`. HTTPS also exposed `readv` and QNX descriptors that reject
+native `writev`; Linuxemu now gathers write vectors into one write so pipe and
+file behavior remains atomic for the submitted vector. The HTTPS index download
+was 522953 bytes and passed gzip validation. Repeating the request with an empty
+guest trust store failed certificate verification, proving that the successful
+path did not bypass certificate checking.
+
+Apk required database locking, filesystem information, contained filesystem
+mutation, timestamp preservation, and shebang execution for package triggers.
+The final repeatable suite temporarily configures the guest resolver, restores
+it on exit, and leaves the package world unchanged:
+
+```text
+https-valid exit=0 expected=0
+https-invalid-certificate exit=1 expected=1
+OK: 25135 distinct packages available
+apk-update exit=0 expected=0
+Executing busybox-1.37.0-r31.trigger
+apk-add exit=0 expected=0
+GNU nano, version 9.2
+installed-program exit=0 expected=0
+Executing busybox-1.37.0-r31.trigger
+apk-del exit=0 expected=0
+linuxemu_package_smoke_failures=0
+```
+
+The process suite also directly executed a generated `#!/bin/sh` guest script
+and returned `phase6_shebang_ok`. Package work uses apk's unprivileged
+`--no-chown` mode. QNX `utime` limits preserved timestamps to seconds, and the
+current `flock` translation uses QNX `fcntl` record locks.
+
+After the final Phase 6 build, the native, static guest, dynamic musl,
+loader-negative, filesystem, process, terminal/time, network, and package
+suites all completed with zero failures on the device at `192.168.0.3`.
