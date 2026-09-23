@@ -17,11 +17,8 @@ int read_exact_at(int fd, void *buffer, size_t length, off_t offset)
 {
     unsigned char *cursor = buffer;
 
-    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
-        return -1;
-    }
     while (length != 0) {
-        ssize_t result = read(fd, cursor, length);
+        ssize_t result = pread(fd, cursor, length, offset);
         if (result < 0 && errno == EINTR) {
             continue;
         }
@@ -33,6 +30,7 @@ int read_exact_at(int fd, void *buffer, size_t length, off_t offset)
             return -1;
         }
         cursor += result;
+        offset += result;
         length -= (size_t)result;
     }
     return 0;

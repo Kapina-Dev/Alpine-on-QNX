@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,6 +17,7 @@ static char *host_environment[MAX_EXEC_VECTOR + 2];
 static char shebang_interpreter[PATH_MAX];
 static char shebang_option[256];
 static char shebang_host_path[PATH_MAX];
+extern char **environ;
 
 static int hidden_environment(const char *value)
 {
@@ -28,6 +30,26 @@ int guest_process_initialize(const char *emulator)
 {
     if (emulator == 0 || realpath(emulator, emulator_path) == 0) return -1;
     return 0;
+}
+
+int guest_process_retry_load(char *const arguments[])
+{
+    const char *value = getenv("LINUXEMU_LOAD_RETRY");
+    char retry_value[16];
+    char *end = 0;
+    unsigned long attempt = value == 0 ? 0 : strtoul(value, &end, 10);
+    int saved_errno;
+    if ((value != 0 && (end == value || *end != '\0')) || attempt >= 31) {
+        errno = EEXIST;
+        return -1;
+    }
+    snprintf(retry_value, sizeof(retry_value), "%lu", attempt + 1);
+    if (setenv("LINUXEMU_LOAD_RETRY", retry_value, 1) != 0) return -1;
+    execve(emulator_path, arguments, environ);
+    saved_errno = errno;
+    unsetenv("LINUXEMU_LOAD_RETRY");
+    errno = saved_errno;
+    return -1;
 }
 
 static int read_shebang(const char *host_executable)

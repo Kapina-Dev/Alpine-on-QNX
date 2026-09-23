@@ -153,12 +153,21 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
     struct stat file_status;
     size_t headers_size;
     size_t i;
+    size_t attempt;
     size_t interpreter_count = 0;
-    size_t loads_before = guest_memory_segment_count();
     int fd = -1;
     int result = -1;
-    uintptr_t load_bias;
+    uintptr_t load_bias = 0;
     uintptr_t data_end = 0;
+    static const uintptr_t main_biases[] = {
+        0x20000000u, 0x30000000u, 0x40000000u, 0x50000000u
+    };
+    static const uintptr_t interpreter_biases[] = {
+        0x60000000u, 0x50000000u, 0x40000000u, 0x30000000u
+    };
+    const uintptr_t *biases = dynamic_bias == INTERPRETER_BIAS ?
+        interpreter_biases : main_biases;
+    size_t bias_count;
 
     memset(object, 0, sizeof(*object));
     if (interpreter != 0 && interpreter_capacity != 0) interpreter[0] = '\0';
@@ -201,8 +210,8 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
         errno = ENOEXEC;
         goto done;
     }
-    load_bias = elf_header.e_type == ET_DYN ? dynamic_bias : 0;
-
+    bias_count = elf_header.e_type == ET_DYN ?
+        ARRAY_COUNT(main_biases) : 1;
     for (i = 0; i < elf_header.e_phnum; ++i) {
         Elf32_Phdr *header = &program_headers[i];
         if (header->p_type == PT_INTERP) {
@@ -216,18 +225,41 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
                 goto done;
             }
         }
-        if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
-            guest_memory_map_load_segment(fd, header, load_bias,
-                file_status.st_size) != 0) goto done;
-        if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
-            load_bias + header->p_vaddr + header->p_memsz > data_end)
-            data_end = load_bias + header->p_vaddr + header->p_memsz;
     }
-    if (guest_memory_segment_count() == loads_before ||
-        patch_executable_sections(fd, &elf_header, program_headers, load_bias,
-            file_status.st_size) != 0 ||
-        load_bias > UINTPTR_MAX - elf_header.e_entry) {
+
+    for (attempt = 0; attempt < bias_count; ++attempt) {
+        size_t loads_before = guest_memory_segment_count();
+        size_t patches_before = arm_patch_count();
+        int saved_errno;
+        load_bias = elf_header.e_type == ET_DYN ? biases[attempt] : 0;
+        data_end = 0;
+        for (i = 0; i < elf_header.e_phnum; ++i) {
+            Elf32_Phdr *header = &program_headers[i];
+            if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
+                guest_memory_map_load_segment(fd, header, load_bias,
+                    file_status.st_size) != 0) break;
+            if (header->p_type == PT_LOAD && header->p_memsz != 0 &&
+                load_bias + header->p_vaddr + header->p_memsz > data_end)
+                data_end = load_bias + header->p_vaddr + header->p_memsz;
+        }
+        if (i == elf_header.e_phnum &&
+            guest_memory_segment_count() != loads_before &&
+            patch_executable_sections(fd, &elf_header, program_headers,
+                load_bias, file_status.st_size) == 0 &&
+            load_bias <= UINTPTR_MAX - elf_header.e_entry) break;
         if (errno == 0) errno = ENOEXEC;
+        saved_errno = errno;
+        if (getenv("LINUXEMU_VERBOSE") != 0 || runtime_trace_enabled())
+            fprintf(stderr, "linuxemu: load bias=%p failed: %s\n",
+                (void *)load_bias, strerror(saved_errno));
+        arm_patch_rollback(patches_before);
+        guest_memory_rollback(loads_before);
+        errno = saved_errno;
+        if (elf_header.e_type != ET_DYN || saved_errno != EEXIST)
+            goto done;
+    }
+    if (attempt == bias_count) {
+        errno = EEXIST;
         goto done;
     }
 
@@ -261,10 +293,12 @@ int load_guest_image(const char *path, struct guest_image *image)
     struct elf_object interpreter_object;
     char interpreter[PATH_MAX];
     char interpreter_path[PATH_MAX];
+    size_t loads_before = guest_memory_segment_count();
+    size_t patches_before = arm_patch_count();
 
     memset(image, 0, sizeof(*image));
     if (load_elf_object(path, MAIN_ET_DYN_BIAS, 1, &main_object,
-            interpreter, sizeof(interpreter)) != 0) return -1;
+            interpreter, sizeof(interpreter)) != 0) goto fail;
     image->entry = main_object.entry;
     image->start_entry = main_object.entry;
     image->program_headers = main_object.program_headers;
@@ -276,7 +310,7 @@ int load_guest_image(const char *path, struct guest_image *image)
         if (guest_path_resolve(interpreter, 0, interpreter_path,
                 sizeof(interpreter_path)) != 0 ||
             load_elf_object(interpreter_path, INTERPRETER_BIAS, 0,
-                &interpreter_object, 0, 0) != 0) return -1;
+                &interpreter_object, 0, 0) != 0) goto fail;
         image->start_entry = interpreter_object.entry;
         image->interpreter_base = interpreter_object.load_bias;
     }
@@ -287,7 +321,16 @@ int load_guest_image(const char *path, struct guest_image *image)
         guest_brk_initialize(image->initial_brk) != 0 ||
         guest_memory_finalize() != 0) {
         if (errno == 0) errno = ENOEXEC;
-        return -1;
+        goto fail;
     }
     return 0;
+
+fail:
+    {
+        int saved_errno = errno;
+        arm_patch_rollback(patches_before);
+        guest_memory_rollback(loads_before);
+        errno = saved_errno;
+    }
+    return -1;
 }

@@ -11,12 +11,20 @@
 static int occupy_test_range(void)
 {
     void *mapping;
-    if (getenv("LINUXEMU_TEST_OCCUPY_STATIC") == 0) return 0;
-    mapping = mmap((void *)0x000ff000u, 0x2000,
+    uintptr_t address;
+    size_t length;
+    if (getenv("LINUXEMU_TEST_OCCUPY_STATIC") != 0) {
+        address = 0x000ff000u;
+        length = 0x2000;
+    } else if (getenv("LINUXEMU_TEST_OCCUPY_DYNAMIC") != 0) {
+        address = MAIN_ET_DYN_BIAS;
+        length = 0x1000;
+    } else return 0;
+    mapping = mmap((void *)address, length,
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (mapping == MAP_FAILED) return -1;
-    if (mapping != (void *)0x000ff000u) {
-        munmap(mapping, 0x2000);
+    if (mapping != (void *)address) {
+        munmap(mapping, length);
         errno = EEXIST;
         return -1;
     }
@@ -74,6 +82,8 @@ int main(int argc, char **argv)
     }
 #endif
     if (load_guest_image(load_path, &image) != 0) {
+        if (errno == EEXIST && getenv("LINUXEMU_TEST_OCCUPY_STATIC") == 0)
+            guest_process_retry_load(argv);
         perror("linuxemu load");
         return 1;
     }

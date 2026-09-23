@@ -31,6 +31,9 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - Linux ARM classic and real-time signal frames, handler return, per-thread masks, alternate signal stacks, synchronous guest `SIGILL`, `sigsuspend` interruption, thread-directed delivery, and musl pthread cancellation.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
 - PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
+- PIE startup falls back across four non-overlapping guest biases. Fixed-address Linux executables transparently restart Linuxemu when QNX address randomization occupies their required range.
+- Private executable mappings created after startup are copied into tracked anonymous guest memory, patched for Linux ARM traps, synchronized with the QNX instruction cache, and covered across `mprotect`, `munmap`, and `dlopen` lifecycles.
+- Multithreaded musl `posix_spawn` is covered by 100 repeated child exec/wait cycles while four guest pthreads remain active.
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
 
@@ -130,6 +133,16 @@ thread-directed, and interruption checks:
 sh scripts/run-signal-smoke.sh
 ```
 
+Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
+
+```sh
+sh scripts/run-loader-process-stress.sh
+```
+
+The Phase 9 fixture sources are under `guest-tests`. To rebuild their pinned ARM
+binaries, temporarily install Alpine `build-base` in the test rootfs and run
+`sh scripts/build-phase9-fixtures.sh`.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -165,3 +178,4 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
 - ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
+- Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.

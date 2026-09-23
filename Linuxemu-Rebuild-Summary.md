@@ -197,6 +197,15 @@ Phase 8 signal status recorded on 2026-09-23:
 - Mapped Linux real-time signals now use per-number, per-thread 64-entry queues and retain each deferred QNX `siginfo`; standard signals retain Linux coalescing behavior.
 - `ppoll` and `pselect6` use the transient wake-pipe protocol above, closing the temporary-mask lost-wakeup window without a helper thread.
 
+Phase 9 loader and process/thread status recorded on 2026-09-23:
+- Dynamic startup now tries four exact, non-overlapping bases for each PIE object and rolls back mapped segments and instruction patches between failed attempts. Fixed-address `ET_EXEC` collisions restart Linuxemu with a bounded private retry counter so QNX address randomization can choose a compatible layout without an external retry loop.
+- Runtime guest mappings are tracked across `mmap2`, `mprotect`, `munmap`, `brk`, stack construction, and fork reset. `MAP_FIXED` may replace only an already tracked runtime range and cannot overwrite Linuxemu or a startup ELF segment.
+- Runtime executable pages are patched and synchronized before execution. QNX rejects instruction-cache invalidation on musl's executable file-backed mapping form, so private executable files use an anonymous copy with preserved file-offset semantics; executable shared mappings are rejected.
+- Direct anonymous RW-to-RX execution and 100 `dlopen`/`dlsym`/call/`dlclose` cycles pass. The loaded module contains a direct Linux ARM `svc #0`, proving post-startup patching rather than only symbol resolution.
+- Musl `posix_spawn` completed 1, 10, and 100 child exec/wait cycles while four guest pthreads continued running. Root `pidin ar` confirmed that no Linuxemu, timeout, or spawn-stress process remained afterward.
+- The runtime mapping registry now coalesces adjacent ranges and has a bounded 2,048-entry capacity. This was exercised by `apk update`, whose allocation pattern exceeded the initial 512-entry implementation.
+- The warning-clean device build, core, malformed-loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, and Phase 9 stress suites all passed. Temporary `build-base` packages, compiler sources/binaries, resolver, and stress artifacts were removed; the six-entry world file was restored and the rootfs retained its 16 baseline installed packages.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
@@ -207,7 +216,7 @@ The original application-and-packaging stages were revised after the Phase 7
 thread work. Signals, loader/process stress, Python, Git, and release packaging
 have different failure surfaces and now have separate acceptance gates.
 
-### Phase 8. Signals and interruption
+### Phase 8. Signals and interruption (complete)
 
 - Implement Linux `rt_sigaction`, per-thread masks, pending delivery, guest
   signal frames, and `rt_sigreturn` without exposing QNX context layouts.
@@ -221,7 +230,7 @@ Gate: direct guest handlers and return, nested masks, timed waits, cancellation,
 signal interruption, queued real-time delivery, and atomic polling-mask wakeups
 pass on the device.
 
-### Phase 9. Loader and process/thread hardening
+### Phase 9. Loader and process/thread hardening (complete)
 
 - Remove the intermittent exact-address mapping collision that currently makes
   some guest tool invocations require retries.
@@ -275,9 +284,9 @@ explicitly; they do not block the first supported release by default.
 
 ## Immediate next action
 
-Begin Phase 9 loader and process/thread hardening against the completed signal
-baseline, preserving the full earlier regression suite as its non-regression
-gate.
+Begin Phase 10 by selecting and pinning the Alpine Python runtime and defining
+the application-level import, filesystem, clock, TLS, socket, subprocess,
+signal, and pthread acceptance suite.
 
 ## Evidence and local artifacts
 

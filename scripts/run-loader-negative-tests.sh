@@ -54,5 +54,12 @@ status=$?
 echo "occupied-range exit=$status expected=1"
 if [ "$status" -ne 1 ]; then failures=$((failures + 1)); fi
 
+echo "=== dynamic guest: occupied-first-bias ==="
+LINUXEMU_ROOT="$alpine_root" LINUXEMU_TEST_OCCUPY_DYNAMIC=1 \
+    "$timeout_command" 10 "$test_linuxemu" "$busybox" true
+status=$?
+echo "occupied-first-bias exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 echo "linuxemu_loader_negative_failures=$failures"
 test "$failures" -eq 0

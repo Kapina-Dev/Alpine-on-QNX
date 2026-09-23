@@ -126,6 +126,14 @@ uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
         MAP_PRIVATE | MAP_ANON | MAP_STACK, -1, 0);
     if (mapping == MAP_FAILED) return 0;
     lower_bound = (uintptr_t)mapping;
+    if (lower_bound < GUEST_MIN_ADDRESS ||
+        lower_bound >= GUEST_MAX_ADDRESS ||
+        GUEST_STACK_SIZE > GUEST_MAX_ADDRESS - lower_bound ||
+        guest_memory_runtime_map(lower_bound, GUEST_STACK_SIZE, 0) != 0) {
+        munmap(mapping, GUEST_STACK_SIZE);
+        errno = ENOMEM;
+        return 0;
+    }
     cursor = lower_bound + GUEST_STACK_SIZE;
 
     for (i = 0; environ[i] != 0; ++i)
@@ -210,5 +218,6 @@ fail:
     free(argument_addresses);
     free(environment_addresses);
     munmap(mapping, GUEST_STACK_SIZE);
+    guest_memory_runtime_unmap(lower_bound, GUEST_STACK_SIZE);
     return 0;
 }

@@ -261,6 +261,7 @@ void guest_thread_after_fork(void)
     thread_registry = &main_thread;
     pthread_setspecific(thread_state_key, &main_thread);
     linux_futex_after_fork();
+    guest_memory_after_fork();
 }
 
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)

@@ -1,6 +1,7 @@
 #include "linuxemu.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
 
@@ -16,6 +17,18 @@ static uintptr_t page_size;
 static uintptr_t current_break;
 static uintptr_t minimum_break;
 static uintptr_t break_mapping_end;
+
+#define MAX_RUNTIME_MAPPINGS 2048
+struct runtime_mapping {
+    uintptr_t start;
+    uintptr_t end;
+    int executable;
+};
+
+static struct runtime_mapping runtime_mappings[MAX_RUNTIME_MAPPINGS];
+static struct runtime_mapping runtime_mapping_scratch[MAX_RUNTIME_MAPPINGS + 2];
+static size_t runtime_mapping_count;
+static pthread_mutex_t runtime_mapping_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int ranges_overlap(uintptr_t first_start, uintptr_t first_end,
     uintptr_t second_start, uintptr_t second_end)
@@ -116,6 +129,9 @@ int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
     if (header->p_filesz != 0 &&
         read_exact_at(fd, (void *)segment_start, header->p_filesz,
             (off_t)header->p_offset) != 0) {
+        int saved_errno = errno;
+        munmap(mapping, map_end - map_start);
+        errno = saved_errno;
         return -1;
     }
     if (header->p_memsz > header->p_filesz) {
@@ -167,12 +183,191 @@ int guest_memory_is_executable(uintptr_t address, size_t length)
             return 1;
         }
     }
+    for (i = 0; i < runtime_mapping_count; ++i)
+        if (runtime_mappings[i].executable &&
+            address >= runtime_mappings[i].start &&
+            address + length <= runtime_mappings[i].end) {
+            return 1;
+        }
     return 0;
 }
 
 size_t guest_memory_segment_count(void)
 {
     return load_segment_count;
+}
+
+void guest_memory_rollback(size_t segment_count)
+{
+    while (load_segment_count > segment_count) {
+        struct load_segment *segment = &load_segments[load_segment_count - 1];
+        munmap((void *)segment->map_start, segment->map_length);
+        memset(segment, 0, sizeof(*segment));
+        load_segment_count--;
+    }
+}
+
+static int runtime_range_owned_locked(uintptr_t start, uintptr_t end)
+{
+    uintptr_t cursor = start;
+    while (cursor < end) {
+        uintptr_t covered_end = cursor;
+        size_t i;
+        for (i = 0; i < runtime_mapping_count; ++i)
+            if (runtime_mappings[i].start <= cursor &&
+                runtime_mappings[i].end > covered_end)
+                covered_end = runtime_mappings[i].end;
+        if (covered_end == cursor) return 0;
+        cursor = covered_end;
+    }
+    return 1;
+}
+
+static int runtime_replace_locked(uintptr_t start, uintptr_t end,
+    int add_replacement, int executable)
+{
+    size_t replacement_count = 0;
+    size_t compacted_count = 0;
+    size_t i;
+
+    for (i = 0; i < runtime_mapping_count; ++i) {
+        struct runtime_mapping old = runtime_mappings[i];
+        if (!ranges_overlap(start, end, old.start, old.end))
+            runtime_mapping_scratch[replacement_count++] = old;
+        else {
+            if (old.start < start) {
+                runtime_mapping_scratch[replacement_count].start = old.start;
+                runtime_mapping_scratch[replacement_count].end = start;
+                runtime_mapping_scratch[replacement_count].executable =
+                    old.executable;
+                replacement_count++;
+            }
+            if (old.end > end) {
+                runtime_mapping_scratch[replacement_count].start = end;
+                runtime_mapping_scratch[replacement_count].end = old.end;
+                runtime_mapping_scratch[replacement_count].executable =
+                    old.executable;
+                replacement_count++;
+            }
+        }
+    }
+    if (add_replacement) {
+        runtime_mapping_scratch[replacement_count].start = start;
+        runtime_mapping_scratch[replacement_count].end = end;
+        runtime_mapping_scratch[replacement_count].executable = executable;
+        replacement_count++;
+    }
+    for (i = 1; i < replacement_count; ++i) {
+        struct runtime_mapping item = runtime_mapping_scratch[i];
+        size_t position = i;
+        while (position != 0 &&
+            runtime_mapping_scratch[position - 1].start > item.start) {
+            runtime_mapping_scratch[position] =
+                runtime_mapping_scratch[position - 1];
+            position--;
+        }
+        runtime_mapping_scratch[position] = item;
+    }
+    for (i = 0; i < replacement_count; ++i) {
+        if (compacted_count != 0 &&
+            runtime_mapping_scratch[compacted_count - 1].end ==
+                runtime_mapping_scratch[i].start &&
+            runtime_mapping_scratch[compacted_count - 1].executable ==
+                runtime_mapping_scratch[i].executable) {
+            runtime_mapping_scratch[compacted_count - 1].end =
+                runtime_mapping_scratch[i].end;
+        } else {
+            runtime_mapping_scratch[compacted_count++] =
+                runtime_mapping_scratch[i];
+        }
+    }
+    if (compacted_count > MAX_RUNTIME_MAPPINGS) return -1;
+    memcpy(runtime_mappings, runtime_mapping_scratch,
+        compacted_count * sizeof(*runtime_mappings));
+    runtime_mapping_count = compacted_count;
+    return 0;
+}
+
+int guest_memory_range_owned(uintptr_t address, size_t length)
+{
+    uintptr_t end;
+    size_t i;
+    int owned;
+    if (length == 0 || length > UINTPTR_MAX - address) return 0;
+    end = address + length;
+    for (i = 0; i < load_segment_count; ++i)
+        if (address >= load_segments[i].map_start &&
+            end <= load_segments[i].map_start + load_segments[i].map_length)
+            return 1;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    owned = runtime_range_owned_locked(address, end);
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    return owned;
+}
+
+int guest_memory_runtime_owned(uintptr_t address, size_t length)
+{
+    int owned;
+    if (length == 0 || length > UINTPTR_MAX - address) return 0;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    owned = runtime_range_owned_locked(address, address + length);
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    return owned;
+}
+
+int guest_memory_runtime_map(uintptr_t address, size_t length, int executable)
+{
+    uintptr_t end;
+    int result = -1;
+    if (length == 0 || length > UINTPTR_MAX - address) {
+        errno = EINVAL;
+        return -1;
+    }
+    end = address + length;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    if (runtime_replace_locked(address, end, 1, executable) == 0) {
+        result = 0;
+    } else errno = ENOMEM;
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    return result;
+}
+
+int guest_memory_runtime_protect(uintptr_t address, size_t length,
+    int executable)
+{
+    uintptr_t end;
+    int result = -1;
+    if (length == 0 || length > UINTPTR_MAX - address) {
+        errno = EINVAL;
+        return -1;
+    }
+    end = address + length;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    if (!runtime_range_owned_locked(address, end)) {
+        pthread_mutex_unlock(&runtime_mapping_lock);
+        return 1;
+    }
+    else if (runtime_replace_locked(address, end, 1, executable) != 0)
+        errno = ENOMEM;
+    else {
+        result = 0;
+    }
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    return result;
+}
+
+void guest_memory_runtime_unmap(uintptr_t address, size_t length)
+{
+    if (length == 0 || length > UINTPTR_MAX - address) return;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    runtime_replace_locked(address, address + length, 0, 0);
+    pthread_mutex_unlock(&runtime_mapping_lock);
+}
+
+void guest_memory_after_fork(void)
+{
+    pthread_mutex_t fresh_lock = PTHREAD_MUTEX_INITIALIZER;
+    runtime_mapping_lock = fresh_lock;
 }
 
 int guest_brk_initialize(uintptr_t initial_break)
@@ -199,6 +394,8 @@ uintptr_t guest_brk_set(uintptr_t requested)
         if (requested_mapping_end < break_mapping_end) {
             munmap((void *)requested_mapping_end,
                 break_mapping_end - requested_mapping_end);
+            guest_memory_runtime_unmap(requested_mapping_end,
+                break_mapping_end - requested_mapping_end);
             break_mapping_end = requested_mapping_end;
         }
         current_break = requested;
@@ -213,6 +410,11 @@ uintptr_t guest_brk_set(uintptr_t requested)
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (mapping == MAP_FAILED) return current_break;
         if ((uintptr_t)mapping != break_mapping_end) {
+            munmap(mapping, requested_mapping_end - break_mapping_end);
+            return current_break;
+        }
+        if (guest_memory_runtime_map(break_mapping_end,
+                requested_mapping_end - break_mapping_end, 0) != 0) {
             munmap(mapping, requested_mapping_end - break_mapping_end);
             return current_break;
         }

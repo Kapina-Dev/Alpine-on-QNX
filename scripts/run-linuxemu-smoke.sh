@@ -33,6 +33,7 @@ run_guest unknown-syscall 0
 run_guest exit-status 37
 run_guest initial-stack 0 alpha beta
 run_guest memory-syscalls 0
+run_guest runtime-exec-syscalls 0
 run_guest entropy-syscalls 0
 run_guest thread-futex-syscalls 0
 

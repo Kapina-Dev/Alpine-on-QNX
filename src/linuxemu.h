@@ -50,12 +50,24 @@ int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
 int guest_memory_finalize(void);
 int guest_memory_is_executable(uintptr_t address, size_t length);
 size_t guest_memory_segment_count(void);
+void guest_memory_rollback(size_t segment_count);
+int guest_memory_range_owned(uintptr_t address, size_t length);
+int guest_memory_runtime_owned(uintptr_t address, size_t length);
+int guest_memory_runtime_map(uintptr_t address, size_t length, int executable);
+int guest_memory_runtime_protect(uintptr_t address, size_t length,
+    int executable);
+void guest_memory_runtime_unmap(uintptr_t address, size_t length);
+void guest_memory_after_fork(void);
 int guest_brk_initialize(uintptr_t initial_break);
 uintptr_t guest_brk_set(uintptr_t requested);
 
 int arm_patch_range(uintptr_t start, size_t length);
+int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
+    size_t length);
+void arm_patch_forget_range(uintptr_t address, size_t length);
 const uint32_t *arm_patch_original(uintptr_t address);
 size_t arm_patch_count(void);
+void arm_patch_rollback(size_t patch_count);
 
 int load_guest_image(const char *path, struct guest_image *image);
 
@@ -75,6 +87,7 @@ const char *guest_path_root(void);
 const char *guest_path_cwd(void);
 
 int guest_process_initialize(const char *emulator);
+int guest_process_retry_load(char *const arguments[]);
 int guest_process_exec(const char *host_executable, const char *guest_executable,
     char *const guest_argv[], char *const guest_envp[]);
 int32_t guest_signal_action(int linux_signal, const void *guest_action,

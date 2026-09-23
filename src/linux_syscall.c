@@ -209,6 +209,14 @@ static void trace_result(uint32_t result)
     write(STDERR_FILENO, message, length);
 }
 
+static void trace_internal_failure(const char *message)
+{
+    size_t length = 0;
+    if (!runtime_trace_enabled()) return;
+    while (message[length] != '\0') length++;
+    write(STDERR_FILENO, message, length);
+}
+
 static int32_t linux_result(ssize_t result)
 {
     return result < 0 ? -(int32_t)linux_errno_number(errno) : (int32_t)result;
@@ -741,11 +749,19 @@ static int translate_protection(uint32_t linux_protection,
 
 static int32_t linux_mmap2(ucontext_t *context)
 {
+    uintptr_t requested_address = context->uc_mcontext.cpu.gpr[0];
+    size_t requested_length = (size_t)context->uc_mcontext.cpu.gpr[1];
     uint32_t linux_flags = context->uc_mcontext.cpu.gpr[3];
     int host_flags = 0;
+    int host_descriptor;
     int host_protection;
+    int mapping_protection;
+    int copy_executable_file;
     void *result;
     off_t offset;
+    size_t mapped_length;
+    uintptr_t mapped_address;
+    uintptr_t host_page_size = (uintptr_t)runtime_page_size();
 
     if (translate_protection(context->uc_mcontext.cpu.gpr[2],
             &host_protection) != 0) return -EINVAL;
@@ -755,14 +771,171 @@ static int32_t linux_mmap2(ucontext_t *context)
     if ((linux_flags & LINUX_MAP_SHARED) != 0) host_flags |= MAP_SHARED;
     else if ((linux_flags & LINUX_MAP_PRIVATE) != 0) host_flags |= MAP_PRIVATE;
     else return -EINVAL;
-    if ((linux_flags & LINUX_MAP_FIXED) != 0) host_flags |= MAP_FIXED;
+    if (requested_length == 0 ||
+        requested_length > SIZE_MAX - (host_page_size - 1u)) return -EINVAL;
+    mapped_length = align_up(requested_length, host_page_size);
+    if ((linux_flags & LINUX_MAP_FIXED) != 0) {
+        if ((requested_address & (host_page_size - 1u)) != 0 ||
+            !guest_memory_runtime_owned(requested_address, mapped_length))
+            return -ENOMEM;
+        host_flags |= MAP_FIXED;
+    }
     if ((linux_flags & LINUX_MAP_ANONYMOUS) != 0) host_flags |= MAP_ANON;
+    if ((linux_flags & LINUX_MAP_SHARED) != 0 &&
+        (host_protection & PROT_EXEC) != 0) return -EOPNOTSUPP;
     offset = (off_t)context->uc_mcontext.cpu.gpr[5] * 4096;
-    result = mmap((void *)context->uc_mcontext.cpu.gpr[0],
-        (size_t)context->uc_mcontext.cpu.gpr[1], host_protection, host_flags,
-        (int)context->uc_mcontext.cpu.gpr[4], offset);
-    return result == MAP_FAILED ?
-        -(int32_t)linux_errno_number(errno) : (int32_t)(uintptr_t)result;
+    host_descriptor = (int)context->uc_mcontext.cpu.gpr[4];
+    copy_executable_file =
+        (linux_flags & LINUX_MAP_PRIVATE) != 0 &&
+        (linux_flags & LINUX_MAP_ANONYMOUS) == 0 &&
+        (host_protection & PROT_EXEC) != 0;
+    if (copy_executable_file) {
+        host_flags |= MAP_ANON;
+        host_descriptor = -1;
+    }
+    mapping_protection = host_protection;
+    if ((linux_flags & LINUX_MAP_PRIVATE) != 0 &&
+        (linux_flags & LINUX_MAP_ANONYMOUS) == 0)
+        mapping_protection =
+            (host_protection | PROT_READ | PROT_WRITE) & ~PROT_EXEC;
+    result = mmap((void *)requested_address, requested_length,
+        mapping_protection, host_flags,
+        host_descriptor, copy_executable_file ? 0 : offset);
+    if (result == MAP_FAILED) {
+        trace_internal_failure("linuxemu: host mmap failed\n");
+        return -(int32_t)linux_errno_number(errno);
+    }
+    mapped_address = (uintptr_t)result;
+    if (mapped_address < GUEST_MIN_ADDRESS ||
+        mapped_address >= GUEST_MAX_ADDRESS ||
+        mapped_length > GUEST_MAX_ADDRESS - mapped_address) {
+        trace_internal_failure("linuxemu: host mmap outside guest range\n");
+        munmap(result, mapped_length);
+        return -ENOMEM;
+    }
+    if (copy_executable_file) {
+        struct stat status;
+        size_t file_bytes;
+        int descriptor = (int)context->uc_mcontext.cpu.gpr[4];
+        if (fstat(descriptor, &status) != 0) {
+            int saved_errno = errno;
+            munmap(result, mapped_length);
+            return -(int32_t)linux_errno_number(saved_errno);
+        }
+        if (status.st_size < 0 || offset < 0 || offset > status.st_size) {
+            munmap(result, mapped_length);
+            return -EINVAL;
+        }
+        file_bytes = requested_length;
+        if ((off_t)file_bytes > status.st_size - offset)
+            file_bytes = (size_t)(status.st_size - offset);
+        if (file_bytes != 0 && read_exact_at(descriptor, result,
+                file_bytes, offset) != 0) {
+            int saved_errno = errno;
+            munmap(result, mapped_length);
+            return -(int32_t)linux_errno_number(saved_errno);
+        }
+    }
+    arm_patch_forget_range(mapped_address, mapped_length);
+    if ((linux_flags & LINUX_MAP_ANONYMOUS) == 0 &&
+        arm_patch_elf_mapping((int)context->uc_mcontext.cpu.gpr[4], offset,
+            mapped_address, mapped_length) != 0) {
+        int saved_errno = errno;
+        trace_internal_failure("linuxemu: runtime ELF patch failed\n");
+        arm_patch_forget_range(mapped_address, mapped_length);
+        munmap(result, mapped_length);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    if ((host_protection & PROT_EXEC) != 0 &&
+        msync(result, mapped_length, MS_INVALIDATE_ICACHE) != 0) {
+        int saved_errno = errno;
+        trace_internal_failure("linuxemu: runtime icache sync failed\n");
+        arm_patch_forget_range(mapped_address, mapped_length);
+        munmap(result, mapped_length);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    if (mapping_protection != host_protection &&
+        mprotect(result, mapped_length, host_protection) != 0) {
+        int saved_errno = errno;
+        trace_internal_failure("linuxemu: runtime mprotect failed\n");
+        arm_patch_forget_range(mapped_address, mapped_length);
+        munmap(result, mapped_length);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    if (guest_memory_runtime_map(mapped_address, mapped_length,
+            (host_protection & PROT_EXEC) != 0) != 0) {
+        int saved_errno = errno;
+        trace_internal_failure("linuxemu: runtime mapping registry full\n");
+        arm_patch_forget_range(mapped_address, mapped_length);
+        munmap(result, mapped_length);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    return (int32_t)mapped_address;
+}
+
+static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
+    uint32_t linux_protection)
+{
+    uintptr_t host_page_size = (uintptr_t)runtime_page_size();
+    size_t mapped_length;
+    size_t patches_before = arm_patch_count();
+    int host_protection;
+    if (translate_protection(linux_protection, &host_protection) != 0)
+        return -EINVAL;
+    if (length == 0 || (address & (host_page_size - 1u)) != 0 ||
+        length > SIZE_MAX - (host_page_size - 1u)) return -EINVAL;
+    mapped_length = align_up(length, host_page_size);
+    if (!guest_memory_runtime_owned(address, mapped_length)) {
+        if (!guest_memory_range_owned(address, mapped_length)) return -ENOMEM;
+        if ((host_protection & PROT_EXEC) != 0 &&
+            !guest_memory_is_executable(address, mapped_length)) return -EACCES;
+        if (mprotect((void *)address, mapped_length, host_protection) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        return 0;
+    }
+    if ((host_protection & PROT_EXEC) != 0) {
+        if (mprotect((void *)address, mapped_length,
+                host_protection | PROT_READ | PROT_WRITE) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        if (arm_patch_range(address, mapped_length) != 0) {
+            int saved_errno = errno;
+            arm_patch_rollback(patches_before);
+            mprotect((void *)address, mapped_length, host_protection);
+            return -(int32_t)linux_errno_number(saved_errno);
+        }
+        if (msync((void *)address, mapped_length,
+                MS_INVALIDATE_ICACHE) != 0) {
+            int saved_errno = errno;
+            arm_patch_rollback(patches_before);
+            mprotect((void *)address, mapped_length, host_protection);
+            return -(int32_t)linux_errno_number(saved_errno);
+        }
+    }
+    if (mprotect((void *)address, mapped_length, host_protection) != 0) {
+        int saved_errno = errno;
+        if ((host_protection & PROT_EXEC) != 0)
+            arm_patch_rollback(patches_before);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    if (guest_memory_runtime_protect(address, mapped_length,
+            (host_protection & PROT_EXEC) != 0) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return 0;
+}
+
+static int32_t linux_munmap_runtime(uintptr_t address, size_t length)
+{
+    uintptr_t host_page_size = (uintptr_t)runtime_page_size();
+    size_t mapped_length;
+    if (length == 0 || (address & (host_page_size - 1u)) != 0 ||
+        length > SIZE_MAX - (host_page_size - 1u)) return -EINVAL;
+    mapped_length = align_up(length, host_page_size);
+    if (!guest_memory_runtime_owned(address, mapped_length)) return -EINVAL;
+    if (munmap((void *)address, mapped_length) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    arm_patch_forget_range(address, mapped_length);
+    guest_memory_runtime_unmap(address, mapped_length);
+    return 0;
 }
 
 static int32_t linux_getrandom(void *buffer, size_t length, uint32_t flags)
@@ -1025,17 +1198,13 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_mmap2(context);
         break;
     case LINUX_NR_MPROTECT:
-        if (translate_protection(context->uc_mcontext.cpu.gpr[2], &result) != 0)
-            result = -EINVAL;
-        else if (mprotect((void *)context->uc_mcontext.cpu.gpr[0],
-                (size_t)context->uc_mcontext.cpu.gpr[1], result) != 0)
-            result = -(int32_t)linux_errno_number(errno);
-        else result = 0;
+        result = linux_mprotect_runtime(context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
         break;
     case LINUX_NR_MUNMAP:
-        result = linux_host_result(munmap(
-            (void *)context->uc_mcontext.cpu.gpr[0],
-            (size_t)context->uc_mcontext.cpu.gpr[1]));
+        result = linux_munmap_runtime(context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_SOCKETCALL:
     case LINUX_NR_SOCKET:
