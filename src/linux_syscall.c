@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
@@ -55,6 +56,7 @@
 #define LINUX_NR_MUNMAP 91
 #define LINUX_NR_SOCKETCALL 102
 #define LINUX_NR_WAIT4 114
+#define LINUX_NR_FSYNC 118
 #define LINUX_NR_CLONE 120
 #define LINUX_NR_UNAME 122
 #define LINUX_NR_FCHDIR 133
@@ -63,17 +65,21 @@
 #define LINUX_NR_FLOCK 143
 #define LINUX_NR_READV 145
 #define LINUX_NR_WRITEV 146
+#define LINUX_NR_FDATASYNC 148
 #define LINUX_NR_NEWSELECT 142
 #define LINUX_NR_NANOSLEEP 162
 #define LINUX_NR_POLL 168
 #define LINUX_NR_RT_SIGACTION 174
 #define LINUX_NR_RT_SIGPROCMASK 175
 #define LINUX_NR_RT_SIGSUSPEND 179
+#define LINUX_NR_PREAD64 180
+#define LINUX_NR_PWRITE64 181
 #define LINUX_NR_SIGALTSTACK 186
 #define LINUX_NR_MPROTECT 125
 #define LINUX_NR_GETCWD 183
 #define LINUX_NR_VFORK 190
 #define LINUX_NR_MMAP2 192
+#define LINUX_NR_FTRUNCATE64 194
 #define LINUX_NR_STAT64 195
 #define LINUX_NR_LSTAT64 196
 #define LINUX_NR_FSTAT64 197
@@ -128,6 +134,7 @@
 #define LINUX_NR_DUP3 358
 #define LINUX_NR_PIPE2 359
 #define LINUX_NR_ACCEPT4 366
+#define LINUX_NR_PRLIMIT64 369
 #define LINUX_NR_GETRANDOM 384
 #define LINUX_NR_CLOCK_GETTIME64 403
 #define LINUX_NR_CLOCK_GETRES_TIME64 406
@@ -164,6 +171,77 @@
 static DIR *directory_streams[MAX_TRACKED_FDS];
 static char *fd_paths[MAX_TRACKED_FDS];
 
+struct linux_flock64 {
+    int16_t type;
+    int16_t whence;
+    int32_t padding;
+    int64_t start;
+    int64_t length;
+    int32_t pid;
+    int32_t trailing_padding;
+};
+
+struct linux_rlimit64 {
+    uint64_t current;
+    uint64_t maximum;
+};
+
+static int linux_resource_number(uint32_t resource)
+{
+    switch (resource) {
+    case 0: return RLIMIT_CPU;
+    case 1: return RLIMIT_FSIZE;
+    case 2: return RLIMIT_DATA;
+    case 3: return RLIMIT_STACK;
+    case 4: return RLIMIT_CORE;
+#ifdef RLIMIT_RSS
+    case 5: return RLIMIT_RSS;
+#endif
+#ifdef RLIMIT_NPROC
+    case 6: return RLIMIT_NPROC;
+#endif
+    case 7: return RLIMIT_NOFILE;
+#ifdef RLIMIT_AS
+    case 9: return RLIMIT_AS;
+#endif
+    default: return -1;
+    }
+}
+
+static uint64_t linux_rlimit_value(rlim_t value)
+{
+    return value == RLIM_INFINITY ? UINT64_MAX : (uint64_t)value;
+}
+
+static rlim_t host_rlimit_value(uint64_t value)
+{
+    return value == UINT64_MAX ? RLIM_INFINITY : (rlim_t)value;
+}
+
+static int32_t linux_prlimit64(int32_t process, uint32_t resource,
+    const struct linux_rlimit64 *guest_new_limit,
+    struct linux_rlimit64 *guest_old_limit)
+{
+    struct rlimit host_limit;
+    struct rlimit host_new_limit;
+    int host_resource = linux_resource_number(resource);
+    if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
+    if (host_resource < 0) return -EINVAL;
+    if (getrlimit(host_resource, &host_limit) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    if (guest_old_limit != 0) {
+        guest_old_limit->current = linux_rlimit_value(host_limit.rlim_cur);
+        guest_old_limit->maximum = linux_rlimit_value(host_limit.rlim_max);
+    }
+    if (guest_new_limit != 0) {
+        host_new_limit.rlim_cur = host_rlimit_value(guest_new_limit->current);
+        host_new_limit.rlim_max = host_rlimit_value(guest_new_limit->maximum);
+        if (setrlimit(host_resource, &host_new_limit) != 0)
+            return -(int32_t)linux_errno_number(errno);
+    }
+    return 0;
+}
+
 static size_t append_text(char *buffer, size_t position, const char *text)
 {
     while (*text != '\0') buffer[position++] = *text++;
@@ -194,6 +272,10 @@ static void trace_call(uint32_t number, const ucontext_t *context)
         length = append_text(message, length, "=0x");
         length = append_hex32(message, length, context->uc_mcontext.cpu.gpr[i]);
     }
+    length = append_text(message, length, " lr=0x");
+    length = append_hex32(message, length, context->uc_mcontext.cpu.gpr[14]);
+    length = append_text(message, length, " pc=0x");
+    length = append_hex32(message, length, context->uc_mcontext.cpu.gpr[15]);
     message[length++] = '\n';
     write(STDERR_FILENO, message, length);
 }
@@ -603,6 +685,35 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
         result = fcntl(fd, F_SETFL, current);
         break;
     }
+    case 12:
+    case 13:
+    case 14: {
+        struct linux_flock64 guest_lock;
+        struct flock host_lock;
+        memcpy(&guest_lock, (const void *)argument, sizeof(guest_lock));
+        memset(&host_lock, 0, sizeof(host_lock));
+        if (guest_lock.type == 0) host_lock.l_type = F_RDLCK;
+        else if (guest_lock.type == 1) host_lock.l_type = F_WRLCK;
+        else if (guest_lock.type == 2) host_lock.l_type = F_UNLCK;
+        else return -EINVAL;
+        if (guest_lock.whence < SEEK_SET || guest_lock.whence > SEEK_END)
+            return -EINVAL;
+        host_lock.l_whence = guest_lock.whence;
+        host_lock.l_start = (off_t)guest_lock.start;
+        host_lock.l_len = (off_t)guest_lock.length;
+        result = fcntl(fd, command == 12 ? F_GETLK :
+            command == 13 ? F_SETLK : F_SETLKW, &host_lock);
+        if (result == 0 && command == 12) {
+            guest_lock.type = host_lock.l_type == F_RDLCK ? 0 :
+                host_lock.l_type == F_WRLCK ? 1 : 2;
+            guest_lock.whence = host_lock.l_whence;
+            guest_lock.start = host_lock.l_start;
+            guest_lock.length = host_lock.l_len;
+            guest_lock.pid = host_lock.l_pid;
+            memcpy((void *)argument, &guest_lock, sizeof(guest_lock));
+        }
+        break;
+    }
     default: return -EINVAL;
     }
     if ((command == 0 || command == 1030) && result >= 0)
@@ -995,6 +1106,35 @@ void linux_syscall_dispatch(ucontext_t *context)
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         break;
+    case LINUX_NR_PREAD64: {
+        uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
+            ((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32);
+        result = linux_result(pread((int)context->uc_mcontext.cpu.gpr[0],
+            (void *)context->uc_mcontext.cpu.gpr[1],
+            (size_t)context->uc_mcontext.cpu.gpr[2], (off_t)offset));
+        break;
+    }
+    case LINUX_NR_PWRITE64: {
+        uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
+            ((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32);
+        result = linux_result(pwrite((int)context->uc_mcontext.cpu.gpr[0],
+            (const void *)context->uc_mcontext.cpu.gpr[1],
+            (size_t)context->uc_mcontext.cpu.gpr[2], (off_t)offset));
+        break;
+    }
+    case LINUX_NR_FSYNC:
+    case LINUX_NR_FDATASYNC:
+        /* QNX 10.3 has fsync but no distinct fdatasync operation. */
+        result = linux_host_result(fsync(
+            (int)context->uc_mcontext.cpu.gpr[0]));
+        break;
+    case LINUX_NR_FTRUNCATE64: {
+        uint64_t length = (uint64_t)context->uc_mcontext.cpu.gpr[2] |
+            ((uint64_t)context->uc_mcontext.cpu.gpr[3] << 32);
+        result = linux_host_result(ftruncate(
+            (int)context->uc_mcontext.cpu.gpr[0], (off_t)length));
+        break;
+    }
     case LINUX_NR_READV:
         result = linux_result(readv((int)context->uc_mcontext.cpu.gpr[0],
             (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
@@ -1231,6 +1371,13 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_getrandom((void *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_PRLIMIT64:
+        result = linux_prlimit64(
+            (int32_t)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1],
+            (const struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[2],
+            (struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[3]);
         break;
     case LINUX_NR_FSTATFS64:
         result = linux_fstatfs64((int)context->uc_mcontext.cpu.gpr[0],

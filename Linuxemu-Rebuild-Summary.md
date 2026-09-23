@@ -1,6 +1,6 @@
 # Linuxemu: progress and rebuild plan
 
-Updated: 2026-09-23
+Updated: 2026-09-24
 
 ## Goal and current state
 
@@ -206,6 +206,13 @@ Phase 9 loader and process/thread status recorded on 2026-09-23:
 - The runtime mapping registry now coalesces adjacent ranges and has a bounded 2,048-entry capacity. This was exercised by `apk update`, whose allocation pattern exceeded the initial 512-entry implementation.
 - The warning-clean device build, core, malformed-loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, and Phase 9 stress suites all passed. Temporary `build-base` packages, compiler sources/binaries, resolver, and stress artifacts were removed; the six-entry world file was restored and the rootfs retained its 16 baseline installed packages.
 
+Phase 10 Python status recorded on 2026-09-24:
+- Pinned Alpine `python3` 3.14.7-r1 and `py3-certifi` 2026.2.25-r1 with a 24-APK recursive offline closure. The tracked manifest records SHA-256 for every archive; the ignored artifact directory exists on both the laptop and device.
+- QNX PIDs can exceed musl's 30-bit robust-futex owner field. Linuxemu now assigns bounded synthetic guest TIDs, preventing musl's recursive dynamic-loader lock from treating its owner as a different thread and waiting on itself during `sqlite3` import.
+- Added ARM `pread64`, `pwrite64`, `fsync`, `fdatasync`, `ftruncate64`, `fcntl64` record-lock, and `prlimit64` translation. These closed SQLite file transactions and prevented CPython's subprocess child from iterating to `INT_MAX` while closing descriptors.
+- The application suite passes imports, compressed/hash/decimal/ctypes operations, file and SQLite round trips, wall and monotonic clocks, TCP/UDP, certificate-verified HTTPS, shell and Python subprocesses, guest signal delivery, four Python threads, and the `ENOSYS` failure path for unsupported epoll.
+- The reproducible runner verifies every APK hash, installs the closure offline under a temporary virtual package, and restores the resolver, six-entry world file, and 16-package baseline. All earlier core, loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, and Phase 9 stress suites pass with the Phase 10 runtime.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
@@ -245,7 +252,7 @@ pass on the device.
 Gate: repeated loader and process/thread stress runs complete without retries,
 stale host state, leaked mappings, or guest-root filesystem damage.
 
-### Phase 10. Python runtime
+### Phase 10. Python runtime (complete)
 
 - Pin an Alpine Python version and package set, preserving archive hashes.
 - Test imports, files, clocks, SSL, sockets, subprocesses, signals, and Python
@@ -284,9 +291,8 @@ explicitly; they do not block the first supported release by default.
 
 ## Immediate next action
 
-Begin Phase 10 by selecting and pinning the Alpine Python runtime and defining
-the application-level import, filesystem, clock, TLS, socket, subprocess,
-signal, and pthread acceptance suite.
+Begin Phase 11 with a pinned local Git repository fixture, then cover local
+object workflows and HTTPS clone/fetch success and failure paths.
 
 ## Evidence and local artifacts
 

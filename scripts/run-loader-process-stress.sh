@@ -9,7 +9,7 @@ fixture_dir="$project_dir/guest-tests/fixtures"
 timeout_command=${TIMEOUT_COMMAND:-timeout}
 spawn_count=${SPAWN_COUNT:-100}
 failures=0
-module=/tmp/linuxemu-phase9-module.so
+module=/tmp/libphase9.so
 
 for fixture in phase9-module-armhf.so dlopen-stress-armhf \
     spawn-thread-stress-armhf; do

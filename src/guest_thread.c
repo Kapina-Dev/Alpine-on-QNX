@@ -68,6 +68,26 @@ static volatile uint32_t next_tid;
 static pthread_mutex_t thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct guest_thread_state *thread_registry;
 
+/*
+ * Linux reserves the top two bits of a TID stored in a robust futex word.
+ * QNX process IDs can use those bits, so they cannot be exposed directly as
+ * guest TIDs.  Keep synthetic guest thread IDs in the Linux 30-bit range.
+ */
+static int32_t initial_guest_tid(void)
+{
+    uint32_t tid = (uint32_t)getpid() & 0x3fffffffu;
+    return (int32_t)(tid == 0 ? 1 : tid);
+}
+
+static int32_t allocate_guest_tid(void)
+{
+    uint32_t tid;
+    do {
+        tid = __sync_fetch_and_add(&next_tid, 1u) & 0x3fffffffu;
+    } while (tid == 0);
+    return (int32_t)tid;
+}
+
 __asm__(
     ".text\n"
     ".align 2\n"
@@ -142,10 +162,10 @@ int guest_thread_initialize(void)
     memset(&main_thread, 0, sizeof(main_thread));
     main_thread.signal_wait_read_fd = -1;
     main_thread.signal_wait_write_fd = -1;
-    main_thread.tid = (int32_t)getpid();
+    main_thread.tid = initial_guest_tid();
     main_thread.host_thread = pthread_self();
     thread_registry = &main_thread;
-    next_tid = (uint32_t)getpid() + 1u;
+    next_tid = (uint32_t)main_thread.tid + 1u;
     error = pthread_setspecific(thread_state_key, &main_thread);
     if (error != 0) { errno = error; return -1; }
     return 0;
@@ -182,7 +202,7 @@ int32_t guest_thread_clone(ucontext_t *context)
         parent->guest_tls;
     memcpy(state->signal_mask, parent->signal_mask,
         sizeof(state->signal_mask));
-    state->tid = (int32_t)__sync_fetch_and_add(&next_tid, 1u);
+    state->tid = allocate_guest_tid();
     tid = state->tid;
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0)
         state->clear_child_tid = child_tid;
@@ -216,7 +236,7 @@ int32_t guest_thread_clone(ucontext_t *context)
 int32_t guest_thread_tid(void)
 {
     struct guest_thread_state *state = current_thread();
-    return state == 0 ? (int32_t)getpid() : state->tid;
+    return state == 0 ? initial_guest_tid() : state->tid;
 }
 
 int32_t guest_thread_set_tid_address(uint32_t *address)
@@ -254,9 +274,9 @@ void guest_thread_after_fork(void)
         sizeof(main_thread.signal_mask));
     main_thread.altstack_pointer = altstack_pointer;
     main_thread.altstack_size = altstack_size;
-    main_thread.tid = (int32_t)getpid();
+    main_thread.tid = initial_guest_tid();
     main_thread.host_thread = pthread_self();
-    next_tid = (uint32_t)getpid() + 1u;
+    next_tid = (uint32_t)main_thread.tid + 1u;
     thread_registry_lock = fresh_lock;
     thread_registry = &main_thread;
     pthread_setspecific(thread_state_key, &main_thread);

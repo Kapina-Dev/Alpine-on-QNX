@@ -34,6 +34,12 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - PIE startup falls back across four non-overlapping guest biases. Fixed-address Linux executables transparently restart Linuxemu when QNX address randomization occupies their required range.
 - Private executable mappings created after startup are copied into tracked anonymous guest memory, patched for Linux ARM traps, synchronized with the QNX instruction cache, and covered across `mprotect`, `munmap`, and `dlopen` lifecycles.
 - Multithreaded musl `posix_spawn` is covered by 100 repeated child exec/wait cycles while four guest pthreads remain active.
+- Linux positional file I/O, file sync/truncate, `fcntl64` record locks, and
+  self-process `prlimit64` support the SQLite and subprocess paths used by
+  Alpine Python.
+- Alpine Python 3.14.7 imports and runs files, SQLite, clocks, verified HTTPS,
+  loopback TCP/UDP, subprocesses, signals, and four-thread synchronization.
+  Unsupported `epoll` creation returns Linux `ENOSYS`.
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
 
@@ -143,6 +149,19 @@ The Phase 9 fixture sources are under `guest-tests`. To rebuild their pinned ARM
 binaries, temporarily install Alpine `build-base` in the test rootfs and run
 `sh scripts/build-phase9-fixtures.sh`.
 
+Run the pinned Python 3.14.7 suite from the clean 16-package rootfs:
+
+```sh
+sh scripts/run-python-smoke.sh
+```
+
+The ignored `artifacts/python-3.14.7-alpine-3.24-armhf` directory contains the
+24-APK offline closure. Its tracked hashes are in
+`docs/python-runtime-apks.sha256`. The runner verifies every archive, installs
+them under one virtual package, runs the Python application suite, and restores
+the resolver, package world, and 16-package baseline on exit. Override the
+default resolver with `DNS_SERVER` when needed.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -176,6 +195,9 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
 - Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
 - Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
+- Linux `fdatasync` uses QNX `fsync`, which provides the required durability
+  with stronger flushing semantics. `prlimit64` currently accepts the current
+  process only.
 - ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
 - Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.
