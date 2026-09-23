@@ -28,6 +28,7 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - Contained rootfs mutation through legacy and directory-relative mkdir, unlink/rmdir, rename, link, symlink, chmod, access, and timestamp calls. Linux shebang execution restarts Linuxemu with the guest interpreter and argv layout.
 - Thread-style `clone` backed by detached QNX pthreads, with separate host lifecycle state, synthetic Linux TIDs, per-thread guest TLS, parent/child TID stores, and `clear_child_tid` wakeup after returning to the native QNX stack.
 - Futex wait, wake, requeue, compare-and-requeue, bitset selection, and relative/absolute timeout paths. Alpine musl pthread creation, joins, mutex contention, condition broadcast, and timed condition waits pass on the device.
+- Linux ARM classic and real-time signal frames, handler return, per-thread masks, alternate signal stacks, synchronous guest `SIGILL`, `sigsuspend` interruption, thread-directed delivery, and musl pthread cancellation.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
 - PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
 
@@ -122,6 +123,13 @@ The fixture source is `guest-tests/pthread-smoke.c`. To rebuild its ARM binary,
 temporarily install Alpine `build-base` in the test rootfs and run
 `sh scripts/build-pthread-fixture.sh`.
 
+Run direct signal-frame, mask, alternate-stack, synchronous-fault, real-time,
+thread-directed, and interruption checks:
+
+```sh
+sh scripts/run-signal-smoke.sh
+```
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -133,7 +141,7 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `guest_process.c`: contained ELF/shebang exec trampoline and guest-to-host process environment boundary.
 - `guest_thread.c`: per-QNX-thread guest state, Linux clone/TID behavior, native-stack retirement, and fork reset.
 - `linux_futex.c`: locked futex waiter registry, wake/requeue operations, and timeout conversion.
-- `guest_signal.c`: signal-number/mask conversion and the bounded SIGCHLD wait path.
+- `guest_signal.c`: signal-number conversion, per-thread masks, Linux ARM signal frames, alternate stacks, delivery, and return.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
 - `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
 - `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
@@ -147,7 +155,7 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 ## Current limits
 
 - Dynamic support is currently limited to the pinned Alpine musl/BusyBox path.
-- General asynchronous guest signal frames and pthread cancellation signals are not implemented.
+- `SA_RESTART` is implemented for the translated blocking read/write, wait, futex, ioctl, and socket calls. Linux real-time signals are mapped only while QNX real-time numbers are available, and pending instances of the same signal are currently coalesced rather than queued.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
 - `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
 - Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.

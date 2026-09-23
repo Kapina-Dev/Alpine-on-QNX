@@ -461,3 +461,46 @@ loader-negative, filesystem, process, terminal/time, network, package, and
 thread suites all completed with zero failures on the device at
 `192.168.0.3`. Package and compiler setup was removed afterward; the rootfs
 world file, resolver state, and installed package set returned to baseline.
+
+## Phase 8 signals and interruption
+
+Linuxemu now constructs Linux ARM classic and real-time signal frames instead
+of calling guest handlers from emulator C. The frame preserves core registers,
+the Linux mask, and QNX VFP state in the ARM auxiliary-frame layout. Signal
+return restores that state through emulator-owned executable trampolines or a
+guest restorer. An 8 KiB separation keeps a guest frame from overwriting the
+live QNX signal frame because this QNX release has no `SA_ONSTACK`; Linux guest
+alternate stacks are implemented independently.
+
+Per-thread Linux mask, pending, alternate-stack, and interrupted-wait state now
+live beside the Phase 7 TLS/TID state. Standard and the available real-time
+signals map explicitly to QNX numbers. `tkill` and `tgkill` resolve synthetic
+Linux TIDs to registered QNX pthreads. A direct guest verifies classic and
+`SA_SIGINFO` handlers, register and mask restoration, alternate-stack handler
+execution, thread-directed real-time delivery, synchronous `SIGILL` recovery,
+and `sigsuspend` returning Linux `EINTR` after handler completion.
+The same guest blocks in a pipe read, receives a handler registered with
+`SA_RESTART`, retries from the saved syscall PC, and reads the byte written by
+the child afterward.
+
+QNX condition waits did not return when musl sent its internal cancellation
+signal to a blocked thread. Futex waiters now use one semaphore per waiter;
+the signal handler records the pending signal and posts that semaphore, while
+the existing registry lock continues to protect value checks, insertion,
+wake, and requeue. The rebuilt musl fixture now reports:
+
+```text
+pthread_smoke=PASS threads=4 iterations=100 counter=400 cancellation=ok
+```
+
+`SA_RESTART` covers the explicitly translated blocking read/write, wait, futex,
+ioctl, and socket calls. Duplicate real-time signal queueing is not implemented.
+`ppoll` and `pselect6` still have the documented QNX 10.3 gap
+between temporary mask installation and entering `poll`/`select`; root-only
+`/proc/<pid>` access does not supply a kernel primitive that closes that race.
+
+After the Phase 8 signal-core build, the native, static guest, signal, dynamic
+musl, loader-negative, filesystem, process, terminal/time, network, package,
+and thread suites all completed with zero failures on `192.168.0.3`. The
+temporary Alpine compiler packages, nano transaction, and resolver were
+removed; the package world and installed set returned to baseline.

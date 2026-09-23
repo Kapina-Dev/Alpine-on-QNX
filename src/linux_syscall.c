@@ -69,6 +69,7 @@
 #define LINUX_NR_RT_SIGACTION 174
 #define LINUX_NR_RT_SIGPROCMASK 175
 #define LINUX_NR_RT_SIGSUSPEND 179
+#define LINUX_NR_SIGALTSTACK 186
 #define LINUX_NR_MPROTECT 125
 #define LINUX_NR_GETCWD 183
 #define LINUX_NR_VFORK 190
@@ -86,12 +87,14 @@
 #define LINUX_NR_SET_TID_ADDRESS 256
 #define LINUX_NR_GETDENTS64 217
 #define LINUX_NR_GETTID 224
+#define LINUX_NR_TKILL 238
 #define LINUX_NR_FCNTL64 221
 #define LINUX_NR_FUTEX 240
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
 #define LINUX_NR_FSTATFS64 267
+#define LINUX_NR_TGKILL 268
 #define LINUX_NR_SOCKET 281
 #define LINUX_NR_BIND 282
 #define LINUX_NR_CONNECT 283
@@ -1180,6 +1183,22 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = guest_signal_suspend(
             (const void *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_SIGALTSTACK:
+        result = guest_signal_altstack(context,
+            (const void *)context->uc_mcontext.cpu.gpr[0],
+            (void *)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_TKILL:
+        result = guest_signal_send_thread(0,
+            (int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_TGKILL:
+        result = guest_signal_send_thread(
+            (int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int32_t)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2]);
         break;
     case LINUX_NR_TIME:
     case LINUX_NR_GETTIMEOFDAY:

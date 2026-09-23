@@ -4,6 +4,7 @@
 #define _QNX_SOURCE 1
 #include <sys/elf.h>
 #include <signal.h>
+#include <semaphore.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -82,8 +83,20 @@ int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
     size_t signal_set_size);
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
 int32_t guest_signal_send(pid_t process, int linux_signal);
+int32_t guest_signal_send_thread(int32_t process, int32_t thread,
+    int linux_signal);
 int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
     sigset_t *host_set);
+int guest_signal_deliver(ucontext_t *context, int linux_signal,
+    const siginfo_t *host_info);
+int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
+    uint32_t original_r0);
+int guest_signal_return(ucontext_t *context, int realtime);
+int32_t guest_signal_altstack(ucontext_t *context, const void *guest_stack,
+    void *guest_old_stack);
+int guest_signal_from_host(int host_signal);
+extern void linuxemu_signal_return_trampoline(void);
+extern void linuxemu_rt_signal_return_trampoline(void);
 
 int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
@@ -100,6 +113,17 @@ int32_t guest_thread_tid(void);
 int32_t guest_thread_set_tid_address(uint32_t *address);
 void guest_thread_after_fork(void);
 void guest_thread_exit(int status) __attribute__((noreturn));
+void guest_thread_signal_pending(int linux_signal);
+int guest_thread_take_pending(void);
+int32_t guest_thread_kill(int32_t tid, int host_signal);
+void guest_thread_signal_mask_get(uint32_t words[2]);
+void guest_thread_signal_mask_set(const uint32_t words[2]);
+void guest_thread_signal_suspend_restore(const uint32_t words[2]);
+void guest_thread_signal_delivery_mask(uint32_t words[2]);
+void guest_thread_futex_wait_begin(sem_t *semaphore);
+int guest_thread_futex_wait_end(void);
+void guest_thread_altstack_get(uint32_t *pointer, uint32_t *size);
+void guest_thread_altstack_set(uint32_t pointer, uint32_t size);
 
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);

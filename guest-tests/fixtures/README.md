@@ -7,8 +7,9 @@ It was built inside Linuxemu against the pinned Alpine 3.24 rootfs using GCC
 SHA-256:
 
 ```text
-f8c1d23a5154beb69602abaa8098377a2e8217597f5352f23ff8894668e8558c
+5771a8ac2fd3b642468b69a20a848df0662620d8a6a54da4a77d2edd7a4157c8
 ```
 
 Install Alpine `build-base` temporarily in the test rootfs and run
 `sh scripts/build-pthread-fixture.sh` to rebuild it from source.
+The fixture also cancels and joins a thread blocked in a musl condition wait.

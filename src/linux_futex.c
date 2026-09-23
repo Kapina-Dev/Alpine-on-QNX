@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <string.h>
 #include <time.h>
 
@@ -21,7 +22,7 @@ struct futex_waiter {
     uint32_t *address;
     uint32_t bitset;
     int woken;
-    pthread_cond_t condition;
+    sem_t semaphore;
     struct futex_waiter *next;
 };
 
@@ -124,30 +125,31 @@ static int32_t futex_wait(uint32_t *address, uint32_t expected,
     memset(&waiter, 0, sizeof(waiter));
     waiter.address = address;
     waiter.bitset = bitset;
-    error = pthread_cond_init(&waiter.condition, 0);
-    if (error != 0) return -(int32_t)linux_errno_number(error);
+    if (sem_init(&waiter.semaphore, 0, 0) != 0)
+        return -(int32_t)linux_errno_number(errno);
     error = pthread_mutex_lock(&futex_lock);
     if (error != 0) {
-        pthread_cond_destroy(&waiter.condition);
+        sem_destroy(&waiter.semaphore);
         return -(int32_t)linux_errno_number(error);
     }
     __sync_synchronize();
     if (*(volatile uint32_t *)address != expected) {
         pthread_mutex_unlock(&futex_lock);
-        pthread_cond_destroy(&waiter.condition);
+        sem_destroy(&waiter.semaphore);
         return -EAGAIN;
     }
     waiter.next = futex_waiters;
     futex_waiters = &waiter;
-    while (!waiter.woken && error == 0) {
-        error = deadline_pointer == 0 ?
-            pthread_cond_wait(&waiter.condition, &futex_lock) :
-            pthread_cond_timedwait(&waiter.condition, &futex_lock,
-                deadline_pointer);
-    }
+    guest_thread_futex_wait_begin(&waiter.semaphore);
+    pthread_mutex_unlock(&futex_lock);
+    error = deadline_pointer == 0 ? sem_wait(&waiter.semaphore) :
+        sem_timedwait(&waiter.semaphore, deadline_pointer);
+    error = error == 0 ? 0 : errno;
+    if (guest_thread_futex_wait_end() && error == 0) error = EINTR;
+    pthread_mutex_lock(&futex_lock);
     remove_waiter(&waiter);
     pthread_mutex_unlock(&futex_lock);
-    pthread_cond_destroy(&waiter.condition);
+    sem_destroy(&waiter.semaphore);
     if (waiter.woken) return 0;
     if (error == ETIMEDOUT) return -110;
     return error == 0 ? 0 : -(int32_t)linux_errno_number(error);
@@ -167,7 +169,7 @@ int32_t linux_futex_wake(uint32_t *address, int count, uint32_t bitset)
         if (waiter->address != address ||
             (waiter->bitset & bitset) == 0 || waiter->woken) continue;
         waiter->woken = 1;
-        pthread_cond_signal(&waiter->condition);
+        sem_post(&waiter->semaphore);
         woken++;
     }
     pthread_mutex_unlock(&futex_lock);
@@ -197,7 +199,7 @@ static int32_t futex_requeue(uint32_t *address, int wake_count,
         if (waiter->address != address || waiter->woken) continue;
         if (woken < wake_count) {
             waiter->woken = 1;
-            pthread_cond_signal(&waiter->condition);
+            sem_post(&waiter->semaphore);
             woken++;
             affected++;
         } else if (requeued < requeue_count) {

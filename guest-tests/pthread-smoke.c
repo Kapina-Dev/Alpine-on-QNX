@@ -13,6 +13,8 @@ static pthread_cond_t start_condition = PTHREAD_COND_INITIALIZER;
 static int ready_threads;
 static int start_threads;
 static unsigned long counter;
+static pthread_cond_t cancel_condition = PTHREAD_COND_INITIALIZER;
+static int cancel_ready;
 
 static void *worker(void *argument)
 {
@@ -33,6 +35,16 @@ static void *worker(void *argument)
         if (pthread_mutex_unlock(&lock) != 0) return (void *)5;
     }
     return (void *)(index + 10);
+}
+
+static void *cancel_worker(void *argument)
+{
+    (void)argument;
+    pthread_mutex_lock(&lock);
+    cancel_ready = 1;
+    pthread_cond_signal(&ready_condition);
+    for (;;)
+        pthread_cond_wait(&cancel_condition, &lock);
 }
 
 int main(void)
@@ -84,7 +96,27 @@ int main(void)
         printf("pthread_cond_timedwait=%d expected=%d\n", error, ETIMEDOUT);
         return 4;
     }
-    printf("pthread_smoke=PASS threads=%d iterations=%d counter=%lu\n",
+    error = pthread_create(&threads[0], 0, cancel_worker, 0);
+    if (error != 0) {
+        printf("cancel pthread_create=%d\n", error);
+        return 5;
+    }
+    pthread_mutex_lock(&lock);
+    while (!cancel_ready)
+        pthread_cond_wait(&ready_condition, &lock);
+    pthread_mutex_unlock(&lock);
+    error = pthread_cancel(threads[0]);
+    if (error != 0) {
+        printf("pthread_cancel=%d\n", error);
+        return 6;
+    }
+    error = pthread_join(threads[0], &result);
+    if (error != 0 || result != PTHREAD_CANCELED) {
+        printf("cancel pthread_join=%d result=%p expected=%p\n", error,
+            result, PTHREAD_CANCELED);
+        return 7;
+    }
+    printf("pthread_smoke=PASS threads=%d iterations=%d counter=%lu cancellation=ok\n",
         THREAD_COUNT, ITERATIONS, counter);
     return 0;
 }

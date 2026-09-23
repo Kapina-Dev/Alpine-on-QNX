@@ -188,6 +188,14 @@ Phase 7 thread and futex status recorded on 2026-09-23:
 - Added the process-clone form used by musl `posix_spawn`; the Alpine guest compiler successfully built the pthread fixture inside Linuxemu.
 - General asynchronous guest signal frames, cancellation signals, priority-inheritance futexes, robust lists, and cross-process shared futexes remain outside the verified surface.
 
+Phase 8 signal status recorded on 2026-09-23:
+- Added Linux ARM classic and real-time signal frames with VFP state, register and mask restoration, emulator-owned return trampolines, and guest-provided restorer support.
+- Signal masks, pending bits, alternate stacks, and interrupted futex state are per guest thread. Linux `tkill` and `tgkill` target synthetic Linux TIDs through the QNX pthread registry.
+- Direct tests cover asynchronous standard and real-time handlers, handler-time mask changes, alternate-stack execution, `sigsuspend` interruption, and recovery from a synchronous guest `SIGILL` by editing the saved context.
+- A blocked pipe read interrupted by a handler with `SA_RESTART` resumes at the original syscall and completes after data arrives; non-restartable waits still report Linux `EINTR`.
+- Replaced futex condition waits with semaphore waits that signal handlers can interrupt safely. A real Alpine musl thread blocked in a condition wait now cancels and joins as `PTHREAD_CANCELED`.
+- Queued duplicate real-time instances and an atomic QNX implementation of the `ppoll`/`pselect6` temporary-mask transition remain unresolved and explicitly unsupported.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
@@ -209,7 +217,8 @@ have different failure surfaces and now have separate acceptance gates.
   primitive, or retain and precisely document the bounded incompatibility.
 
 Gate: direct guest handlers and return, nested masks, timed waits, cancellation,
-signal interruption, and repeated mask-transition race tests pass on the device.
+and signal interruption pass on the device. The polling mask transition must be
+proven atomic or remain explicitly outside the supported compatibility surface.
 
 ### Phase 9. Loader and process/thread hardening
 

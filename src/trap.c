@@ -48,6 +48,16 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
     uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
     const uint32_t *original = arm_patch_original(pc);
 
+    if (sig == SIGILL && pc == (uintptr_t)linuxemu_signal_return_trampoline) {
+        if (guest_signal_return(context, 0) == 0) return;
+        fatal_signal(sig, info, pc);
+    }
+    if (sig == SIGILL &&
+        pc == (uintptr_t)linuxemu_rt_signal_return_trampoline) {
+        if (guest_signal_return(context, 1) == 0) return;
+        fatal_signal(sig, info, pc);
+    }
+
     if (sig == SIGSEGV) {
         if (pc == LINUX_KUSER_GET_TLS) {
             context->uc_mcontext.cpu.gpr[0] = runtime_guest_tls();
@@ -77,14 +87,34 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
             context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
             return;
         }
+        if (guest_memory_is_executable(pc, 4) &&
+            guest_signal_deliver(context, 11, info) == 0) return;
         fatal_signal(sig, info, pc);
     }
-    if (sig != SIGILL || original == 0) fatal_signal(sig, info, pc);
+    if (sig != SIGILL) fatal_signal(sig, info, pc);
+    if (original == 0) {
+        if (guest_memory_is_executable(pc, 4) &&
+            guest_signal_deliver(context, 4, info) == 0) return;
+        fatal_signal(sig, info, pc);
+    }
     if ((*original & ARM_TPIDRURO_MASK) == ARM_TPIDRURO_READ) {
         unsigned destination = (*original >> 12) & 15u;
         context->uc_mcontext.cpu.gpr[destination] = runtime_guest_tls();
     } else if (*original == ARM_LINUX_SVC_0) {
+        uint32_t syscall_number = context->uc_mcontext.cpu.gpr[7];
+        uint32_t original_r0 = context->uc_mcontext.cpu.gpr[0];
+        if (context->uc_mcontext.cpu.gpr[7] == 119u) {
+            if (guest_signal_return(context, 0) == 0) return;
+            fatal_signal(sig, info, pc);
+        }
+        if (context->uc_mcontext.cpu.gpr[7] == 173u) {
+            if (guest_signal_return(context, 1) == 0) return;
+            fatal_signal(sig, info, pc);
+        }
         linux_syscall_dispatch(context);
+        context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
+        guest_signal_deliver_pending(context, syscall_number, original_r0);
+        return;
     } else {
         fatal_signal(sig, info, pc);
     }
