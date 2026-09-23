@@ -1,6 +1,6 @@
 # Linuxemu: progress and rebuild plan
 
-Updated: 2026-09-22
+Updated: 2026-09-23
 
 ## Goal and current state
 
@@ -162,6 +162,13 @@ Deferred polling correctness item recorded after the 2026-09-22 Phase 4 implemen
 - Keep the working implementation for basic terminal and readiness workloads, but do not claim signal-race-equivalent Linux semantics.
 - Investigate QNX `_select_event`, `timer_timeout`, or another kernel-assisted wait that can combine signal notification with descriptor readiness. Do not replace the current path with a helper-thread design unless cancellation, descriptor reuse, and process-fork behavior are defined.
 - Add a stress test that repeatedly delivers a signal in the mask-transition window and proves there is no lost wakeup before this item is closed.
+
+Phase 5 networking status recorded on 2026-09-23:
+- Direct ARM socket syscalls 281 through 297 and `accept4`, plus legacy `socketcall`, are translated for the currently tested operations.
+- UNIX, IPv4, and IPv6 address layouts; socket creation flags; message flags; common `SOL_SOCKET`, IPv4, and TCP options; and QNX network errno values are converted explicitly.
+- Synthetic guests pass socket-pair, UDP, send/receive, message-header, option, descriptor-flag, nonblocking-connect, readiness, peer-address, and `SO_ERROR` paths.
+- BusyBox `wget` passes against native loopback HTTP servers through numeric IPv4 and `localhost` IPv6. BusyBox `nslookup` resolves through the configurable LAN resolver, and a refused connection reports Linux `ECONNREFUSED`.
+- Ancillary/control messages and socket options outside the explicit compatibility table remain unsupported.
 
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 

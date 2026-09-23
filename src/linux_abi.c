@@ -57,6 +57,38 @@ int linux_errno_number(int value)
     case ENOSYS: return 38;
     case ENOTEMPTY: return 39;
     case ELOOP: return 40;
+    case ENOTSOCK: return 88;
+    case EDESTADDRREQ: return 89;
+    case EMSGSIZE: return 90;
+    case EPROTOTYPE: return 91;
+    case ENOPROTOOPT: return 92;
+    case EPROTONOSUPPORT: return 93;
+    case ESOCKTNOSUPPORT: return 94;
+    case EOPNOTSUPP: return 95;
+    case EPFNOSUPPORT: return 96;
+    case EAFNOSUPPORT: return 97;
+    case EADDRINUSE: return 98;
+    case EADDRNOTAVAIL: return 99;
+    case ENETDOWN: return 100;
+    case ENETUNREACH: return 101;
+    case ENETRESET: return 102;
+    case ECONNABORTED: return 103;
+    case ECONNRESET: return 104;
+    case ENOBUFS: return 105;
+    case EISCONN: return 106;
+    case ENOTCONN: return 107;
+    case ESHUTDOWN: return 108;
+    case ETOOMANYREFS: return 109;
+    case ETIMEDOUT: return 110;
+    case ECONNREFUSED: return 111;
+    case EHOSTDOWN: return 112;
+    case EHOSTUNREACH: return 113;
+#ifdef EALREADY_NEW
+    case EALREADY_NEW: return 114;
+#else
+    case EALREADY: return 114;
+#endif
+    case EINPROGRESS: return 115;
     default: return 5;
     }
 }

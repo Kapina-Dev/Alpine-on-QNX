@@ -41,6 +41,7 @@
 #define LINUX_NR_SETSID 66
 #define LINUX_NR_READLINK 85
 #define LINUX_NR_MUNMAP 91
+#define LINUX_NR_SOCKETCALL 102
 #define LINUX_NR_WAIT4 114
 #define LINUX_NR_CLONE 120
 #define LINUX_NR_UNAME 122
@@ -74,6 +75,23 @@
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
+#define LINUX_NR_SOCKET 281
+#define LINUX_NR_BIND 282
+#define LINUX_NR_CONNECT 283
+#define LINUX_NR_LISTEN 284
+#define LINUX_NR_ACCEPT 285
+#define LINUX_NR_GETSOCKNAME 286
+#define LINUX_NR_GETPEERNAME 287
+#define LINUX_NR_SOCKETPAIR 288
+#define LINUX_NR_SEND 289
+#define LINUX_NR_SENDTO 290
+#define LINUX_NR_RECV 291
+#define LINUX_NR_RECVFROM 292
+#define LINUX_NR_SHUTDOWN 293
+#define LINUX_NR_SETSOCKOPT 294
+#define LINUX_NR_GETSOCKOPT 295
+#define LINUX_NR_SENDMSG 296
+#define LINUX_NR_RECVMSG 297
 #define LINUX_NR_OPENAT 322
 #define LINUX_NR_FSTATAT64 327
 #define LINUX_NR_READLINKAT 332
@@ -81,6 +99,7 @@
 #define LINUX_NR_PPOLL 336
 #define LINUX_NR_DUP3 358
 #define LINUX_NR_PIPE2 359
+#define LINUX_NR_ACCEPT4 366
 #define LINUX_NR_CLOCK_GETTIME64 403
 #define LINUX_NR_CLOCK_GETRES_TIME64 406
 #define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
@@ -652,6 +671,27 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_host_result(munmap(
             (void *)context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]));
+        break;
+    case LINUX_NR_SOCKETCALL:
+    case LINUX_NR_SOCKET:
+    case LINUX_NR_BIND:
+    case LINUX_NR_CONNECT:
+    case LINUX_NR_LISTEN:
+    case LINUX_NR_ACCEPT:
+    case LINUX_NR_GETSOCKNAME:
+    case LINUX_NR_GETPEERNAME:
+    case LINUX_NR_SOCKETPAIR:
+    case LINUX_NR_SEND:
+    case LINUX_NR_SENDTO:
+    case LINUX_NR_RECV:
+    case LINUX_NR_RECVFROM:
+    case LINUX_NR_SHUTDOWN:
+    case LINUX_NR_SETSOCKOPT:
+    case LINUX_NR_GETSOCKOPT:
+    case LINUX_NR_SENDMSG:
+    case LINUX_NR_RECVMSG:
+    case LINUX_NR_ACCEPT4:
+        result = linux_socket_syscall(number, context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_WAIT4:
         result = linux_wait4((int32_t)context->uc_mcontext.cpu.gpr[0],

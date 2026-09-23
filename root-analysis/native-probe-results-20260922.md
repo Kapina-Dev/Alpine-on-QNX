@@ -334,3 +334,40 @@ linuxemu_terminal_time_smoke_failures=0
 ```
 
 After the Phase 4 changes, the native contract, static guest, dynamic musl, loader-negative, filesystem, process, and terminal/time suites all completed with zero failures on the device at `192.168.0.3`.
+
+## Phase 5 socket and network foundation
+
+Linuxemu now translates the direct Linux ARM socket syscall range from
+`socket` through `recvmsg`, `accept4`, and the legacy `socketcall` multiplexer.
+The implementation converts UNIX, IPv4, and IPv6 address layouts; socket
+creation flags; common message flags; common `SOL_SOCKET`, IPv4, and TCP
+options; and QNX networking errno values. Ancillary/control messages are
+rejected with Linux `EOPNOTSUPP` rather than passed through with an incompatible
+layout.
+
+The synthetic socket guest passed UNIX socket pairs, send/receive and
+sendmsg/recvmsg, shutdown, nonblocking and close-on-exec flags, socket options,
+two bound IPv4 UDP sockets, address round trips, and legacy `socketcall`.
+A separate guest passed nonblocking IPv4 connect, `EINPROGRESS`, poll writable
+readiness, `SO_ERROR`, `getpeername`, request transmission, and response
+readiness. The historical report that QNX poll omitted writable readiness after
+a nonblocking connect was not reproduced on this device, so no select-based
+workaround was added.
+
+The application-level network suite passed numeric IPv4 HTTP, `localhost`
+over IPv6, DNS through the device's LAN resolver, and a refused connection:
+
+```text
+syscall-probe exit=0 expected=0
+nonblocking-connect guest_exit=0 server_exit=0 expected=0
+numeric-host guest_exit=0 server_exit=0 expected=0
+hosts-name guest_exit=0 server_exit=0 expected=0
+dns-query exit=0 expected=0 server=192.168.0.1 name=example.com
+connection-refused exit=1 expected=1
+linuxemu_network_smoke_failures=0
+```
+
+After the final socket-option and `SO_ERROR` conversion changes, the native,
+static guest, dynamic musl, loader-negative, filesystem, process,
+terminal/time, and network suites all completed with zero failures on the
+device at `192.168.0.3`.

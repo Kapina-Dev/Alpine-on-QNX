@@ -60,18 +60,21 @@ set -x
     "$project_dir/native-probes/emulated-tls-read.c"
 "$cc" $common_flags -o "$build_dir/mprotect-subrange" \
     "$project_dir/native-probes/mprotect-subrange.c"
+"$cc" $common_flags -o "$build_dir/http-loopback-server" \
+    "$project_dir/native-probes/http-loopback-server.c" -lsocket
 "$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \
-    -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c
+    -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c -lsocket
 "$cc" $common_flags -std=gnu99 -marm -DLINUXEMU_TESTING=1 \
     -I"$project_dir/src" -o "$project_dir/build/linuxemu-loader-test" \
-    "$project_dir"/src/*.c
+    "$project_dir"/src/*.c -lsocket
 "$cc" $common_flags -std=gnu99 -marm \
     -o "$project_dir/build/elf-fixture-tool" \
     "$project_dir/tests/elf-fixture-tool.c"
 
 mkdir -p "$project_dir/build/guest-tests"
 for guest in write-exit unknown-syscall exit-status initial-stack \
-    memory-syscalls file-syscalls terminal-time-syscalls; do
+    memory-syscalls file-syscalls terminal-time-syscalls socket-syscalls \
+    network-connect-syscalls; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \
@@ -93,6 +96,7 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-arm"
 "$sdk_root/bin/readelf" -h "$build_dir/emulated-tls-read-thumb"
 "$sdk_root/bin/readelf" -h "$build_dir/mprotect-subrange"
+"$sdk_root/bin/readelf" -h "$build_dir/http-loopback-server"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu-loader-test"
 "$sdk_root/bin/readelf" -h "$project_dir/build/elf-fixture-tool"

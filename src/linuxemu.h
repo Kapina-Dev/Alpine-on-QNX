@@ -88,6 +88,7 @@ int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
 int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
+int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6]);
 
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);

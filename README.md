@@ -21,6 +21,8 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - Linux ARM terminal calls with explicit termios, control-character, baud-rate, window-size, process-group, `FIONREAD`, and `FIONBIO` conversion. BusyBox `stty` can read and update an SSH pseudo-terminal.
 - Linux ARM readiness calls: `poll`, `ppoll`, legacy and new `select`, and `pselect6`, including time32/time64 timeout conversion and Linux/QNX poll-event mapping.
 - Linux ARM wall and monotonic clocks, resolution queries, `time`, `gettimeofday`, `nanosleep`, and `clock_nanosleep`, with explicit time32/time64 layouts. BusyBox `date` and `sleep` work against the pinned rootfs.
+- Linux ARM socket calls for UNIX, IPv4, and IPv6 endpoints, including explicit address, type/descriptor flag, message flag, socket option, and network errno conversion. Both direct ARM socket syscalls and legacy `socketcall` are accepted.
+- Blocking and nonblocking TCP connections, UDP datagrams, socket pairs, DNS queries, and BusyBox HTTP downloads. Numeric IPv4 and `localhost` over IPv6 are covered on the device.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
 - PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
 
@@ -83,6 +85,17 @@ Run clock, sleep, poll/select, terminal conversion, and interactive-shell tests.
 ssh -tt bb10 'cd /accounts/1000/shared/misc/linuxemu-dev && sh scripts/run-terminal-time-smoke.sh'
 ```
 
+Run direct socket coverage, nonblocking connection readiness, loopback HTTP,
+DNS, and connection-error tests:
+
+```sh
+sh scripts/run-network-smoke.sh
+```
+
+The DNS test defaults to resolver `192.168.0.1` and name `example.com`.
+Override them with `DNS_SERVER` and `DNS_NAME` when the device is on another
+network.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -95,6 +108,7 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `guest_signal.c`: signal-number/mask conversion and the bounded SIGCHLD wait path.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
 - `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
+- `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
 - `linux_termios.c`: Linux terminal flags, baud rates, control characters, window sizes, and related ioctl conversion.
 - `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
 - `trap.c`: SIGILL/SIGSEGV dispatch and Linux ARM kuser helpers.
@@ -111,5 +125,6 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `vfork` and fork-style `clone` currently use host `fork`; clone flags for shared-memory threads are rejected.
 - `ppoll` and `pselect6` install the requested host signal mask around the wait, but QNX 10.3 lacks native entry points that make the mask replacement and wait one atomic operation.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
+- Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
 - ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
