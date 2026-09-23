@@ -279,9 +279,24 @@ failure behavior.
 - Preserve pinned rootfs/archive hashes, release artifacts, test results, and
   an off-device backup.
 - Require predictable guest failures that do not alter global phone state.
+- Prepare the Git history for publication: classify the remaining recovery
+  artifacts, scan tracked files and history for credentials and unwanted large
+  objects, and keep QNX SDK material, device dumps, private keys, proprietary
+  binaries, and decompiled proprietary code out of the public repository.
+- Add a license and source/provenance notices after reviewing the code and
+  fixture origins. Decide whether to retain the existing local commit identity
+  or rewrite it to the maintainer's public name and email before the first push.
+- Create an empty hosted repository, publish the reviewed branch privately
+  first, inspect its rendered contents, and then make it public. Tag the first
+  clean, fully tested state as `v0.1.0` and attach compatibility notes, known
+  limitations, test evidence, and checksum manifests to the release.
+- Publish reproducible acquisition instructions and hashes for external guest
+  packages. Do not attach the locally cached APK closure or third-party QNX and
+  BlackBerry files unless their redistribution terms have been verified.
 
 Gate: a clean installation reproduces the supported suite without manual repair
-or retry loops.
+or retry loops, and the hosted source and release contain no credentials,
+device-specific private material, or unlicensed third-party artifacts.
 
 Priority-inheritance futexes, robust mutexes, process-shared futexes, Thumb
 execution, unusual socket control messages, kernel modules, full Linux service
