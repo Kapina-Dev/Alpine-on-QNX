@@ -192,47 +192,81 @@ Translate guest buffers through defined layouts and validate access. Unsupported
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
 
-### 5. Replace the threading workaround
+## Remaining execution phases
 
-Give each guest thread explicit host and guest state. Establish safe entry/exit trampolines and a retirement mechanism that runs on memory which remains valid. Implement real synchronization semantics rather than sleep-based futex stubs.
+The original application-and-packaging stages were revised after the Phase 7
+thread work. Signals, loader/process stress, Python, Git, and release packaging
+have different failure surfaces and now have separate acceptance gates.
 
-Gate: thousands of create/join and detach cycles, contended mutexes, condition variables, timeouts and signal interruptions complete correctly, without memory growing with each retired thread. Exercise fork from a multithreaded guest separately.
+### Phase 8. Signals and interruption
 
-### 6. Restore applications progressively
+- Implement Linux `rt_sigaction`, per-thread masks, pending delivery, guest
+  signal frames, and `rt_sigreturn` without exposing QNX context layouts.
+- Cover synchronous faults separately from asynchronous signals and preserve
+  Linux `EINTR` and restart behavior across blocking calls.
+- Exercise the signal path used by pthread cancellation.
+- Resolve the `ppoll`/`pselect6` mask-transition race with a QNX kernel-assisted
+  primitive, or retain and precisely document the bounded incompatibility.
 
-Suggested regression order:
-1. Minimal guest programs, BusyBox commands and shell scripts.
-2. File manipulation, pipes, subprocesses and terminal behavior.
-3. nano interactive editing and saving.
-4. wget HTTP; then separately verified HTTPS/certificate handling.
-5. apk index refresh, install/remove and trigger scripts using a verified repository snapshot.
-6. Python scripts, imports, networking, subprocesses and threading.
-7. Git clone/fetch and HTTPS, beyond git --version.
+Gate: direct guest handlers and return, nested masks, timed waits, cancellation,
+signal interruption, and repeated mask-transition race tests pass on the device.
 
-Select and pin an Alpine ARM release/rootfs only after checking its current availability and requirements. Preserve archive hashes and package versions for reproducible tests. Do not assume the historical Alpine 3.19 environment remains obtainable unchanged.
+### Phase 9. Loader and process/thread hardening
 
-Gate: a clean installation can reproduce the supported application suite without undocumented manual fixes.
+- Remove the intermittent exact-address mapping collision that currently makes
+  some guest tool invocations require retries.
+- Exercise `dlopen`, executable mappings created after startup, and failure
+  cleanup without weakening exact Linux address checks.
+- Stress fork, exec, and musl `posix_spawn` from a multithreaded guest and prove
+  that copied thread/futex state is reset correctly in the child.
+- Use root-only `/proc/<pid>` and `pidin` access for diagnostic evidence when
+  needed. Ordinary-user execution remains the acceptance environment and must
+  not depend on privileged process inspection.
 
-### 7. Package and define completion
+Gate: repeated loader and process/thread stress runs complete without retries,
+stale host state, leaked mappings, or guest-root filesystem damage.
 
-A practical completed first version means:
-- Documented supported device/OS/guest combinations.
-- A reproducible build and installation procedure.
-- A tested compatibility matrix, including explicit unsupported features.
-- No known thread-exit leak or success stubs masking essential behavior.
-- Predictable guest crashes/errors that do not alter global phone state.
-- Automated regression tests and useful optional tracing.
-- Source, release artifacts and test results backed up off-device.
+### Phase 10. Python runtime
 
-It does not mean every Linux program works. Kernel modules, full Linux service management, graphics integration and arbitrary device ioctls need separate scope. X11 through Android XSDL was a historical optional direction, not a completed milestone; defer it until CLI, networking and threads are reliable.
+- Pin an Alpine Python version and package set, preserving archive hashes.
+- Test imports, files, clocks, SSL, sockets, subprocesses, signals, and Python
+  threads from a clean rootfs state.
+- Reject unsupported operations with Linux errors instead of success stubs.
 
-## Immediate next actions
+Gate: a reproducible Python application suite passes from a clean rootfs.
 
-1. Confirm the outcome of the planned autoloader run and compare first-root versus next-boot filesystem state.
-2. Once Downloads is writable, build the native baseline on the phone using the recovered SDK.
-3. Preserve build output and run results; investigate ordinary-user execution before elevated execution.
-4. Extend the native contract probes before rebuilding the Linux loader.
-5. Begin the new repository and regression corpus; retain this document as the reconstruction checklist.
+### Phase 11. Git workflows
+
+- Cover local repository creation, status, add, commit, and object operations.
+- Cover HTTPS clone and incremental fetch against pinned test content, including
+  invalid-certificate, authentication, and unreachable-server failures.
+- Stress subprocess behavior and transfers larger than the smoke fixtures.
+
+Gate: local workflows, clean clone, and incremental fetch pass with correct
+failure behavior.
+
+### Phase 12. Package and define completion
+
+- Document supported device, OS, guest, syscall, and application combinations.
+- Provide reproducible build and installation procedures plus a single full
+  regression entry point.
+- Preserve pinned rootfs/archive hashes, release artifacts, test results, and
+  an off-device backup.
+- Require predictable guest failures that do not alter global phone state.
+
+Gate: a clean installation reproduces the supported suite without manual repair
+or retry loops.
+
+Priority-inheritance futexes, robust mutexes, process-shared futexes, Thumb
+execution, unusual socket control messages, kernel modules, full Linux service
+management, graphics integration, and arbitrary device ioctls are demand-driven
+compatibility items. Implement them for a selected workload or reject them
+explicitly; they do not block the first supported release by default.
+
+## Immediate next action
+
+Execute Phase 8 against the completed thread/futex baseline, preserving the
+full earlier regression suite as its non-regression gate.
 
 ## Evidence and local artifacts
 
