@@ -139,7 +139,7 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - `guest_path.c`: rootfs path normalization, contained symlink resolution, and guest working-directory state.
 - `linux_abi.c`: explicit Linux errno, open-flag, status-flag, and `stat64` conversion.
 - `guest_process.c`: contained ELF/shebang exec trampoline and guest-to-host process environment boundary.
-- `guest_thread.c`: per-QNX-thread guest state, Linux clone/TID behavior, native-stack retirement, and fork reset.
+- `guest_thread.c`: per-QNX-thread guest state, Linux clone/TID behavior, queued signals, wait wakeups, native-stack retirement, and fork reset.
 - `linux_futex.c`: locked futex waiter registry, wake/requeue operations, and timeout conversion.
 - `guest_signal.c`: signal-number conversion, per-thread masks, Linux ARM signal frames, alternate stacks, delivery, and return.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
@@ -155,11 +155,11 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 ## Current limits
 
 - Dynamic support is currently limited to the pinned Alpine musl/BusyBox path.
-- `SA_RESTART` is implemented for the translated blocking read/write, wait, futex, ioctl, and socket calls. Linux real-time signals are mapped only while QNX real-time numbers are available, and pending instances of the same signal are currently coalesced rather than queued.
+- `SA_RESTART` is implemented for the translated blocking read/write, wait, futex, ioctl, and socket calls. Linux real-time signals are mapped only while QNX real-time numbers are available. Each mapped real-time number has a bounded 64-entry per-thread queue; `rt_sigqueueinfo` payload submission is not implemented.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
 - `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
 - Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.
-- `ppoll` and `pselect6` install the requested host signal mask around the wait, but QNX 10.3 lacks native entry points that make the mask replacement and wait one atomic operation.
+- `ppoll` and `pselect6` use a transient per-thread nonblocking wake pipe to bridge QNX's separate mask and wait operations. `pselect6` returns `EMFILE` if that internal read descriptor is outside QNX `FD_SETSIZE`, which requires the process to have exhausted the descriptor range accepted by `select`.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
 - Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
 - Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.

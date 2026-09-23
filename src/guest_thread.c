@@ -1,6 +1,7 @@
 #include "linuxemu.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
@@ -28,6 +29,11 @@
     LINUX_CLONE_SETTLS | LINUX_CLONE_PARENT_SETTID | \
     LINUX_CLONE_CHILD_CLEARTID | LINUX_CLONE_DETACHED | \
     LINUX_CLONE_CHILD_SETTID)
+#define LINUX_FIRST_REALTIME_SIGNAL 32
+#define LINUX_LAST_REALTIME_SIGNAL 47
+#define REALTIME_SIGNALS (LINUX_LAST_REALTIME_SIGNAL - \
+    LINUX_FIRST_REALTIME_SIGNAL + 1)
+#define REALTIME_QUEUE_LENGTH 64
 
 struct guest_thread_state {
     uint32_t registers[16];
@@ -39,11 +45,18 @@ struct guest_thread_state {
     sigjmp_buf exit_context;
     pthread_t host_thread;
     volatile uint32_t pending_signals[2];
+    siginfo_t pending_information[31];
+    volatile sig_atomic_t realtime_head[REALTIME_SIGNALS];
+    volatile sig_atomic_t realtime_tail[REALTIME_SIGNALS];
+    siginfo_t realtime_information[REALTIME_SIGNALS][REALTIME_QUEUE_LENGTH];
     uint32_t signal_mask[2];
     uint32_t suspend_restore_mask[2];
     int suspend_restore_valid;
     sem_t *futex_semaphore;
     volatile sig_atomic_t futex_interrupted;
+    volatile sig_atomic_t signal_wait_write_fd;
+    int signal_wait_read_fd;
+    volatile sig_atomic_t syscall_active;
     uint32_t altstack_pointer;
     uint32_t altstack_size;
     struct guest_thread_state *next;
@@ -93,6 +106,8 @@ static void finish_guest_thread(struct guest_thread_state *state)
         __sync_lock_test_and_set(clear_child_tid, 0);
         linux_futex_wake(clear_child_tid, INT_MAX, 0xffffffffu);
     }
+    if (state->signal_wait_read_fd >= 0) close(state->signal_wait_read_fd);
+    if (state->signal_wait_write_fd >= 0) close(state->signal_wait_write_fd);
     pthread_setspecific(thread_state_key, 0);
     free(state);
 }
@@ -125,6 +140,8 @@ int guest_thread_initialize(void)
     int error = pthread_key_create(&thread_state_key, 0);
     if (error != 0) { errno = error; return -1; }
     memset(&main_thread, 0, sizeof(main_thread));
+    main_thread.signal_wait_read_fd = -1;
+    main_thread.signal_wait_write_fd = -1;
     main_thread.tid = (int32_t)getpid();
     main_thread.host_thread = pthread_self();
     thread_registry = &main_thread;
@@ -154,6 +171,8 @@ int32_t guest_thread_clone(ucontext_t *context)
         child_stack == 0) return -EINVAL;
     state = calloc(1, sizeof(*state));
     if (state == 0) return -ENOMEM;
+    state->signal_wait_read_fd = -1;
+    state->signal_wait_write_fd = -1;
     memcpy(state->registers, context->uc_mcontext.cpu.gpr,
         sizeof(state->registers));
     state->registers[0] = 0;
@@ -211,14 +230,25 @@ void guest_thread_after_fork(void)
 {
     pthread_mutex_t fresh_lock = PTHREAD_MUTEX_INITIALIZER;
     struct guest_thread_state *state = current_thread();
+    struct guest_thread_state *cursor;
     uint32_t guest_tls = state == 0 ? 0 : state->guest_tls;
     uint32_t signal_mask[2] = { 0, 0 };
     uint32_t altstack_pointer = state == 0 ? 0 : state->altstack_pointer;
     uint32_t altstack_size = state == 0 ? 0 : state->altstack_size;
     if (state != 0)
         memcpy(signal_mask, state->signal_mask, sizeof(signal_mask));
+    for (cursor = thread_registry; cursor != 0; cursor = cursor->next) {
+        if (cursor->signal_wait_read_fd >= 0)
+            close(cursor->signal_wait_read_fd);
+        if (cursor->signal_wait_write_fd >= 0)
+            close(cursor->signal_wait_write_fd);
+        cursor->signal_wait_read_fd = -1;
+        cursor->signal_wait_write_fd = -1;
+    }
     if (state != 0 && state != &main_thread) free(state);
     memset(&main_thread, 0, sizeof(main_thread));
+    main_thread.signal_wait_read_fd = -1;
+    main_thread.signal_wait_write_fd = -1;
     main_thread.guest_tls = guest_tls;
     memcpy(main_thread.signal_mask, signal_mask,
         sizeof(main_thread.signal_mask));
@@ -233,38 +263,91 @@ void guest_thread_after_fork(void)
     linux_futex_after_fork();
 }
 
-void guest_thread_signal_pending(int linux_signal)
+void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)
 {
     struct guest_thread_state *state = current_thread();
+    unsigned char byte = 1;
     if (state != 0 && linux_signal > 0 && linux_signal <= 64) {
-        __sync_or_and_fetch(&state->pending_signals[(linux_signal - 1) / 32],
-            (uint32_t)1u << ((linux_signal - 1) % 32));
+        if (linux_signal >= LINUX_FIRST_REALTIME_SIGNAL &&
+            linux_signal <= LINUX_LAST_REALTIME_SIGNAL) {
+            int index = linux_signal - LINUX_FIRST_REALTIME_SIGNAL;
+            sig_atomic_t tail = state->realtime_tail[index];
+            if (tail - state->realtime_head[index] < REALTIME_QUEUE_LENGTH) {
+                if (information != 0)
+                    state->realtime_information[index]
+                        [tail % REALTIME_QUEUE_LENGTH] = *information;
+                else memset(&state->realtime_information[index]
+                    [tail % REALTIME_QUEUE_LENGTH], 0, sizeof(siginfo_t));
+                __sync_synchronize();
+                state->realtime_tail[index] = tail + 1;
+            }
+        } else {
+            uint32_t bit = (uint32_t)1u << ((linux_signal - 1) % 32);
+            uint32_t old = state->pending_signals[(linux_signal - 1) / 32];
+            if ((old & bit) == 0 && linux_signal <= 31) {
+                if (information != 0)
+                    state->pending_information[linux_signal - 1] =
+                        *information;
+                else memset(&state->pending_information[linux_signal - 1],
+                    0, sizeof(siginfo_t));
+            }
+            __sync_or_and_fetch(
+                &state->pending_signals[(linux_signal - 1) / 32], bit);
+        }
         if (state->futex_semaphore != 0) {
             state->futex_interrupted = 1;
             sem_post(state->futex_semaphore);
         }
+        if (state->signal_wait_write_fd >= 0)
+            write(state->signal_wait_write_fd, &byte, sizeof(byte));
     }
 }
 
-int guest_thread_take_pending(void)
+int guest_thread_take_pending(siginfo_t *information, int *has_information)
 {
     struct guest_thread_state *state = current_thread();
     uint32_t old_value;
     uint32_t candidates;
     uint32_t new_value;
+    siginfo_t selected_information;
     int word;
     int signal_number;
+    if (has_information != 0) *has_information = 0;
+    if (information != 0) memset(information, 0, sizeof(*information));
     if (state == 0) return 0;
-    for (word = 0; word != 2; ++word) {
+    for (word = 0; word != 1; ++word) {
         do {
             old_value = state->pending_signals[word];
             candidates = old_value & ~state->signal_mask[word];
             if (candidates == 0) break;
             signal_number = __builtin_ctz(candidates) + 1 + word * 32;
+            selected_information =
+                state->pending_information[signal_number - 1];
             new_value = old_value & ~(1u << ((signal_number - 1) % 32));
         } while (!__sync_bool_compare_and_swap(&state->pending_signals[word],
             old_value, new_value));
-        if (candidates != 0) return signal_number;
+        if (candidates != 0) {
+            if (information != 0)
+                *information = selected_information;
+            if (has_information != 0) *has_information = 1;
+            return signal_number;
+        }
+    }
+    for (signal_number = LINUX_FIRST_REALTIME_SIGNAL;
+        signal_number <= LINUX_LAST_REALTIME_SIGNAL; ++signal_number) {
+        int index = signal_number - LINUX_FIRST_REALTIME_SIGNAL;
+        sig_atomic_t head;
+        if ((state->signal_mask[(signal_number - 1) / 32] &
+                (1u << ((signal_number - 1) % 32))) != 0) continue;
+        head = state->realtime_head[index];
+        if (head == state->realtime_tail[index]) continue;
+        if (information != 0)
+            *information = state->realtime_information[index]
+                [head % REALTIME_QUEUE_LENGTH];
+        __sync_synchronize();
+        state->realtime_head[index] = head + 1;
+        if (has_information != 0) *has_information = 1;
+        return signal_number;
     }
     return 0;
 }
@@ -301,6 +384,93 @@ void guest_thread_signal_delivery_mask(uint32_t words[2])
             sizeof(state->suspend_restore_mask));
         state->suspend_restore_valid = 0;
     } else guest_thread_signal_mask_get(words);
+}
+
+int guest_thread_signal_wait_begin(void)
+{
+    struct guest_thread_state *state = current_thread();
+    int descriptors[2];
+    int flags;
+    if (state == 0) { errno = EINVAL; return -1; }
+    if (pipe(descriptors) != 0) return -1;
+    flags = fcntl(descriptors[0], F_GETFL, 0);
+    if (flags < 0 || fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(descriptors[0]); close(descriptors[1]); return -1;
+    }
+    flags = fcntl(descriptors[1], F_GETFL, 0);
+    if (flags < 0 || fcntl(descriptors[1], F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(descriptors[0]); close(descriptors[1]); return -1;
+    }
+    state->signal_wait_read_fd = descriptors[0];
+    __sync_synchronize();
+    state->signal_wait_write_fd = descriptors[1];
+    return descriptors[0];
+}
+
+void guest_thread_signal_wait_arm(void)
+{
+    struct guest_thread_state *state = current_thread();
+    unsigned char byte = 1;
+    int signal_number;
+    if (state == 0 || state->signal_wait_write_fd < 0) return;
+    if ((state->pending_signals[0] & ~state->signal_mask[0]) != 0) {
+        write(state->signal_wait_write_fd, &byte, sizeof(byte));
+        return;
+    }
+    for (signal_number = LINUX_FIRST_REALTIME_SIGNAL;
+        signal_number <= LINUX_LAST_REALTIME_SIGNAL; ++signal_number) {
+        int index = signal_number - LINUX_FIRST_REALTIME_SIGNAL;
+        if ((state->signal_mask[(signal_number - 1) / 32] &
+                (1u << ((signal_number - 1) % 32))) == 0 &&
+            state->realtime_head[index] != state->realtime_tail[index]) {
+            write(state->signal_wait_write_fd, &byte, sizeof(byte));
+            return;
+        }
+    }
+}
+
+void guest_thread_signal_wait_interrupted(const uint32_t old_words[2])
+{
+    guest_thread_signal_suspend_restore(old_words);
+}
+
+void guest_thread_signal_wait_complete(const uint32_t old_words[2])
+{
+    struct guest_thread_state *state = current_thread();
+    if (state != 0) state->suspend_restore_valid = 0;
+    guest_thread_signal_mask_set(old_words);
+}
+
+void guest_thread_signal_wait_end(void)
+{
+    struct guest_thread_state *state = current_thread();
+    int read_fd, write_fd;
+    if (state == 0) return;
+    write_fd = state->signal_wait_write_fd;
+    state->signal_wait_write_fd = -1;
+    __sync_synchronize();
+    read_fd = state->signal_wait_read_fd;
+    state->signal_wait_read_fd = -1;
+    if (read_fd >= 0) close(read_fd);
+    if (write_fd >= 0) close(write_fd);
+}
+
+void guest_thread_syscall_enter(void)
+{
+    struct guest_thread_state *state = current_thread();
+    if (state != 0) state->syscall_active = 1;
+}
+
+void guest_thread_syscall_leave(void)
+{
+    struct guest_thread_state *state = current_thread();
+    if (state != 0) state->syscall_active = 0;
+}
+
+int guest_thread_syscall_active(void)
+{
+    struct guest_thread_state *state = current_thread();
+    return state != 0 && state->syscall_active;
 }
 
 void guest_thread_futex_wait_begin(sem_t *semaphore)

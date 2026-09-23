@@ -198,7 +198,7 @@ int guest_signal_deliver(ucontext_t *context, int linux_signal,
     if (linux_signal != 4 && linux_signal != 11 &&
         (old_mask[(linux_signal - 1) / 32] &
             (1u << ((linux_signal - 1) % 32))) != 0) {
-        guest_thread_signal_pending(linux_signal);
+        guest_thread_signal_pending(linux_signal, host_info);
         return 1;
     }
     action = guest_actions[linux_signal];
@@ -281,7 +281,10 @@ static int restartable_syscall(uint32_t number)
 int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
     uint32_t original_r0)
 {
-    int linux_signal = guest_thread_take_pending();
+    siginfo_t information;
+    int has_information;
+    int linux_signal = guest_thread_take_pending(&information,
+        &has_information);
     if (linux_signal == 0) return 0;
     if (context->uc_mcontext.cpu.gpr[0] == (uint32_t)-EINTR &&
         (guest_actions[linux_signal].flags & LINUX_SA_RESTART) != 0 &&
@@ -289,7 +292,8 @@ int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
         context->uc_mcontext.cpu.gpr[0] = original_r0;
         context->uc_mcontext.cpu.gpr[15] -= 4u;
     }
-    return guest_signal_deliver(context, linux_signal, 0) == 0 ? 1 : -1;
+    return guest_signal_deliver(context, linux_signal,
+        has_information ? &information : 0) == 0 ? 1 : -1;
 }
 
 int guest_signal_return(ucontext_t *context, int realtime)
@@ -354,9 +358,9 @@ static void host_signal_handler(int host_signal, siginfo_t *information,
     int linux_signal = guest_signal_from_host(host_signal);
     uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
     if (linux_signal == 0) return;
-    if (guest_memory_is_executable(pc, 4) &&
+    if (!guest_thread_syscall_active() && guest_memory_is_executable(pc, 4) &&
         guest_signal_deliver(context, linux_signal, information) == 0) return;
-    guest_thread_signal_pending(linux_signal);
+    guest_thread_signal_pending(linux_signal, information);
 }
 
 int32_t guest_signal_send(pid_t process, int linux_signal)

@@ -111,7 +111,9 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
             if (guest_signal_return(context, 1) == 0) return;
             fatal_signal(sig, info, pc);
         }
+        guest_thread_syscall_enter();
         linux_syscall_dispatch(context);
+        guest_thread_syscall_leave();
         context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
         guest_signal_deliver_pending(context, syscall_number, original_r0);
         return;

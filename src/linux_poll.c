@@ -64,19 +64,32 @@ static int timespec_timeout(const void *address, int time64, int *milliseconds)
     return 0;
 }
 
-static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout)
+static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
+    int signal_wait_fd, int *signal_interrupted)
 {
     struct pollfd *host;
+    uint32_t host_count = count + (signal_wait_fd >= 0 ? 1u : 0u);
     uint32_t i;
     int result;
     if (count > 65536u) return -EINVAL;
-    host = count == 0 ? 0 : calloc(count, sizeof(*host));
-    if (count != 0 && host == 0) return -ENOMEM;
+    host = host_count == 0 ? 0 : calloc(host_count, sizeof(*host));
+    if (host_count != 0 && host == 0) return -ENOMEM;
     for (i = 0; i != count; ++i) {
         host[i].fd = guest[i].fd;
         host[i].events = poll_events_to_host(guest[i].events);
     }
-    result = poll(host, count, timeout);
+    if (signal_wait_fd >= 0) {
+        host[count].fd = signal_wait_fd;
+        host[count].events = POLLIN;
+    }
+    result = poll(host, host_count, timeout);
+    if (signal_interrupted != 0)
+        *signal_interrupted = result < 0 && errno == EINTR;
+    if (result > 0 && signal_wait_fd >= 0 && host[count].revents != 0) {
+        if (signal_interrupted != 0) *signal_interrupted = 1;
+        result = -1;
+        errno = EINTR;
+    }
     if (result >= 0)
         for (i = 0; i != count; ++i)
             guest[i].revents = poll_events_to_linux(host[i].revents);
@@ -111,7 +124,11 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
     fd_set read_set, write_set, except_set;
     struct timeval timeout, *timeout_pointer = 0;
     sigset_t requested, old;
+    uint32_t requested_words[2], old_words[2];
     int replace_mask = 0;
+    int signal_wait_fd = -1;
+    int signal_interrupted = 0;
+    int host_count = count;
     int result;
     if (count < 0 || count > FD_SETSIZE) return -EINVAL;
     fdset_to_host(guest_read, count, &read_set);
@@ -138,16 +155,46 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
         memcpy(pair, (void *)arguments[5], sizeof(pair));
         result = guest_signal_host_mask((void *)pair[0], pair[1], &requested);
         if (result != 0) return result;
-        if (sigprocmask(SIG_SETMASK, &requested, &old) != 0)
+        memcpy(requested_words, (void *)pair[0], sizeof(requested_words));
+        requested_words[0] &= ~((1u << (9 - 1)) | (1u << (19 - 1)));
+        guest_thread_signal_mask_get(old_words);
+        signal_wait_fd = guest_thread_signal_wait_begin();
+        if (signal_wait_fd < 0)
             return -(int32_t)linux_errno_number(errno);
+        if (signal_wait_fd >= FD_SETSIZE) {
+            guest_thread_signal_wait_end();
+            return -EMFILE;
+        }
+        FD_SET(signal_wait_fd, &read_set);
+        if (signal_wait_fd >= host_count) host_count = signal_wait_fd + 1;
+        if (sigprocmask(SIG_SETMASK, &requested, &old) != 0)
+            {
+                int saved_errno = errno;
+                guest_thread_signal_wait_end();
+                return -(int32_t)linux_errno_number(saved_errno);
+            }
+        guest_thread_signal_mask_set(requested_words);
+        guest_thread_signal_wait_arm();
         replace_mask = 1;
     }
-    result = select(count, guest_read ? &read_set : 0,
+    result = select(host_count, (guest_read || signal_wait_fd >= 0) ?
+        &read_set : 0,
         guest_write ? &write_set : 0, guest_except ? &except_set : 0,
         timeout_pointer);
+    signal_interrupted = result < 0 && errno == EINTR;
+    if (result > 0 && signal_wait_fd >= 0 &&
+        FD_ISSET(signal_wait_fd, &read_set)) {
+        signal_interrupted = 1;
+        result = -1;
+        errno = EINTR;
+    }
     if (replace_mask) {
         int saved_errno = errno;
+        if (signal_interrupted)
+            guest_thread_signal_wait_interrupted(old_words);
+        else guest_thread_signal_wait_complete(old_words);
         sigprocmask(SIG_SETMASK, &old, 0);
+        guest_thread_signal_wait_end();
         errno = saved_errno;
     }
     if (result < 0) return -(int32_t)linux_errno_number(errno);
@@ -166,25 +213,50 @@ int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6])
 {
     if (number == LINUX_NR_POLL)
         return do_poll((struct linux_pollfd *)arguments[0], arguments[1],
-            (int)arguments[2]);
+            (int)arguments[2], -1, 0);
     if (number == LINUX_NR_PPOLL || number == LINUX_NR_PPOLL_TIME64) {
         int timeout;
         int result = timespec_timeout((void *)arguments[2],
             number == LINUX_NR_PPOLL_TIME64, &timeout);
         sigset_t requested, old;
+        uint32_t requested_words[2], old_words[2];
         int replace_mask = 0;
+        int signal_wait_fd = -1;
+        int signal_interrupted = 0;
         if (result != 0) return result;
         if (arguments[3] != 0) {
             result = guest_signal_host_mask((void *)arguments[3], arguments[4],
                 &requested);
             if (result != 0) return result;
-            if (sigprocmask(SIG_SETMASK, &requested, &old) != 0)
+            memcpy(requested_words, (void *)arguments[3],
+                sizeof(requested_words));
+            requested_words[0] &=
+                ~((1u << (9 - 1)) | (1u << (19 - 1)));
+            guest_thread_signal_mask_get(old_words);
+            signal_wait_fd = guest_thread_signal_wait_begin();
+            if (signal_wait_fd < 0)
                 return -(int32_t)linux_errno_number(errno);
+            if (sigprocmask(SIG_SETMASK, &requested, &old) != 0)
+                {
+                    int saved_errno = errno;
+                    guest_thread_signal_wait_end();
+                    return -(int32_t)linux_errno_number(saved_errno);
+                }
+            guest_thread_signal_mask_set(requested_words);
+            guest_thread_signal_wait_arm();
             replace_mask = 1;
         }
         result = do_poll((struct linux_pollfd *)arguments[0], arguments[1],
-            timeout);
-        if (replace_mask) sigprocmask(SIG_SETMASK, &old, 0);
+            timeout, signal_wait_fd, &signal_interrupted);
+        if (replace_mask) {
+            int saved_errno = errno;
+            if (signal_interrupted)
+                guest_thread_signal_wait_interrupted(old_words);
+            else guest_thread_signal_wait_complete(old_words);
+            sigprocmask(SIG_SETMASK, &old, 0);
+            guest_thread_signal_wait_end();
+            errno = saved_errno;
+        }
         return result;
     }
     if (number == LINUX_NR_SELECT) {

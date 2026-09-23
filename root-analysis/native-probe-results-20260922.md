@@ -494,12 +494,21 @@ pthread_smoke=PASS threads=4 iterations=100 counter=400 cancellation=ok
 ```
 
 `SA_RESTART` covers the explicitly translated blocking read/write, wait, futex,
-ioctl, and socket calls. Duplicate real-time signal queueing is not implemented.
-`ppoll` and `pselect6` still have the documented QNX 10.3 gap
-between temporary mask installation and entering `poll`/`select`; root-only
-`/proc/<pid>` access does not supply a kernel primitive that closes that race.
+ioctl, and socket calls. Mapped real-time signals use bounded 64-entry
+per-number, per-thread queues and preserve deferred `siginfo`; standard signals
+retain Linux coalescing behavior.
 
-After the Phase 8 signal-core build, the native, static guest, signal, dynamic
+QNX 10.3 does not expose an atomic mask-and-wait call, but Linuxemu now closes
+the transition race with a transient per-thread nonblocking wake pipe. It
+publishes the write end before changing the mask, checks already-pending signals
+after installing the temporary software mask, and includes the read end in the
+host `poll` or `select`. The handler only records the signal and writes a wake
+byte while a translated syscall is active. A new direct guest verifies three
+queued copies of real-time signal 32 with their sender information, then
+interrupts both `ppoll` and `pselect6`; twenty consecutive combined iterations
+pass.
+
+After the completed Phase 8 build, the native, static guest, signal, dynamic
 musl, loader-negative, filesystem, process, terminal/time, network, package,
 and thread suites all completed with zero failures on `192.168.0.3`. The
 temporary Alpine compiler packages, nano transaction, and resolver were

@@ -157,11 +157,11 @@ Priority areas:
 - Signals, masks, interruption, restart semantics and guest signal frames.
 - clone/thread lifecycle, futex wait/wake races, TLS setup and clear_child_tid behavior.
 
-Deferred polling correctness item recorded after the 2026-09-22 Phase 4 implementation:
-- `ppoll` and `pselect6` currently convert the Linux signal mask, install it with `sigprocmask`, perform the QNX wait, and restore the old mask. QNX 10.3 provides no native `ppoll` or `pselect` entry point, so mask installation and the wait are not atomic and a signal can arrive in between.
-- Keep the working implementation for basic terminal and readiness workloads, but do not claim signal-race-equivalent Linux semantics.
-- Investigate QNX `_select_event`, `timer_timeout`, or another kernel-assisted wait that can combine signal notification with descriptor readiness. Do not replace the current path with a helper-thread design unless cancellation, descriptor reuse, and process-fork behavior are defined.
-- Add a stress test that repeatedly delivers a signal in the mask-transition window and proves there is no lost wakeup before this item is closed.
+Polling correctness item closed during Phase 8 on 2026-09-23:
+- QNX 10.3 has no native `ppoll` or `pselect` entry point, so Linuxemu now publishes a transient per-thread nonblocking wake pipe before changing the temporary mask and includes its read end in the host wait.
+- A host handler records the pending signal and writes the pipe. After installing the temporary software mask, Linuxemu also checks signals that became pending before the pipe existed and arms it before entering `poll` or `select`. The pipe is a wake hint; the per-thread pending queues remain authoritative.
+- Interrupted waits retain the temporary software mask until the guest frame is constructed, while its saved context contains the pre-wait mask. Completed waits restore the old mask directly. Fork cleanup closes every inherited internal wait descriptor.
+- A direct guest repeatedly exercises signals delivered through both `ppoll` and `pselect6`; twenty consecutive combined queue/wait iterations pass in the standard signal suite. `pselect6` returns `EMFILE` in the exceptional case where the transient internal descriptor exceeds QNX `FD_SETSIZE`.
 
 Phase 5 networking status recorded on 2026-09-23:
 - Direct ARM socket syscalls 281 through 297 and `accept4`, plus legacy `socketcall`, are translated for the currently tested operations.
@@ -194,7 +194,8 @@ Phase 8 signal status recorded on 2026-09-23:
 - Direct tests cover asynchronous standard and real-time handlers, handler-time mask changes, alternate-stack execution, `sigsuspend` interruption, and recovery from a synchronous guest `SIGILL` by editing the saved context.
 - A blocked pipe read interrupted by a handler with `SA_RESTART` resumes at the original syscall and completes after data arrives; non-restartable waits still report Linux `EINTR`.
 - Replaced futex condition waits with semaphore waits that signal handlers can interrupt safely. A real Alpine musl thread blocked in a condition wait now cancels and joins as `PTHREAD_CANCELED`.
-- Queued duplicate real-time instances and an atomic QNX implementation of the `ppoll`/`pselect6` temporary-mask transition remain unresolved and explicitly unsupported.
+- Mapped Linux real-time signals now use per-number, per-thread 64-entry queues and retain each deferred QNX `siginfo`; standard signals retain Linux coalescing behavior.
+- `ppoll` and `pselect6` use the transient wake-pipe protocol above, closing the temporary-mask lost-wakeup window without a helper thread.
 
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
@@ -217,8 +218,8 @@ have different failure surfaces and now have separate acceptance gates.
   primitive, or retain and precisely document the bounded incompatibility.
 
 Gate: direct guest handlers and return, nested masks, timed waits, cancellation,
-and signal interruption pass on the device. The polling mask transition must be
-proven atomic or remain explicitly outside the supported compatibility surface.
+signal interruption, queued real-time delivery, and atomic polling-mask wakeups
+pass on the device.
 
 ### Phase 9. Loader and process/thread hardening
 
@@ -274,8 +275,9 @@ explicitly; they do not block the first supported release by default.
 
 ## Immediate next action
 
-Execute Phase 8 against the completed thread/futex baseline, preserving the
-full earlier regression suite as its non-regression gate.
+Begin Phase 9 loader and process/thread hardening against the completed signal
+baseline, preserving the full earlier regression suite as its non-regression
+gate.
 
 ## Evidence and local artifacts
 
