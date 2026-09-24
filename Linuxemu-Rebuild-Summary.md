@@ -236,7 +236,7 @@ Phase 12 packaging status recorded on 2026-09-24:
 - Documented the v0.1 compatibility matrix, installation, deterministic bundle
   build, release procedure, and source provenance. The public-branch audit
   reports no forbidden recovery paths, credential markers, or blobs over 5 MiB
-  in the 20 currently committed changes.
+  in the 21 publication commits.
 - Local Codex checkpoint refs still reach recovery artifacts. They are not in
   the `master` ancestry and must remain local; publication must push the
   reviewed branch and tag explicitly rather than mirroring this repository.
