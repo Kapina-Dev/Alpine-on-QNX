@@ -9,7 +9,7 @@
 
    ```sh
    LINUXEMU_BINARY=PATH sh scripts/prepare-release.sh \
-     https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.1
+     https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.2
    ```
 
 5. Test the rendered installer from an empty prefix on the device.

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-version=0.1.1
+version=0.1.2
 default_release_base='@LINUXEMU_RELEASE_BASE@'
 default_bundle_sha256='@LINUXEMU_BUNDLE_SHA256@'
 alpine_version=3.24.2

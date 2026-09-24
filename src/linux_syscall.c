@@ -339,6 +339,50 @@ static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
     return (int32_t)process;
 }
 
+static int32_t linux_write_compat(int descriptor, const void *data,
+    size_t count)
+{
+    static const unsigned char cursor_query[] = { 0x1b, '[', '6', 'n' };
+    const unsigned char *bytes = data;
+    const char *terminal;
+    size_t start = 0;
+    size_t position;
+
+    if (count < sizeof(cursor_query) || !isatty(descriptor))
+        return linux_result(write(descriptor, data, count));
+    terminal = getenv("TERM");
+    if (terminal == 0 || strcmp(terminal, "ansi") != 0)
+        return linux_result(write(descriptor, data, count));
+
+    for (position = 0; position + sizeof(cursor_query) <= count; ++position) {
+        size_t offset;
+        if (memcmp(bytes + position, cursor_query,
+                sizeof(cursor_query)) != 0)
+            continue;
+        offset = start;
+        while (offset < position) {
+            ssize_t written = write(descriptor, bytes + offset,
+                position - offset);
+            if (written < 0)
+                return -(int32_t)linux_errno_number(errno);
+            if (written == 0) return -EIO;
+            offset += (size_t)written;
+        }
+        position += sizeof(cursor_query) - 1;
+        start = position + 1;
+    }
+    if (start == 0)
+        return linux_result(write(descriptor, data, count));
+    while (start < count) {
+        ssize_t written = write(descriptor, bytes + start, count - start);
+        if (written < 0)
+            return -(int32_t)linux_errno_number(errno);
+        if (written == 0) return -EIO;
+        start += (size_t)written;
+    }
+    return (int32_t)count;
+}
+
 static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
     int count)
 {
@@ -361,9 +405,9 @@ static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
             vectors[index].iov_len);
         position += vectors[index].iov_len;
     }
-    result = write(descriptor, buffer, total);
+    result = linux_write_compat(descriptor, buffer, total);
     free(buffer);
-    return linux_result(result);
+    return (int32_t)result;
 }
 
 static int directory_path(int directory_fd, const char *guest_path,
@@ -1186,10 +1230,10 @@ void linux_syscall_dispatch(ucontext_t *context)
                 (int)context->uc_mcontext.cpu.gpr[0],
                 (const void *)context->uc_mcontext.cpu.gpr[1],
                 (size_t)context->uc_mcontext.cpu.gpr[2]);
-        else result = linux_result(write(
+        else result = linux_write_compat(
             (int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
-            (size_t)context->uc_mcontext.cpu.gpr[2]));
+            (size_t)context->uc_mcontext.cpu.gpr[2]);
         break;
     case LINUX_NR_PREAD64: {
         uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |

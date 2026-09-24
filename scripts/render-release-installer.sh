@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-version=${LINUXEMU_VERSION:-0.1.1}
+version=${LINUXEMU_VERSION:-0.1.2}
 output_dir=${RELEASE_OUTPUT_DIR:-"$project_dir/build/release"}
 release_base=${1:?usage: render-release-installer.sh RELEASE_BASE [OUTPUT]}
 output=${2:-"$output_dir/install-linuxemu.sh"}
