@@ -4,6 +4,12 @@ Linuxemu is an ARM32 Linux ABI translation layer for BlackBerry 10/QNX. Linux AR
 
 The current rebuild has a verified native contract plus static and dynamic ARM execution paths. Alpine 3.24.2's musl interpreter can relocate and run BusyBox commands against a contained guest root filesystem.
 
+## Acknowledgment
+
+Respect and thanks to **sw7ft** for BerryBrowser, BerryCore, and his wider
+efforts to keep BlackBerry devices alive and useful. Alpine-on-QNX builds on
+that same spirit of extending the practical life of these devices.
+
 ## Current verified behavior
 
 - Native QNX signals and `ucontext_t` register edits in ARM and Thumb modes.
