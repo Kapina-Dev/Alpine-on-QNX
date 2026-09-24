@@ -40,6 +40,10 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 - Alpine Python 3.14.7 imports and runs files, SQLite, clocks, verified HTTPS,
   loopback TCP/UDP, subprocesses, signals, and four-thread synchronization.
   Unsupported `epoll` creation returns Linux `ENOSYS`.
+- Alpine Git 2.54.0 creates, commits, verifies, packs, clones, pushes, and
+  incrementally fetches repositories. Verified HTTPS clone/fetch and invalid
+  certificate, unavailable authentication, and unreachable-server failures
+  are covered against pinned public refs.
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
 
@@ -162,6 +166,19 @@ them under one virtual package, runs the Python application suite, and restores
 the resolver, package world, and 16-package baseline on exit. Override the
 default resolver with `DNS_SERVER` when needed.
 
+Run the pinned Git 2.54.0 suite from the clean 16-package rootfs:
+
+```sh
+sh scripts/run-git-smoke.sh
+```
+
+The ignored `artifacts/git-2.54.0-alpine-3.24-armhf` directory contains the
+18-APK offline closure. Its tracked hashes are in
+`docs/git-runtime-apks.sha256`. The runner installs the closure under one
+virtual package, tests local object and multi-megabyte transfer workflows,
+uses pinned commits for HTTPS clone/fetch, covers network failure paths, and
+restores the resolver, package world, and 16-package baseline on exit.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
 
 ## Execution-core layout
@@ -186,7 +203,8 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 
 ## Current limits
 
-- Dynamic support is currently limited to the pinned Alpine musl/BusyBox path.
+- Dynamic support is currently limited to the pinned Alpine 3.24 musl package
+  fixtures exercised by BusyBox, apk, nano, OpenSSL, Python, and Git.
 - `SA_RESTART` is implemented for the translated blocking read/write, wait, futex, ioctl, and socket calls. Linux real-time signals are mapped only while QNX real-time numbers are available. Each mapped real-time number has a bounded 64-entry per-thread queue; `rt_sigqueueinfo` payload submission is not implemented.
 - ARM `svc #0` patching only; Thumb guest instruction scanning is not implemented.
 - `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
@@ -198,6 +216,12 @@ Detailed device evidence is recorded in `root-analysis/native-probe-results-2026
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current
   process only.
+- `eventfd2` provides the nonblocking, close-on-exec, zero-initialized wake
+  descriptor form used by libcurl. It is pipe-backed; general counters,
+  semaphore mode, duplication from the event descriptor, and inherited event
+  descriptors are outside the supported surface and fail explicitly where
+  they can be identified. Replacing it as a `dup2`/`dup3` destination is
+  supported for Git's subprocess path.
 - ARM patching is limited to 32-bit ARM instructions in validated `SHF_EXECINSTR` sections. Thumb instruction decoding remains unsupported.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
 - Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.

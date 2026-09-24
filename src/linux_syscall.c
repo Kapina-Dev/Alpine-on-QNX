@@ -129,6 +129,7 @@
 #define LINUX_NR_FCHMODAT 333
 #define LINUX_NR_FACCESSAT 334
 #define LINUX_NR_UTIMENSAT 348
+#define LINUX_NR_EVENTFD2 356
 #define LINUX_NR_PSELECT6 335
 #define LINUX_NR_PPOLL 336
 #define LINUX_NR_DUP3 358
@@ -160,6 +161,7 @@
 #define LINUX_O_NOFOLLOW 0x00008000u
 #define LINUX_O_NONBLOCK 0x00000800u
 #define LINUX_O_CLOEXEC 0x00080000u
+#define LINUX_EFD_SEMAPHORE 0x00000001u
 #define LINUX_WNOHANG 0x00000001u
 #define LINUX_WUNTRACED 0x00000002u
 #define LINUX_WCONTINUED 0x00000008u
@@ -170,6 +172,22 @@
 
 static DIR *directory_streams[MAX_TRACKED_FDS];
 static char *fd_paths[MAX_TRACKED_FDS];
+static int eventfd_write_peers[MAX_TRACKED_FDS];
+
+static int is_wake_eventfd(int fd)
+{
+    return fd >= 0 && fd < MAX_TRACKED_FDS && eventfd_write_peers[fd] != 0;
+}
+
+static void release_wake_eventfd(int fd)
+{
+    int peer;
+
+    if (!is_wake_eventfd(fd)) return;
+    peer = eventfd_write_peers[fd] - 1;
+    eventfd_write_peers[fd] = 0;
+    close(peer);
+}
 
 struct linux_flock64 {
     int16_t type;
@@ -635,6 +653,7 @@ static int32_t linux_close_fd(int fd)
         directory_streams[fd] = 0;
     }
     if (fd >= 0 && fd < MAX_TRACKED_FDS) {
+        release_wake_eventfd(fd);
         free(fd_paths[fd]);
         fd_paths[fd] = 0;
     }
@@ -656,6 +675,8 @@ static void copy_fd_path(int source, int destination)
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
 {
     int result;
+    if ((command == 0 || command == 1030) && is_wake_eventfd(fd))
+        return -LINUX_EOPNOTSUPP;
     switch (command) {
     case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
     case 1030:
@@ -745,6 +766,58 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
     copy_fd_path(-1, descriptors[1]);
     memcpy(guest_descriptors, descriptors, sizeof(descriptors));
     return 0;
+}
+
+static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
+{
+    int descriptors[2];
+    int host_status_flags = 0;
+
+    if ((flags & ~(LINUX_EFD_SEMAPHORE | LINUX_O_NONBLOCK |
+            LINUX_O_CLOEXEC)) != 0) return -EINVAL;
+    /* The pipe-backed form is the wake descriptor subset used by libcurl. */
+    if (initial_value != 0 || flags != (LINUX_O_NONBLOCK | LINUX_O_CLOEXEC))
+        return -LINUX_EOPNOTSUPP;
+    if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
+    if (descriptors[0] < 0 || descriptors[0] >= MAX_TRACKED_FDS) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return -EMFILE;
+    }
+    if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
+    if ((host_status_flags != 0 &&
+            (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
+            fcntl(descriptors[1], F_SETFL, host_status_flags) != 0)) ||
+        ((flags & LINUX_O_CLOEXEC) != 0 &&
+            (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0))) {
+        int saved_errno = errno;
+        close(descriptors[0]);
+        close(descriptors[1]);
+        errno = saved_errno;
+        return -(int32_t)linux_errno_number(errno);
+    }
+    eventfd_write_peers[descriptors[0]] = descriptors[1] + 1;
+    copy_fd_path(-1, descriptors[0]);
+    return descriptors[0];
+}
+
+static int32_t linux_eventfd_read(int fd, void *buffer, size_t length)
+{
+    if (length < sizeof(uint64_t)) return -EINVAL;
+    return linux_result(read(fd, buffer, sizeof(uint64_t)));
+}
+
+static int32_t linux_eventfd_write(int fd, const void *buffer, size_t length)
+{
+    uint64_t value;
+    int peer;
+
+    if (length < sizeof(value)) return -EINVAL;
+    memcpy(&value, buffer, sizeof(value));
+    if (value != 1) return -EINVAL;
+    peer = eventfd_write_peers[fd] - 1;
+    return linux_result(write(peer, &value, sizeof(value)));
 }
 
 static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
@@ -1097,12 +1170,24 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_fork_process(context, 0);
         break;
     case LINUX_NR_READ:
-        result = linux_result(read((int)context->uc_mcontext.cpu.gpr[0],
+        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
+            result = linux_eventfd_read(
+                (int)context->uc_mcontext.cpu.gpr[0],
+                (void *)context->uc_mcontext.cpu.gpr[1],
+                (size_t)context->uc_mcontext.cpu.gpr[2]);
+        else result = linux_result(read(
+            (int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         break;
     case LINUX_NR_WRITE:
-        result = linux_result(write((int)context->uc_mcontext.cpu.gpr[0],
+        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
+            result = linux_eventfd_write(
+                (int)context->uc_mcontext.cpu.gpr[0],
+                (const void *)context->uc_mcontext.cpu.gpr[1],
+                (size_t)context->uc_mcontext.cpu.gpr[2]);
+        else result = linux_result(write(
+            (int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         break;
@@ -1277,16 +1362,37 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     }
     case LINUX_NR_DUP:
-        result = linux_host_result(dup((int)context->uc_mcontext.cpu.gpr[0]));
-        if (result >= 0) copy_fd_path((int)context->uc_mcontext.cpu.gpr[0],
-            result);
+        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
+            result = -LINUX_EOPNOTSUPP;
+        else {
+            result = linux_host_result(dup(
+                (int)context->uc_mcontext.cpu.gpr[0]));
+            if (result >= 0) copy_fd_path(
+                (int)context->uc_mcontext.cpu.gpr[0], result);
+        }
         break;
     case LINUX_NR_DUP2:
-        result = linux_host_result(dup2((int)context->uc_mcontext.cpu.gpr[0],
-            (int)context->uc_mcontext.cpu.gpr[1]));
-        if (result >= 0 &&
-            (int)context->uc_mcontext.cpu.gpr[0] != result)
-            copy_fd_path((int)context->uc_mcontext.cpu.gpr[0], result);
+        if ((int)context->uc_mcontext.cpu.gpr[0] ==
+                (int)context->uc_mcontext.cpu.gpr[1])
+            result = linux_host_result(fcntl(
+                (int)context->uc_mcontext.cpu.gpr[0], F_GETFD, 0)) < 0 ?
+                -(int32_t)linux_errno_number(errno) :
+                (int)context->uc_mcontext.cpu.gpr[0];
+        else if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
+            result = -LINUX_EOPNOTSUPP;
+        else {
+            int source = (int)context->uc_mcontext.cpu.gpr[0];
+            int destination = (int)context->uc_mcontext.cpu.gpr[1];
+            if (fcntl(source, F_GETFD, 0) < 0)
+                result = -(int32_t)linux_errno_number(errno);
+            else {
+                release_wake_eventfd(destination);
+                result = linux_host_result(dup2(source, destination));
+            }
+            if (result >= 0 &&
+                (int)context->uc_mcontext.cpu.gpr[0] != result)
+                copy_fd_path((int)context->uc_mcontext.cpu.gpr[0], result);
+        }
         break;
     case LINUX_NR_ACCESS: {
         char host_path[PATH_MAX];
@@ -1573,7 +1679,12 @@ void linux_syscall_dispatch(ucontext_t *context)
         uint32_t flags = context->uc_mcontext.cpu.gpr[2];
         if (source == destination || (flags & ~LINUX_O_CLOEXEC) != 0)
             result = -EINVAL;
+        else if (is_wake_eventfd(source))
+            result = -LINUX_EOPNOTSUPP;
+        else if (fcntl(source, F_GETFD, 0) < 0)
+            result = -(int32_t)linux_errno_number(errno);
         else {
+            release_wake_eventfd(destination);
             result = linux_host_result(dup2(source, destination));
             if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
                 fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)
@@ -1582,6 +1693,10 @@ void linux_syscall_dispatch(ucontext_t *context)
         }
         break;
     }
+    case LINUX_NR_EVENTFD2:
+        result = linux_eventfd2(context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
     case LINUX_NR_PIPE2:
         result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);

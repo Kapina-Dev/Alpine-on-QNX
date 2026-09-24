@@ -213,6 +213,13 @@ Phase 10 Python status recorded on 2026-09-24:
 - The application suite passes imports, compressed/hash/decimal/ctypes operations, file and SQLite round trips, wall and monotonic clocks, TCP/UDP, certificate-verified HTTPS, shell and Python subprocesses, guest signal delivery, four Python threads, and the `ENOSYS` failure path for unsupported epoll.
 - The reproducible runner verifies every APK hash, installs the closure offline under a temporary virtual package, and restores the resolver, six-entry world file, and 16-package baseline. All earlier core, loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, and Phase 9 stress suites pass with the Phase 10 runtime.
 
+Phase 11 Git status recorded on 2026-09-24:
+- Pinned Alpine `git` 2.54.0-r0 and `git-init-template` 2.54.0-r0 with an 18-APK recursive offline closure. The tracked manifest records SHA-256 for every archive; the ignored closure is preserved on both the laptop and device.
+- Local workflows cover init, status, add, three commits, object inspection, strict fsck, garbage collection, a multi-megabyte binary object, bare and working clones, push, and incremental fetch.
+- HTTPS clone of `octocat/Hello-World` pins master commit `7fd1a60b01f91b314f59955a4e4d4e80d8edf11d`; a subsequent fetch pins test commit `b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf`. Empty certificate trust, disabled-prompt authentication failure, and an unreachable loopback endpoint all fail with diagnostics.
+- Alpine libcurl requires ARM `eventfd2` to construct its multi handle. Linuxemu now provides its zero-initialized, nonblocking, close-on-exec wake-descriptor subset with a tracked pipe peer. Git also replaces that descriptor while spawning `index-pack`, so `dup2`/`dup3` destination replacement releases the hidden peer; unsupported counter, semaphore, source-duplication, and inheritance forms fail explicitly where identifiable.
+- The clean-rootfs Git gate passed once during development and then three consecutive repeated cycles. Every cycle restored the resolver, six-entry world file, and 16-package baseline. The warning-clean build and all native, core, loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, loader/process stress, and Python regressions pass with the Phase 11 runtime.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
@@ -261,7 +268,7 @@ stale host state, leaked mappings, or guest-root filesystem damage.
 
 Gate: a reproducible Python application suite passes from a clean rootfs.
 
-### Phase 11. Git workflows
+### Phase 11. Git workflows (complete)
 
 - Cover local repository creation, status, add, commit, and object operations.
 - Cover HTTPS clone and incremental fetch against pinned test content, including
@@ -306,8 +313,9 @@ explicitly; they do not block the first supported release by default.
 
 ## Immediate next action
 
-Begin Phase 11 with a pinned local Git repository fixture, then cover local
-object workflows and HTTPS clone/fetch success and failure paths.
+Begin Phase 12 by defining the supported release matrix and a single clean
+build, installation, and full-regression entry point. Then audit the tracked
+tree and history for publication and prepare the private hosted release review.
 
 ## Evidence and local artifacts
 
