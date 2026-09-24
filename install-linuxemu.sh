@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-version=0.1.0
+version=0.1.1
 default_release_base='@LINUXEMU_RELEASE_BASE@'
 default_bundle_sha256='@LINUXEMU_BUNDLE_SHA256@'
 alpine_version=3.24.2
@@ -145,11 +145,10 @@ mkdir -p "$stage/rootfs/home/linuxemu" "$stage/rootfs/etc/profile.d" \
 printf 'nameserver %s\n' "$dns_server" >"$stage/rootfs/etc/resolv.conf"
 cat >"$stage/rootfs/etc/profile.d/linuxemu.sh" <<EOF
 export HOME=/home/linuxemu
-alias apk='apk --no-chown'
 case \$- in
 *i*)
     printf '\nLinuxemu $version / Alpine $alpine_version armhf\n'
-    printf 'Type "exit" to return to QNX. Use "apk --no-chown" for packages.\n\n'
+    printf 'Type "exit" to return to QNX. Install with "apk add --no-chown PACKAGE".\n\n'
     PS1='alpinx:\w\$ '
     ;;
 esac

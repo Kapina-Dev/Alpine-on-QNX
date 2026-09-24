@@ -1,5 +1,9 @@
 # Linuxemu v0.1.0
 
+> Superseded by v0.1.1. This release's interactive profile puts
+> `--no-chown` before every apk subcommand, which breaks commands such as
+> `apk info`. Upgrade to v0.1.1.
+
 Linuxemu runs 32-bit ARM Linux applications directly on a BlackBerry 10 ARM
 CPU and translates their Linux system calls to QNX. This first supported
 release targets the pinned Alpine Linux 3.24.2 armhf minirootfs.
@@ -36,7 +40,7 @@ adds `linuxemu` and `alpinx` to the login `PATH`. It also provides
 General Thumb guest syscall scanning, priority-inheritance and cross-process
 futexes, socket ancillary data, epoll, graphics, service management, and
 arbitrary device ioctls are outside this release. Package installation is
-unprivileged and should use `apk --no-chown`.
+unprivileged and package installation should use `apk add --no-chown PACKAGE`.
 
 Read `linuxemu-compatibility-0.1.0.md` for the complete supported surface and
 `SHA256SUMS` before using the attached files.

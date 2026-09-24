@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-version=${LINUXEMU_VERSION:-0.1.0}
+version=${LINUXEMU_VERSION:-0.1.1}
 output_dir=${RELEASE_OUTPUT_DIR:-"$project_dir/build/release"}
 summary=${REGRESSION_SUMMARY:-"$project_dir/build/full-regression/summary.txt"}
 release_base=${1:?usage: prepare-release.sh RELEASE_BASE}

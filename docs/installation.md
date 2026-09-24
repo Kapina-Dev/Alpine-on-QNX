@@ -11,7 +11,7 @@ the root SSH account.
 Download the installer associated with the release tag and execute it:
 
 ```sh
-wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.0/install-linuxemu.sh
+wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.1/install-linuxemu.sh
 sh /tmp/install-linuxemu.sh
 ```
 
@@ -42,5 +42,6 @@ and runs a guest smoke test before replacing an existing installation.
 - `linuxemu-rollback` exchanges the current and previous installations.
 - `linuxemu-uninstall` removes Linuxemu and its profile entry.
 
-Use `apk --no-chown` inside Alpine because the rootfs is owned by the ordinary
-QNX user. The interactive profile supplies an `apk` alias with that option.
+The rootfs is owned by the ordinary QNX user. Add packages with
+`apk add --no-chown PACKAGE`; read-only commands such as `apk info` need no
+extra option.

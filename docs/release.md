@@ -9,7 +9,7 @@
 
    ```sh
    LINUXEMU_BINARY=PATH sh scripts/prepare-release.sh \
-     https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.0
+     https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.1
    ```
 
 5. Test the rendered installer from an empty prefix on the device.
@@ -19,7 +19,7 @@
    exact branch that will be pushed.
 7. Publish the reviewed source privately, inspect it, and run the installer
    against the actual private release assets.
-8. Make the repository public, create the annotated `v0.1.0` tag, and publish
+8. Make the repository public, create the annotated release tag, and publish
    the runtime bundle, its checksum, the rendered installer, compatibility
    document, and regression summary.
 

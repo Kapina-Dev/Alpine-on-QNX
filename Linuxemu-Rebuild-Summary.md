@@ -236,7 +236,7 @@ Phase 12 packaging status recorded on 2026-09-24:
 - Documented the v0.1 compatibility matrix, installation, deterministic bundle
   build, release procedure, and source provenance. The public-branch audit
   reports no forbidden recovery paths, credential markers, or blobs over 5 MiB
-  in the 21 publication commits.
+  in the 22 publication commits.
 - Local Codex checkpoint refs still reach recovery artifacts. They are not in
   the `master` ancestry and must remain local; publication must push the
   reviewed branch and tag explicitly rather than mirroring this repository.
@@ -244,6 +244,11 @@ Phase 12 packaging status recorded on 2026-09-24:
   `Kapina-Dev/Alpine-on-QNX` repository coordinates are selected. Final release
   assets have been rendered and verified; hosted private/public verification
   remains open.
+- The first public interactive check exposed a v0.1.0 profile alias that put
+  apk's `--no-chown` option before every subcommand and broke `apk info`. The
+  v0.1.1 candidate removes that alias, documents
+  `apk add --no-chown PACKAGE`, and passes both direct and interactive
+  16-package `apk info` checks in an isolated device installation.
 
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
@@ -320,7 +325,7 @@ failure behavior.
   or rewrite it to the maintainer's public name and email before the first push.
 - Create an empty hosted repository, publish the reviewed branch privately
   first, inspect its rendered contents, and then make it public. Tag the first
-  clean, fully tested state as `v0.1.0` and attach compatibility notes, known
+  clean, fully tested state and attach compatibility notes, known
   limitations, test evidence, and checksum manifests to the release.
 - Publish reproducible acquisition instructions and hashes for external guest
   packages. Do not attach the locally cached APK closure or third-party QNX and
@@ -341,7 +346,7 @@ explicitly; they do not block the first supported release by default.
 Choose the public license and commit identity, then build the final licensed
 bundle and render the installer for the selected GitHub repository. Audit and
 publish only the reviewed branch privately, test the real hosted installer,
-then make the repository public and publish tag `v0.1.0`.
+then make the repository public and publish the tested release tag.
 
 ## Evidence and local artifacts
 

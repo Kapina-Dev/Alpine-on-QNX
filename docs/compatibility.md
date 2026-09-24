@@ -39,7 +39,8 @@ Python application workflows, and local plus HTTPS Git workflows.
   rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file
   mappings use an anonymous copy.
-- Package installation is unprivileged and should use `apk --no-chown`.
+- Package installation is unprivileged and should use
+  `apk add --no-chown PACKAGE`.
 - Guest paths remain inside the Alpine rootfs. Host shared-media directories
   are not mounted into the guest.
 
