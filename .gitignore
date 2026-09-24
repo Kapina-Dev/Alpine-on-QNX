@@ -1,3 +1,15 @@
 /build/
 /artifacts/
 /root-analysis/gcc-sdk.zip
+/bb10-contract-*/
+/bb10-results-*/
+/bb10-root-artifacts-*/
+/analysis-tools/
+/Collect-BB10Root.ps1
+/Collect-LinuxEmuContract.ps1
+/LinuxEmu-Contract-Plan.md
+/project_linuxemu.md
+/root-analysis/*.decompiled.py
+/root-analysis/*.disassembly.txt
+/root-analysis/findings.md
+/root-analysis/root-contract-followup.md

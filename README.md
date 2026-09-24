@@ -47,6 +47,25 @@ The current rebuild has a verified native contract plus static and dynamic ARM e
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
 
+## Device installation
+
+The v0.1 release is installed directly on the phone. BerryCore by sw7ft is a
+prerequisite and supplies the HTTPS-capable `wget` and checksum tools. Download
+the installer for the release tag, run it as the ordinary Term49/SSH user, then
+reconnect or reload the login profile:
+
+```sh
+wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.0/install-linuxemu.sh
+sh /tmp/install-linuxemu.sh
+. ~/.profile
+alpinx
+```
+
+The installer verifies the Linuxemu runtime bundle and official Alpine 3.24.2
+armhf minirootfs, stages and smoke-tests the installation, and adds `alpinx`
+and `linuxemu` to the login `PATH`. See `docs/installation.md` for DNS,
+rollback, uninstallation, and command details.
+
 ## Device build
 
 The phone workspace is `/accounts/1000/shared/misc/linuxemu-dev`. With the recovered SDK extracted to its `sdk` directory:
@@ -179,7 +198,18 @@ virtual package, tests local object and multi-megabyte transfer workflows,
 uses pinned commits for HTTPS clone/fetch, covers network failure paths, and
 restores the resolver, package world, and 16-package baseline on exit.
 
+Run the complete release regression from a pseudo-terminal:
+
+```sh
+ssh -tt bb10 'cd /accounts/1000/shared/misc/linuxemu-dev && sh scripts/run-full-regression.sh'
+```
+
+Per-suite logs and the final summary are written under
+`build/full-regression`.
+
 Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
+Release inputs and excluded development material are described in
+`docs/provenance.md`.
 
 ## Execution-core layout
 

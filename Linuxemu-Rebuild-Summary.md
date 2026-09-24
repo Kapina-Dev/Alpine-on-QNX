@@ -6,7 +6,9 @@ Updated: 2026-09-24
 
 Rebuild Linuxemu as a reliable Linux ARM32 ABI translation layer for Alpine/musl applications on BlackBerry 10. Linux instructions execute on the ARM CPU; the translator supplies the Linux process environment and translates operating-system interfaces to QNX. This is not a Linux kernel, container, or guarantee that all Linux software will run.
 
-The earlier source and executable are lost on both devices. The surviving project notes describe substantial working progress, but cannot replace the implementation or reproducible test results. The new native probe exists as source only; it has not been compiled or run.
+The earlier source and executable are lost on both devices. The surviving
+project notes guided a clean rebuild, which now runs the pinned Alpine 3.24.2
+armhf guest and passes the complete device regression described below.
 
 Historical work targeted the Passport. Current root investigation is on a Q20/Classic. Results must identify the device instead of assuming identical behavior.
 
@@ -220,6 +222,29 @@ Phase 11 Git status recorded on 2026-09-24:
 - Alpine libcurl requires ARM `eventfd2` to construct its multi handle. Linuxemu now provides its zero-initialized, nonblocking, close-on-exec wake-descriptor subset with a tracked pipe peer. Git also replaces that descriptor while spawning `index-pack`, so `dup2`/`dup3` destination replacement releases the hidden peer; unsupported counter, semaphore, source-duplication, and inheritance forms fail explicitly where identifiable.
 - The clean-rootfs Git gate passed once during development and then three consecutive repeated cycles. Every cycle restored the resolver, six-entry world file, and 16-package baseline. The warning-clean build and all native, core, loader, dynamic, filesystem, process, terminal/time, network, package, thread/futex, signal, loader/process stress, and Python regressions pass with the Phase 11 runtime.
 
+Phase 12 packaging status recorded on 2026-09-24:
+- Added a device-only installer that requires the already installed BerryCore
+  tools, verifies a pinned Linuxemu bundle and the official Alpine 3.24.2
+  minirootfs, stages and smoke-tests the result, and installs `linuxemu` plus
+  `alpinx` for the ordinary QNX user.
+- An isolated device install passed interactive greeting, command, upgrade,
+  rollback, uninstall, and bad-checksum tests. The bad checksum left no prefix
+  or profile mutation, and all temporary test inputs were removed afterward.
+- A single pseudo-terminal regression runner passed all 14 suites with zero
+  failures, restored the package world and resolver, and retained the expected
+  16-package rootfs baseline.
+- Documented the v0.1 compatibility matrix, installation, deterministic bundle
+  build, release procedure, and source provenance. The public-branch audit
+  reports no forbidden recovery paths, credential markers, or blobs over 5 MiB
+  in the 20 currently committed changes.
+- Local Codex checkpoint refs still reach recovery artifacts. They are not in
+  the `master` ancestry and must remain local; publication must push the
+  reviewed branch and tag explicitly rather than mirroring this repository.
+- MIT licensing, the `Kapina-Dev` public commit identity, and the
+  `Kapina-Dev/Alpine-on-QNX` repository coordinates are selected. Final release
+  assets have been rendered and verified; hosted private/public verification
+  remains open.
+
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 
 Gate: positive, failure-path and concurrent tests pass for each advertised feature.
@@ -313,9 +338,10 @@ explicitly; they do not block the first supported release by default.
 
 ## Immediate next action
 
-Begin Phase 12 by defining the supported release matrix and a single clean
-build, installation, and full-regression entry point. Then audit the tracked
-tree and history for publication and prepare the private hosted release review.
+Choose the public license and commit identity, then build the final licensed
+bundle and render the installer for the selected GitHub repository. Audit and
+publish only the reviewed branch privately, test the real hosted installer,
+then make the repository public and publish tag `v0.1.0`.
 
 ## Evidence and local artifacts
 
