@@ -43,8 +43,9 @@ Python application workflows, and local plus HTTPS Git workflows.
   `apk add --no-chown PACKAGE`.
 - Guest paths remain inside the Alpine rootfs. Host shared-media directories
   are not mounted into the guest.
-- On QNX terminals reporting `TERM=ansi`, Linuxemu suppresses the unsupported
-  ANSI `ESC[6n` cursor-position query emitted by BusyBox's interactive shell.
+- The installed interactive environment uses Bash. BusyBox `sh` emits an ANSI
+  `ESC[6n` cursor-position query that Term49 displays as question marks; Bash
+  avoids that query and preserves the terminal's normal capabilities.
 
 Unsupported system calls return Linux errors. The supported release does not
 promise compatibility with arbitrary Linux binaries beyond this tested matrix.

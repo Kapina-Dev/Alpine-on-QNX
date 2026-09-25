@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-version=0.1.2
+version=0.1.3
 default_release_base='@LINUXEMU_RELEASE_BASE@'
 default_bundle_sha256='@LINUXEMU_BUNDLE_SHA256@'
 alpine_version=3.24.2
@@ -143,8 +143,15 @@ tar -xzf "$download_dir/$alpine_name" -C "$stage/rootfs"
 mkdir -p "$stage/rootfs/home/linuxemu" "$stage/rootfs/etc/profile.d" \
     "$stage/bin"
 printf 'nameserver %s\n' "$dns_server" >"$stage/rootfs/etc/resolv.conf"
+say "Installing Alpine base packages..."
+LINUXEMU_ROOT="$stage/rootfs" "$stage/libexec/linuxemu-core" \
+    "$stage/rootfs/sbin/apk" add --no-cache --no-chown bash
+awk -F: 'BEGIN { OFS=":" } $1 == "root" { $7="/bin/bash" } { print }' \
+    "$stage/rootfs/etc/passwd" >"$stage/rootfs/etc/passwd.linuxemu"
+mv "$stage/rootfs/etc/passwd.linuxemu" "$stage/rootfs/etc/passwd"
 cat >"$stage/rootfs/etc/profile.d/linuxemu.sh" <<EOF
 export HOME=/home/linuxemu
+export SHELL=/bin/bash
 case \$- in
 *i*)
     printf '\nLinuxemu $version / Alpine $alpine_version armhf\n'
@@ -164,18 +171,19 @@ export LINUXEMU_ROOT="\$root"
 export HOME=/home/linuxemu
 export USER=linuxemu
 export LOGNAME=linuxemu
+export SHELL=/bin/bash
 if [ "\$#" -eq 0 ]; then
     exec "\$core" --linuxemu-exec "\$root" /home/linuxemu \
-        "\$root/bin/busybox" /bin/sh -l
+        "\$root/bin/bash" /bin/bash --login
 fi
 if [ "\$1" = -c ]; then
     shift
     [ "\$#" -gt 0 ] || { echo 'linuxemu: -c requires a command' >&2; exit 2; }
     exec "\$core" --linuxemu-exec "\$root" /home/linuxemu \
-        "\$root/bin/busybox" /bin/sh -c "\$1"
+        "\$root/bin/bash" /bin/bash -c "\$1"
 fi
 exec "\$core" --linuxemu-exec "\$root" /home/linuxemu \
-    "\$root/bin/busybox" /bin/sh -c 'exec "\$@"' linuxemu "\$@"
+    "\$root/bin/bash" /bin/bash -c 'exec "\$@"' linuxemu "\$@"
 EOF
 chmod 755 "$stage/bin/linuxemu"
 (cd "$stage/bin" && ln -s linuxemu alpinx)
@@ -219,8 +227,10 @@ chmod 755 "$stage/bin/linuxemu-rollback"
 say "Running the installation smoke test..."
 LINUXEMU_ROOT="$stage/rootfs" "$stage/libexec/linuxemu-core" \
     --linuxemu-exec "$stage/rootfs" /home/linuxemu \
-    "$stage/rootfs/bin/busybox" /bin/sh -c \
-    'test -x /bin/busybox && test "$(pwd)" = /home/linuxemu && echo linuxemu_install_smoke=ok'
+    "$stage/rootfs/bin/bash" /bin/bash -c \
+    'test -x /bin/bash && test "$(pwd)" = /home/linuxemu &&
+        grep -q "^root:.*:/bin/bash$" /etc/passwd &&
+        echo linuxemu_install_smoke=ok'
 
 rm -rf "$previous"
 if [ -d "$prefix" ]; then mv "$prefix" "$previous"; fi

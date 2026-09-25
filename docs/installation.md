@@ -11,7 +11,7 @@ the root SSH account.
 Download the installer associated with the release tag and execute it:
 
 ```sh
-wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.2/install-linuxemu.sh
+wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.3/install-linuxemu.sh
 sh /tmp/install-linuxemu.sh
 ```
 
@@ -31,8 +31,9 @@ DNS_SERVER=192.168.1.1 sh /tmp/install-linuxemu.sh
 ```
 
 The installer downloads the pinned runtime bundle and official Alpine 3.24.2
-armhf minirootfs, verifies their SHA-256 hashes, builds a staged installation,
-and runs a guest smoke test before replacing an existing installation.
+armhf minirootfs, verifies their SHA-256 hashes, installs Bash as the base
+interactive shell, builds a staged installation, and runs a guest smoke test
+before replacing an existing installation.
 
 ## Commands
 

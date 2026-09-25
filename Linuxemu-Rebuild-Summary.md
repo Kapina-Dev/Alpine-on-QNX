@@ -236,7 +236,7 @@ Phase 12 packaging status recorded on 2026-09-24:
 - Documented the v0.1 compatibility matrix, installation, deterministic bundle
   build, release procedure, and source provenance. The public-branch audit
   reports no forbidden recovery paths, credential markers, or blobs over 5 MiB
-  in the 24 publication commits.
+  in the 27 publication commits.
 - Local Codex checkpoint refs still reach recovery artifacts. They are not in
   the `master` ancestry and must remain local; publication must push the
   reviewed branch and tag explicitly rather than mirroring this repository.
@@ -253,10 +253,12 @@ Phase 12 packaging status recorded on 2026-09-24:
   device installation upgraded successfully, and a fresh interactive SSH
   login passed the greeting, `/home/linuxemu` cwd, 16-package `apk info`, and
   `armv7l` checks. The v0.1.0 installation remains available for rollback.
-- Term49 renders BusyBox's ANSI `ESC[6n` cursor-position query as question
-  marks after the prompt. A captured prompt trace identified the exact bytes;
-  v0.1.2 suppresses only that query on tty writes when the host reports
-  `TERM=ansi`.
+- Term49 renders BusyBox `sh`'s ANSI `ESC[6n` cursor-position query as question
+  marks after the prompt. The syscall-level v0.1.2 workaround required
+  `TERM=ansi`, which reduced terminal capabilities and affected full-screen
+  programs. The v0.1.3 design installs Bash as a base package, sets the guest
+  account and `SHELL` to `/bin/bash`, and launches Bash directly. Bash avoids
+  the query while retaining the normal `xterm-256color` interface.
 
 Translate guest buffers through defined layouts and validate access. Unsupported functionality must fail predictably; do not use success stubs for locking or other operations whose semantics matter. Keep any deliberate approximation documented.
 

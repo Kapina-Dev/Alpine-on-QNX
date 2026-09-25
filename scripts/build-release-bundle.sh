@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-version=${LINUXEMU_VERSION:-0.1.2}
+version=${LINUXEMU_VERSION:-0.1.3}
 binary=${LINUXEMU_BINARY:-"$project_dir/build/linuxemu"}
 output_dir=${RELEASE_OUTPUT_DIR:-"$project_dir/build/release"}
 name="linuxemu-runtime-$version-bb10-qnx8-arm"
