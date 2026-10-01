@@ -14,6 +14,10 @@ arbitrary Linux binary compatibility.
 ## Design principles
 
 - Preserve the current release regression while extending the ABI surface.
+- Keep Bash installed and use `/bin/bash` as the default interactive shell.
+  BusyBox `sh` triggers the terminal-status query that Term49 renders as
+  `?????`; future releases must not regress to that behavior or rely on escape
+  filtering to hide it.
 - Implement Linux semantics explicitly rather than matching syscall names.
 - Return correct Linux errors for unsupported behavior; do not use success
   stubs to inflate compatibility results.
@@ -25,7 +29,7 @@ arbitrary Linux binary compatibility.
 
 ## Phase 0: measurable compatibility
 
-Preserve the v0.1.2 regression as the baseline and add structured syscall
+Preserve the v0.1.3 regression as the baseline and add structured syscall
 diagnostics containing:
 
 - unsupported syscall number and name;
@@ -45,6 +49,33 @@ Score each application separately for:
 5. clean shutdown and resource cleanup.
 
 Installation alone must not count as application compatibility.
+
+### Validated device finding: threaded server teardown
+
+On 2026-10-01, the Python HTTP failure described in the v3 roadmap was
+reproduced on the Passport using the current `v0.1.3` Linuxemu binary and the
+development rootfs. The standard threaded `python3 -m http.server` served its
+first request with HTTP 200 and then Linuxemu terminated with `SIGSEGV` in QNX
+`MsgSendnc_r`.
+
+Syscall tracing showed that the final guest operation was `munmap` of the
+handler thread's own approximately 2 MiB stack mapping. The QNX fault reference
+was inside that just-unmapped range. This identifies the immediate defect as a
+guest-thread self-unmap/exit lifecycle problem, not a general socket teardown
+failure.
+
+A single-threaded `HTTPServer` control completed all of the following without a
+crash:
+
+- 100 sequential connections;
+- 10 clients that disconnected early;
+- a 1 MiB response; and
+- clean SIGINT shutdown with exit status 130.
+
+Therefore, fix and regression-test detached-thread self-unmap and exit before
+using the standard threaded Python server as a socket/FD acceptance test. Keep
+separate socket-close, shutdown, duplication, fork, and early-disconnect tests
+because the control does not prove every socket lifecycle case.
 
 ## Phase 1: virtual file-descriptor layer
 
@@ -211,6 +242,9 @@ unsupported fields.
 
 Add features in response to measured workloads:
 
+- safe detached-thread self-unmap and exit, including musl's `__unmapself`
+  sequence, without executing a QNX syscall handler from the mapping being
+  removed;
 - robust futex lists and additional futex operations;
 - process-shared futex support where correctness is achievable;
 - `waitid` and additional process-style clone forms;
@@ -255,6 +289,8 @@ Networking priorities:
 Every release must pass:
 
 - the existing full regression;
+- Bash-default interactive-shell checks in Term49, including absence of the
+  `?????` prompt artifact;
 - descriptor and resource-leak stress;
 - forced error and interruption tests;
 - clean installation, upgrade, rollback, and removal;
@@ -280,6 +316,8 @@ as root or make package compatibility depend on root access.
 
 ```text
 Compatibility measurement
+        |
+Thread self-unmap/exit regression fix
         |
 Virtual descriptor layer
         |
