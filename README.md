@@ -32,7 +32,7 @@ that same spirit of extending the practical life of these devices.
 - HTTPS through Alpine's OpenSSL-backed `ssl_client`, including device entropy through Linux `getrandom` and certificate-chain rejection. The pinned Alpine package index downloads and validates as gzip data.
 - Alpine `apk` repository refresh, package extraction, BusyBox trigger scripts, installed dynamic applications, and package removal. A clean nano transaction restores the original world file.
 - Contained rootfs mutation through legacy and directory-relative mkdir, unlink/rmdir, rename, link, symlink, chmod, access, and timestamp calls. Linux shebang execution restarts Linuxemu with the guest interpreter and argv layout.
-- Thread-style `clone` backed by detached QNX pthreads, with separate host lifecycle state, synthetic Linux TIDs, per-thread guest TLS, parent/child TID stores, and `clear_child_tid` wakeup after returning to the native QNX stack.
+- Thread-style `clone` backed by detached QNX pthreads, with separate host lifecycle state, synthetic Linux TIDs, per-thread guest TLS, parent/child TID stores, safe musl-style self-stack unmapping after returning to the native QNX stack, and correctly ordered `clear_child_tid` wakeup.
 - Futex wait, wake, requeue, compare-and-requeue, bitset selection, and relative/absolute timeout paths. Alpine musl pthread creation, joins, mutex contention, condition broadcast, and timed condition waits pass on the device.
 - Linux ARM classic and real-time signal frames, handler return, per-thread masks, alternate signal stacks, synchronous guest `SIGILL`, `sigsuspend` interruption, thread-directed delivery, and musl pthread cancellation.
 - The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
@@ -44,8 +44,9 @@ that same spirit of extending the practical life of these devices.
   self-process `prlimit64` support the SQLite and subprocess paths used by
   Alpine Python.
 - Alpine Python 3.14.7 imports and runs files, SQLite, clocks, verified HTTPS,
-  loopback TCP/UDP, subprocesses, signals, and four-thread synchronization.
-  Unsupported `epoll` creation returns Linux `ENOSYS`.
+  loopback TCP/UDP, subprocesses, signals, four-thread synchronization, and a
+  `ThreadingHTTPServer` across 100 sequential connections. Unsupported `epoll`
+  creation returns Linux `ENOSYS`.
 - Alpine Git 2.54.0 creates, commits, verifies, packs, clones, pushes, and
   incrementally fetches repositories. Verified HTTPS clone/fetch and invalid
   certificate, unavailable authentication, and unreachable-server failures
@@ -151,8 +152,8 @@ sh scripts/run-package-smoke.sh
 This suite temporarily writes the configured resolver into the guest rootfs and
 restores the prior resolver and package world state on exit.
 
-Run synthetic thread/futex races, 2,000 thread lifecycle cycles, and the pinned
-Alpine musl pthread fixture:
+Run synthetic thread/futex races, a self-stack-unmap/exit regression, 2,000
+thread lifecycle cycles, and the pinned Alpine musl pthread fixture:
 
 ```sh
 sh scripts/run-thread-smoke.sh

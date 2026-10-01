@@ -76,7 +76,8 @@ for guest in write-exit unknown-syscall exit-status initial-stack \
     memory-syscalls runtime-exec-syscalls file-syscalls \
     terminal-time-syscalls socket-syscalls \
     network-connect-syscalls entropy-syscalls thread-futex-syscalls \
-    thread-lifecycle-stress futex-contention-stress \
+    thread-lifecycle-stress thread-self-unmap-syscalls \
+    futex-contention-stress \
     clone-vfork-syscalls signal-frame-syscalls signal-queue-wait-syscalls; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"

@@ -1115,6 +1115,8 @@ static int32_t linux_munmap_runtime(uintptr_t address, size_t length)
         length > SIZE_MAX - (host_page_size - 1u)) return -EINVAL;
     mapped_length = align_up(length, host_page_size);
     if (!guest_memory_runtime_owned(address, mapped_length)) return -EINVAL;
+    if (guest_thread_defer_active_stack_unmap(address, mapped_length))
+        return 0;
     if (munmap((void *)address, mapped_length) != 0)
         return -(int32_t)linux_errno_number(errno);
     arm_patch_forget_range(address, mapped_length);

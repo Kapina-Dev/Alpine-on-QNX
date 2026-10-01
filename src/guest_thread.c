@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define LINUX_CLONE_VM 0x00000100u
@@ -59,6 +60,8 @@ struct guest_thread_state {
     volatile sig_atomic_t syscall_active;
     uint32_t altstack_pointer;
     uint32_t altstack_size;
+    uintptr_t deferred_unmap_start;
+    size_t deferred_unmap_length;
     struct guest_thread_state *next;
 };
 
@@ -114,6 +117,23 @@ static void finish_guest_thread(struct guest_thread_state *state)
 {
     struct guest_thread_state **cursor;
     uint32_t *clear_child_tid = state->clear_child_tid;
+
+    /*
+     * A detached musl thread ends through __unmapself: it unmaps its own
+     * guest stack and immediately invokes exit without using that stack
+     * again.  QNX delivers Linuxemu's syscall trap on the guest stack, so
+     * the physical unmap has to wait until siglongjmp has returned us to the
+     * native pthread stack.  Complete it before publishing clear_child_tid,
+     * preserving Linux's observable thread-retirement order.
+     */
+    if (state->deferred_unmap_length != 0) {
+        munmap((void *)state->deferred_unmap_start,
+            state->deferred_unmap_length);
+        arm_patch_forget_range(state->deferred_unmap_start,
+            state->deferred_unmap_length);
+        guest_memory_runtime_unmap(state->deferred_unmap_start,
+            state->deferred_unmap_length);
+    }
     pthread_mutex_lock(&thread_registry_lock);
     for (cursor = &thread_registry; *cursor != 0; cursor = &(*cursor)->next) {
         if (*cursor == state) {
@@ -244,6 +264,29 @@ int32_t guest_thread_set_tid_address(uint32_t *address)
     struct guest_thread_state *state = current_thread();
     if (state != 0) state->clear_child_tid = address;
     return guest_thread_tid();
+}
+
+int guest_thread_defer_active_stack_unmap(uintptr_t address, size_t length)
+{
+    volatile unsigned char stack_marker;
+    uintptr_t active_stack = (uintptr_t)&stack_marker;
+    struct guest_thread_state *state = current_thread();
+    uintptr_t start;
+    uintptr_t end;
+
+    if (state == 0 || active_stack < address ||
+        active_stack - address >= length) return 0;
+    start = address;
+    end = address + length;
+    if (state->deferred_unmap_length != 0) {
+        uintptr_t old_start = state->deferred_unmap_start;
+        uintptr_t old_end = old_start + state->deferred_unmap_length;
+        if (old_start < start) start = old_start;
+        if (old_end > end) end = old_end;
+    }
+    state->deferred_unmap_start = start;
+    state->deferred_unmap_length = end - start;
+    return 1;
 }
 
 void guest_thread_after_fork(void)

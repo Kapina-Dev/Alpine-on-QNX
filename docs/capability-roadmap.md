@@ -72,10 +72,13 @@ crash:
 - a 1 MiB response; and
 - clean SIGINT shutdown with exit status 130.
 
-Therefore, fix and regression-test detached-thread self-unmap and exit before
-using the standard threaded Python server as a socket/FD acceptance test. Keep
-separate socket-close, shutdown, duplication, fork, and early-disconnect tests
-because the control does not prove every socket lifecycle case.
+The post-v0.1.3 development build now defers a physical self-stack unmap until
+the guest exits and Linuxemu has returned to the native QNX pthread stack. It
+performs that unmap before clearing the child TID and waking waiters. A direct
+ARM regression fails with status 139 on v0.1.3 and passes with the fix; the
+permanent Python suite also completes 100 sequential `ThreadingHTTPServer`
+connections. Keep separate socket-close, shutdown, duplication, fork, and
+early-disconnect tests because this does not prove every socket lifecycle case.
 
 ## Phase 1: virtual file-descriptor layer
 
@@ -242,9 +245,6 @@ unsupported fields.
 
 Add features in response to measured workloads:
 
-- safe detached-thread self-unmap and exit, including musl's `__unmapself`
-  sequence, without executing a QNX syscall handler from the mapping being
-  removed;
 - robust futex lists and additional futex operations;
 - process-shared futex support where correctness is achievable;
 - `waitid` and additional process-style clone forms;
@@ -317,7 +317,7 @@ as root or make package compatibility depend on root access.
 ```text
 Compatibility measurement
         |
-Thread self-unmap/exit regression fix
+[complete] Thread self-unmap/exit regression fix
         |
 Virtual descriptor layer
         |

@@ -124,6 +124,7 @@ int guest_thread_initialize(void);
 int32_t guest_thread_clone(ucontext_t *context);
 int32_t guest_thread_tid(void);
 int32_t guest_thread_set_tid_address(uint32_t *address);
+int guest_thread_defer_active_stack_unmap(uintptr_t address, size_t length);
 void guest_thread_after_fork(void);
 void guest_thread_exit(int status) __attribute__((noreturn));
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information);

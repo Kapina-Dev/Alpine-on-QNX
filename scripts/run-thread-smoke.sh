@@ -22,6 +22,7 @@ run_thread_guest()
 }
 
 run_thread_guest thread-futex-syscalls 15
+run_thread_guest thread-self-unmap-syscalls 15
 run_thread_guest clone-vfork-syscalls 15
 run_thread_guest futex-contention-stress 30
 run_thread_guest thread-lifecycle-stress 120

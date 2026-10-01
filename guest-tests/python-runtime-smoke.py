@@ -4,6 +4,8 @@ import ctypes
 import decimal
 import errno
 import hashlib
+import http.client
+import http.server
 import json
 import lzma
 import os
@@ -151,6 +153,38 @@ def test_threads():
     assert all(0 < thread.native_id <= 0x3fffffff for thread in threads)
 
 
+def test_threaded_http_server():
+    payload = b"linuxemu threaded http\n"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *args):
+            del args
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        for _ in range(100):
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=2)
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            assert response.status == 200
+            assert response.read() == payload
+            connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(5)
+    assert not server_thread.is_alive()
+
+
 def test_unsupported_errors():
     if not hasattr(select, "epoll"):
         return
@@ -171,5 +205,6 @@ check("ssl", test_ssl)
 check("subprocesses", test_subprocesses)
 check("signals", test_signals)
 check("threads", test_threads)
+check("threaded_http_server", test_threaded_http_server)
 check("unsupported_errors", test_unsupported_errors)
 print("python_runtime_smoke_failures=0", flush=True)

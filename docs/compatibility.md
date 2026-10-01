@@ -25,8 +25,9 @@ The acceptance suite covers static and dynamic ELF loading, files and
 directories, contained guest paths, memory mappings, terminals, clocks,
 poll/select, IPv4/IPv6/UNIX sockets, DNS, verified HTTPS, apk transactions,
 fork/exec/wait and `posix_spawn`, pthreads and the required futex operations,
-Linux ARM signal frames and cancellation, runtime executable mappings,
-Python application workflows, and local plus HTTPS Git workflows.
+Linux ARM signal frames and cancellation, detached-thread self-stack cleanup,
+runtime executable mappings, Python application workflows including a
+100-connection threaded HTTP server, and local plus HTTPS Git workflows.
 
 ## Deliberate limits
 
