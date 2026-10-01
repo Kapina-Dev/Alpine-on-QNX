@@ -62,7 +62,7 @@ the installer for the release tag, run it as the ordinary Term49/SSH user, then
 reconnect or reload the login profile:
 
 ```sh
-wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.3/install-linuxemu.sh
+wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.4/install-linuxemu.sh
 sh /tmp/install-linuxemu.sh
 . ~/.profile
 alpinx

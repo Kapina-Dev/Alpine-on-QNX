@@ -29,7 +29,7 @@ arbitrary Linux binary compatibility.
 
 ## Phase 0: measurable compatibility
 
-Preserve the v0.1.3 regression as the baseline and add structured syscall
+Preserve the v0.1.4 regression as the baseline and add structured syscall
 diagnostics containing:
 
 - unsupported syscall number and name;
