@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-version=0.1.4
+version=0.1.5
 default_release_base='@LINUXEMU_RELEASE_BASE@'
 default_bundle_sha256='@LINUXEMU_BUNDLE_SHA256@'
 alpine_version=3.24.2
@@ -17,6 +17,7 @@ bundle_url=${LINUXEMU_BUNDLE_URL:-"$release_base/$bundle_name"}
 bundle_sha256=${LINUXEMU_BUNDLE_SHA256:-$default_bundle_sha256}
 bundle_file=${LINUXEMU_BUNDLE_FILE:-}
 rootfs_file=${LINUXEMU_ROOTFS_FILE:-}
+guest_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 placeholder_release_base='@LINUXEMU_''RELEASE_BASE@'
 placeholder_bundle_sha256='@LINUXEMU_''BUNDLE_SHA256@'
 stage=
@@ -75,6 +76,10 @@ cleanup()
 {
     status=$?
     trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ] && [ -n "$stage" ]; then
+        printf '%s\n' \
+            'install-linuxemu: staged installation failed; the active installation was not replaced.' >&2
+    fi
     [ -z "$stage" ] || rm -rf "$stage"
     [ -z "$download_dir" ] || rm -rf "$download_dir"
     [ -z "${profile_tmp:-}" ] || rm -f "$profile_tmp"
@@ -144,7 +149,8 @@ mkdir -p "$stage/rootfs/home/linuxemu" "$stage/rootfs/etc/profile.d" \
     "$stage/bin"
 printf 'nameserver %s\n' "$dns_server" >"$stage/rootfs/etc/resolv.conf"
 say "Installing Alpine base packages..."
-LINUXEMU_ROOT="$stage/rootfs" "$stage/libexec/linuxemu-core" \
+PATH="$guest_path" LINUXEMU_ROOT="$stage/rootfs" \
+    "$stage/libexec/linuxemu-core" \
     "$stage/rootfs/sbin/apk" add --no-cache --no-chown bash
 awk -F: 'BEGIN { OFS=":" } $1 == "root" { $7="/bin/bash" } { print }' \
     "$stage/rootfs/etc/passwd" >"$stage/rootfs/etc/passwd.linuxemu"
@@ -152,6 +158,7 @@ mv "$stage/rootfs/etc/passwd.linuxemu" "$stage/rootfs/etc/passwd"
 cat >"$stage/rootfs/etc/profile.d/linuxemu.sh" <<EOF
 export HOME=/home/linuxemu
 export SHELL=/bin/bash
+export PATH='$guest_path'
 case \$- in
 *i*)
     printf '\nLinuxemu $version / Alpine $alpine_version armhf\n'
@@ -172,6 +179,7 @@ export HOME=/home/linuxemu
 export USER=linuxemu
 export LOGNAME=linuxemu
 export SHELL=/bin/bash
+export PATH='$guest_path'
 if [ "\$#" -eq 0 ]; then
     exec "\$core" --linuxemu-exec "\$root" /home/linuxemu \
         "\$root/bin/bash" /bin/bash --login
@@ -225,11 +233,13 @@ EOF
 chmod 755 "$stage/bin/linuxemu-rollback"
 
 say "Running the installation smoke test..."
-LINUXEMU_ROOT="$stage/rootfs" "$stage/libexec/linuxemu-core" \
+PATH="$guest_path" LINUXEMU_ROOT="$stage/rootfs" \
+    "$stage/libexec/linuxemu-core" \
     --linuxemu-exec "$stage/rootfs" /home/linuxemu \
     "$stage/rootfs/bin/bash" /bin/bash -c \
-    'test -x /bin/bash && test "$(pwd)" = /home/linuxemu &&
-        grep -q "^root:.*:/bin/bash$" /etc/passwd &&
+    'test -x /bin/bash && test -x /bin/grep &&
+        test "$(pwd)" = /home/linuxemu &&
+        /bin/grep -q "^root:.*:/bin/bash$" /etc/passwd &&
         echo linuxemu_install_smoke=ok'
 
 rm -rf "$previous"
