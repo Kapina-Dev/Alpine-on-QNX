@@ -2,6 +2,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -11,12 +13,16 @@
 #define LINUX_TCSETS 0x5402u
 #define LINUX_TCSETSW 0x5403u
 #define LINUX_TCSETSF 0x5404u
+#define LINUX_TIOCSCTTY 0x540eu
 #define LINUX_TIOCGPGRP 0x540fu
 #define LINUX_TIOCSPGRP 0x5410u
 #define LINUX_TIOCGWINSZ 0x5413u
 #define LINUX_TIOCSWINSZ 0x5414u
 #define LINUX_FIONREAD 0x541bu
 #define LINUX_FIONBIO 0x5421u
+#define LINUX_TIOCGPTN 0x80045430u
+#define LINUX_TIOCSPTLCK 0x40045431u
+#define LINUX_EOPNOTSUPP 95
 #define QNX_DISABLED_CHARACTER 0xffu
 
 struct linux_termios {
@@ -125,6 +131,9 @@ int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
     case LINUX_TCSETS:
     case LINUX_TCSETSW:
     case LINUX_TCSETSF: return termios_set(fd, request, guest_argument);
+    case LINUX_TIOCSCTTY:
+        return tcsetsid(fd, getpid()) == 0 ? 0 :
+            -(int32_t)linux_errno_number(errno);
     case LINUX_TIOCGWINSZ:
         if (guest_argument == 0) return -EFAULT;
         if (ioctl(fd, TIOCGWINSZ, &window) != 0)
@@ -154,6 +163,27 @@ int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
             return fcntl(fd, F_SETFL, value) == 0 ? 0 :
                 -(int32_t)linux_errno_number(errno);
         }
+    case LINUX_TIOCGPTN:
+        if (guest_argument == 0) return -EFAULT;
+        {
+            const char *name = ttyname(fd);
+            char *end;
+            long number;
+            if (name == 0) return -(int32_t)linux_errno_number(errno);
+            if (strncmp(name, "/dev/ptyp", 9) != 0) return -ENOTTY;
+            number = strtol(name + 9, &end, 10);
+            if (*end != '\0' || number < 0 || number > INT_MAX)
+                return -ENOTTY;
+            value = (int)number;
+            memcpy(guest_argument, &value, sizeof(value));
+            return 0;
+        }
+    case LINUX_TIOCSPTLCK:
+        if (guest_argument == 0) return -EFAULT;
+        memcpy(&value, guest_argument, sizeof(value));
+        if (value != 0) return -LINUX_EOPNOTSUPP;
+        if (ttyname(fd) == 0) return -(int32_t)linux_errno_number(errno);
+        return 0;
     case LINUX_TIOCGPGRP:
         if (guest_argument == 0) return -EFAULT;
         value = (int)tcgetpgrp(fd);

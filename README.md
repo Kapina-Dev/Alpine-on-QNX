@@ -24,10 +24,10 @@ that same spirit of extending the practical life of these devices.
 - Linux ARM process calls for shell workloads: pipes, fork and fork-like `vfork`/`clone`, `execve`, `wait4`, process IDs/groups, working-directory changes, and exit-status propagation.
 - Exec preserves guest argv, cwd, rootfs selection, ordinary environment variables, and descriptor inheritance. Host-only `LINUXEMU_ROOT` and `LD_LIBRARY_PATH` values are removed from the guest environment.
 - The noninteractive SIGCHLD action/mask/suspend path needed by BusyBox background jobs. General guest signal delivery remains outside this phase.
-- Linux ARM terminal calls with explicit termios, control-character, baud-rate, window-size, process-group, `FIONREAD`, and `FIONBIO` conversion. BusyBox `stty` can read and update an SSH pseudo-terminal.
+- Linux ARM terminal calls with explicit termios, control-character, baud-rate, window-size, process-group, `FIONREAD`, and `FIONBIO` conversion. Linux `/dev/ptmx`, `/dev/pts/N`, controlling-terminal setup, and `forkpty` are backed by the finite QNX legacy PTY pool. BusyBox `stty` can read and update an SSH pseudo-terminal.
 - Linux ARM readiness calls: `poll`, `ppoll`, legacy and new `select`, and `pselect6`, including time32/time64 timeout conversion and Linux/QNX poll-event mapping.
 - Linux ARM wall and monotonic clocks, resolution queries, `time`, `gettimeofday`, `nanosleep`, and `clock_nanosleep`, with explicit time32/time64 layouts. BusyBox `date` and `sleep` work against the pinned rootfs.
-- Linux ARM socket calls for UNIX, IPv4, and IPv6 endpoints, including explicit address, type/descriptor flag, message flag, socket option, and network errno conversion. Both direct ARM socket syscalls and legacy `socketcall` are accepted.
+- Linux ARM socket calls for UNIX, IPv4, and IPv6 endpoints, including contained pathname UNIX sockets, `SCM_RIGHTS`, `SO_PEERCRED`, explicit address, type/descriptor flag, message flag, socket option, and network errno conversion. Both direct ARM socket syscalls and legacy `socketcall` are accepted.
 - Blocking and nonblocking TCP connections, UDP datagrams, socket pairs, DNS queries, and BusyBox HTTP downloads. Numeric IPv4 and `localhost` over IPv6 are covered on the device.
 - HTTPS through Alpine's OpenSSL-backed `ssl_client`, including device entropy through Linux `getrandom` and certificate-chain rejection. The pinned Alpine package index downloads and validates as gzip data.
 - Alpine `apk` repository refresh, package extraction, BusyBox trigger scripts, installed dynamic applications, and package removal. A clean nano transaction restores the original world file.
@@ -130,6 +130,10 @@ Run clock, sleep, poll/select, terminal conversion, and interactive-shell tests.
 ```sh
 ssh -tt bb10 'cd /accounts/1000/shared/misc/linuxemu-dev && sh scripts/run-terminal-time-smoke.sh'
 ```
+
+This suite also runs the pinned musl `forkpty` fixture. Rebuild it while Alpine
+`build-base` is temporarily installed with
+`sh scripts/build-forkpty-fixture.sh`.
 
 Run direct socket coverage, nonblocking connection readiness, loopback HTTP,
 DNS, and connection-error tests:
@@ -249,7 +253,7 @@ Release inputs and excluded development material are described in
 - Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.
 - `ppoll` and `pselect6` use a transient per-thread nonblocking wake pipe to bridge QNX's separate mask and wait operations. `pselect6` returns `EMFILE` if that internal read descriptor is outside QNX `FD_SETSIZE`, which requires the process to have exhausted the descriptor range accepted by `select`.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
-- Socket ancillary/control messages and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
+- Socket ancillary/control messages other than `SCM_RIGHTS` and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
 - Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current

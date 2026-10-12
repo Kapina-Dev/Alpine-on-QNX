@@ -403,6 +403,27 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
     int fd;
 
     if (linux_open_flags(flags, &host_flags) != 0) return -EINVAL;
+    if (guest_path != 0 && strcmp(guest_path, "/dev/ptmx") == 0) {
+        unsigned index;
+        int saved_errno = EAGAIN;
+        for (index = 0; index != 256; ++index) {
+            int length = snprintf(host_path, sizeof(host_path),
+                "/dev/ptyp%u", index);
+            if (length < 0 || (size_t)length >= sizeof(host_path))
+                return -ENAMETOOLONG;
+            fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
+            if (fd >= 0) {
+                if (fd < MAX_TRACKED_FDS) {
+                    free(fd_paths[fd]);
+                    fd_paths[fd] = strdup(host_path);
+                }
+                return fd;
+            }
+            if (errno == ENOENT) break;
+            if (errno != EBUSY) saved_errno = errno;
+        }
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
     if (resolve_at(directory_fd, guest_path, (host_flags & O_CREAT) != 0,
             (flags & LINUX_O_NOFOLLOW) != 0 ||
             (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==

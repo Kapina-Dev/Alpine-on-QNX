@@ -27,15 +27,20 @@ poll/select, IPv4/IPv6/UNIX sockets, DNS, verified HTTPS, apk transactions,
 fork/exec/wait and `posix_spawn`, pthreads and the required futex operations,
 Linux ARM signal frames and cancellation, detached-thread self-stack cleanup,
 runtime executable mappings, Python application workflows including a
-100-connection threaded HTTP server, and local plus HTTPS Git workflows.
+100-connection threaded HTTP server, local plus HTTPS Git workflows, pathname
+UNIX sockets, `SCM_RIGHTS` descriptor passing, peer credentials, and Linux
+PTY/forkpty workflows backed by QNX pseudoterminals.
 
 ## Deliberate limits
 
 - ARM `svc #0` patching is supported; general Thumb guest scanning is not.
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
-- Socket ancillary data, unlisted options, arbitrary ioctls, epoll, graphics,
-  kernel modules, and Linux service management are outside the v0.1 surface.
+- Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary
+  ioctls, epoll, graphics, kernel modules, and Linux service management are
+  outside the v0.1 surface.
+- Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
+  `/dev/ttypN` pool; allocation fails when every native pair is busy.
 - `eventfd2` implements the pipe-backed wake descriptor form needed by libcurl,
   rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file

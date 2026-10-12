@@ -6,7 +6,13 @@ project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 alpine_root=${ALPINE_ROOT:-"$project_dir/test-rootfs"}
 linuxemu="$project_dir/build/linuxemu"
 busybox="$alpine_root/bin/busybox"
+forkpty_fixture="$project_dir/guest-tests/fixtures/forkpty-smoke-armhf"
 failures=0
+
+[ -x "$forkpty_fixture" ] || {
+    echo "forkpty fixture is missing: $forkpty_fixture" >&2
+    exit 2
+}
 
 run_guest()
 {
@@ -20,6 +26,7 @@ run_guest()
 }
 
 run_guest syscall-probe "$project_dir/build/guest-tests/terminal-time-syscalls"
+run_guest forkpty "$forkpty_fixture"
 
 epoch=$(LINUXEMU_ROOT="$alpine_root" "$linuxemu" "$busybox" date +%s)
 case "$epoch" in

@@ -14,6 +14,22 @@ Install Alpine `build-base` temporarily in the test rootfs and run
 `sh scripts/build-pthread-fixture.sh` to rebuild it from source.
 The fixture also cancels and joins a thread blocked in a musl condition wait.
 
+# ARM forkpty fixture
+
+`forkpty-smoke-armhf` is the stripped output of
+`guest-tests/forkpty-smoke.c`. It verifies Linux `/dev/ptmx` allocation,
+`grantpt`, `unlockpt`, `/dev/pts/N`, controlling-terminal setup, data transfer,
+child exit, and wait behavior against the QNX PTY backend.
+
+Rebuild it with `sh scripts/build-forkpty-fixture.sh` while Alpine
+`build-base` is installed in the test rootfs.
+
+SHA-256:
+
+```text
+23e366aa15d0576328d6838fdc6418b8eec9cb08d9cc58ddf3987b34514ddd5a
+```
+
 # Phase 9 loader/process fixtures
 
 These stripped ARM binaries were built from `dlopen-module.c`,

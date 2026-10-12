@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -40,9 +41,13 @@
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SOL_IP 0
 #define LINUX_SOL_TCP 6
+#define LINUX_SCM_RIGHTS 1
+#define LINUX_SO_PEERCRED 17
+#define LINUX_MSG_CMSG_CLOEXEC 0x40000000u
 #define LINUX_ENOPROTOOPT 92
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EAFNOSUPPORT 97
+#define LINUX_UNIX_PATH_MAX 108
 
 struct linux_msghdr {
     uint32_t name;
@@ -53,6 +58,17 @@ struct linux_msghdr {
     uint32_t control_length;
     uint32_t flags;
 };
+
+struct linux_cmsghdr {
+    uint32_t length;
+    int32_t level;
+    int32_t type;
+};
+
+static size_t linux_cmsg_align(size_t length)
+{
+    return (length + 3u) & ~3u;
+}
 
 static int32_t socket_result(ssize_t result)
 {
@@ -107,8 +123,15 @@ static int configure_socket(int fd, int status_flags, int descriptor_flags)
     return 0;
 }
 
+static size_t bounded_string_length(const char *text, size_t limit)
+{
+    size_t length = 0;
+    while (length != limit && text[length] != '\0') length++;
+    return length;
+}
+
 static int guest_address(const void *guest, uint32_t guest_length,
-    struct sockaddr_storage *host, socklen_t *host_length)
+    int bind_address, struct sockaddr_storage *host, socklen_t *host_length)
 {
     uint16_t family;
     int mapped;
@@ -134,12 +157,31 @@ static int guest_address(const void *guest, uint32_t guest_length,
     } else {
         struct sockaddr_un *address = (struct sockaddr_un *)host;
         size_t path_length = guest_length - 2;
-        if (path_length > sizeof(address->sun_path)) return -EINVAL;
+        size_t actual_length;
+        char guest_path[LINUX_UNIX_PATH_MAX + 1];
+        char host_path[PATH_MAX];
+        if (path_length > LINUX_UNIX_PATH_MAX) return -EINVAL;
+        if (path_length == 0) {
+            address->sun_len = offsetof(struct sockaddr_un, sun_path);
+            address->sun_family = AF_UNIX;
+            *host_length = address->sun_len;
+            return 0;
+        }
+        if (((const unsigned char *)guest)[2] == '\0')
+            return -LINUX_EOPNOTSUPP;
+        actual_length = bounded_string_length(
+            (const char *)guest + 2, path_length);
+        memcpy(guest_path, (const unsigned char *)guest + 2, actual_length);
+        guest_path[actual_length] = '\0';
+        if (guest_path_resolve(guest_path, bind_address, host_path,
+                sizeof(host_path)) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        actual_length = strlen(host_path);
+        if (actual_length >= sizeof(address->sun_path)) return -ENAMETOOLONG;
+        memcpy(address->sun_path, host_path, actual_length + 1);
         address->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) +
-            path_length);
+            actual_length);
         address->sun_family = AF_UNIX;
-        memcpy(address->sun_path, (const unsigned char *)guest + 2,
-            path_length);
         *host_length = address->sun_len;
     }
     return 0;
@@ -160,7 +202,34 @@ static int store_address(void *guest, uint32_t *guest_length,
     family = (uint16_t)mapped;
     if (mapped == LINUX_AF_INET) required = 16;
     else if (mapped == LINUX_AF_INET6) required = 28;
-    else required = host_length;
+    else {
+        const struct sockaddr_un *address =
+            (const struct sockaddr_un *)host;
+        const char *path = address->sun_path;
+        const char *root = guest_path_root();
+        size_t available = host_length > offsetof(struct sockaddr_un, sun_path) ?
+            host_length - offsetof(struct sockaddr_un, sun_path) : 0;
+        size_t path_length;
+        size_t root_length = strlen(root);
+        if (available > sizeof(address->sun_path))
+            available = sizeof(address->sun_path);
+        path_length = bounded_string_length(path, available);
+        if (path_length >= root_length && memcmp(path, root, root_length) == 0 &&
+            (path_length == root_length || path[root_length] == '/')) {
+            path += root_length;
+            path_length -= root_length;
+            if (path_length == 0) { path = "/"; path_length = 1; }
+        }
+        required = (uint32_t)(2 + path_length + (path_length != 0 ? 1 : 0));
+        if (required > sizeof(converted)) return -EINVAL;
+        memset(converted, 0, required);
+        memcpy(converted, &family, 2);
+        if (path_length != 0) memcpy(converted + 2, path, path_length);
+        if (guest != 0 && capacity != 0)
+            memcpy(guest, converted, capacity < required ? capacity : required);
+        memcpy(guest_length, &required, sizeof(required));
+        return 0;
+    }
     if (required > sizeof(converted)) return -EINVAL;
     memset(converted, 0, required);
     memcpy(converted, &family, 2);
@@ -176,7 +245,8 @@ static int message_flags(uint32_t linux_flags, int *host_flags)
 {
     uint32_t known = 0x00000001u | 0x00000002u | 0x00000004u |
         0x00000008u | 0x00000020u | 0x00000040u | 0x00000080u |
-        0x00000100u | 0x00004000u | 0x00010000u;
+        0x00000100u | 0x00004000u | 0x00010000u |
+        LINUX_MSG_CMSG_CLOEXEC;
     int result = 0;
     if ((linux_flags & ~known) != 0) return -1;
     if (linux_flags & 0x0001u) result |= MSG_OOB;
@@ -195,6 +265,136 @@ static int message_flags(uint32_t linux_flags, int *host_flags)
 #endif
     *host_flags = result;
     return 0;
+}
+
+static int send_control(const void *guest_control, uint32_t guest_length,
+    void **host_control, size_t *host_length)
+{
+    const unsigned char *guest = guest_control;
+    size_t guest_offset = 0;
+    size_t required = 0;
+    unsigned char *converted;
+    size_t host_offset = 0;
+    while (guest_offset != guest_length) {
+        struct linux_cmsghdr header;
+        size_t payload_length;
+        size_t space;
+        if (guest_length - guest_offset < sizeof(header))
+            return -EINVAL;
+        memcpy(&header, guest + guest_offset, sizeof(header));
+        if (header.length < sizeof(header) ||
+            header.length > guest_length - guest_offset)
+            return -EINVAL;
+        if (header.level != LINUX_SOL_SOCKET ||
+            header.type != LINUX_SCM_RIGHTS)
+            return -LINUX_EOPNOTSUPP;
+        payload_length = header.length - sizeof(header);
+        if (payload_length == 0 || payload_length % sizeof(int) != 0)
+            return -EINVAL;
+        space = linux_cmsg_align(header.length);
+        if (space > guest_length - guest_offset) {
+            if (header.length != guest_length - guest_offset) return -EINVAL;
+            space = header.length;
+        }
+        if (CMSG_SPACE(payload_length) > SIZE_MAX - required) return -EINVAL;
+        required += CMSG_SPACE(payload_length);
+        guest_offset += space;
+    }
+    converted = calloc(1, required);
+    if (converted == 0) return -ENOMEM;
+    guest_offset = 0;
+    while (guest_offset != guest_length) {
+        struct linux_cmsghdr header;
+        struct cmsghdr *host_header;
+        size_t payload_length;
+        size_t guest_space;
+        memcpy(&header, guest + guest_offset, sizeof(header));
+        payload_length = header.length - sizeof(header);
+        host_header = (struct cmsghdr *)(converted + host_offset);
+        host_header->cmsg_len = CMSG_LEN(payload_length);
+        host_header->cmsg_level = SOL_SOCKET;
+        host_header->cmsg_type = SCM_RIGHTS;
+        memcpy(CMSG_DATA(host_header), guest + guest_offset + sizeof(header),
+            payload_length);
+        host_offset += CMSG_SPACE(payload_length);
+        guest_space = linux_cmsg_align(header.length);
+        guest_offset += guest_space <= guest_length - guest_offset ?
+            guest_space : header.length;
+    }
+    *host_control = converted;
+    *host_length = required;
+    return 0;
+}
+
+static int receive_control(const struct msghdr *host, void *guest_control,
+    uint32_t guest_capacity, int close_on_exec, uint32_t *guest_length,
+    uint32_t *linux_flags)
+{
+    struct cmsghdr *header;
+    unsigned char *guest = guest_control;
+    size_t guest_offset = 0;
+    for (header = CMSG_FIRSTHDR(host); header != 0;
+            header = CMSG_NXTHDR(host, header)) {
+        struct linux_cmsghdr converted;
+        size_t minimum = CMSG_LEN(0);
+        size_t payload_length;
+        size_t converted_length;
+        size_t converted_space;
+        size_t index;
+        int *descriptors;
+        if (header->cmsg_len < minimum) return -EINVAL;
+        if (header->cmsg_level != SOL_SOCKET ||
+            header->cmsg_type != SCM_RIGHTS)
+            return -LINUX_EOPNOTSUPP;
+        payload_length = header->cmsg_len - minimum;
+        if (payload_length == 0 || payload_length % sizeof(int) != 0)
+            return -EINVAL;
+        descriptors = (int *)CMSG_DATA(header);
+        if (close_on_exec)
+            for (index = 0; index != payload_length / sizeof(int); ++index) {
+                int flags = fcntl(descriptors[index], F_GETFD);
+                if (flags < 0 || fcntl(descriptors[index], F_SETFD,
+                        flags | FD_CLOEXEC) != 0)
+                    return -(int32_t)linux_errno_number(errno);
+            }
+        converted_length = sizeof(converted) + payload_length;
+        converted_space = linux_cmsg_align(converted_length);
+        if (converted_space > guest_capacity - guest_offset) {
+            *linux_flags |= 0x0008u;
+            for (index = 0; index != payload_length / sizeof(int); ++index)
+                close(descriptors[index]);
+            continue;
+        }
+        converted.length = (uint32_t)converted_length;
+        converted.level = LINUX_SOL_SOCKET;
+        converted.type = LINUX_SCM_RIGHTS;
+        memset(guest + guest_offset, 0, converted_space);
+        memcpy(guest + guest_offset, &converted, sizeof(converted));
+        memcpy(guest + guest_offset + sizeof(converted), descriptors,
+            payload_length);
+        guest_offset += converted_space;
+    }
+    *guest_length = (uint32_t)guest_offset;
+    return 0;
+}
+
+static void close_received_rights(const struct msghdr *host)
+{
+    struct cmsghdr *header;
+    for (header = CMSG_FIRSTHDR(host); header != 0;
+            header = CMSG_NXTHDR(host, header)) {
+        size_t minimum = CMSG_LEN(0);
+        size_t payload_length;
+        size_t index;
+        int *descriptors;
+        if (header->cmsg_len < minimum || header->cmsg_level != SOL_SOCKET ||
+            header->cmsg_type != SCM_RIGHTS) continue;
+        payload_length = header->cmsg_len - minimum;
+        if (payload_length % sizeof(int) != 0) continue;
+        descriptors = (int *)CMSG_DATA(header);
+        for (index = 0; index != payload_length / sizeof(int); ++index)
+            close(descriptors[index]);
+    }
 }
 
 static uint32_t linux_message_flags(int host_flags)
@@ -287,7 +487,7 @@ static int32_t address_call(uint32_t number, uint32_t *arguments)
     int converted;
     if (number == LINUX_NR_BIND || number == LINUX_NR_CONNECT) {
         converted = guest_address((void *)arguments[1], arguments[2],
-            &address, &length);
+            number == LINUX_NR_BIND, &address, &length);
         if (converted != 0) return converted;
         return socket_result(number == LINUX_NR_BIND ?
             bind((int)arguments[0], (struct sockaddr *)&address, length) :
@@ -365,7 +565,7 @@ static int32_t transfer(uint32_t number, uint32_t *arguments)
             result = send((int)arguments[0], (void *)arguments[1],
                 arguments[2], flags);
         else {
-            converted = guest_address((void *)arguments[4], arguments[5],
+            converted = guest_address((void *)arguments[4], arguments[5], 0,
                 &address, &length);
             if (converted != 0) return converted;
             result = sendto((int)arguments[0], (void *)arguments[1],
@@ -390,6 +590,35 @@ static int32_t socket_option_call(uint32_t number, uint32_t *arguments)
     int level, option;
     socklen_t length;
     int result;
+    if (number == LINUX_NR_GETSOCKOPT &&
+        (int)arguments[1] == LINUX_SOL_SOCKET &&
+        (int)arguments[2] == LINUX_SO_PEERCRED) {
+        struct unpcbid host_peer;
+        uint32_t capacity;
+        uint32_t required = 12;
+        int32_t linux_pid;
+        uint32_t linux_uid;
+        uint32_t linux_gid;
+        unsigned char linux_peer[12];
+        if (arguments[3] == 0 || arguments[4] == 0) return -EFAULT;
+        memcpy(&capacity, (void *)arguments[4], sizeof(capacity));
+        length = sizeof(host_peer);
+        if (getsockopt((int)arguments[0], 0, LOCAL_PEEREID,
+                &host_peer, &length) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        linux_pid = (int32_t)host_peer.unp_pid;
+        linux_uid = (uint32_t)host_peer.unp_euid;
+        linux_gid = (uint32_t)host_peer.unp_egid;
+        memset(linux_peer, 0, sizeof(linux_peer));
+        memcpy(linux_peer, &linux_pid, 4);
+        memcpy(linux_peer + 4, &linux_uid, 4);
+        memcpy(linux_peer + 8, &linux_gid, 4);
+        if (capacity != 0)
+            memcpy((void *)arguments[3], linux_peer,
+                capacity < required ? capacity : required);
+        memcpy((void *)arguments[4], &required, sizeof(required));
+        return 0;
+    }
     if (socket_option((int)arguments[1], (int)arguments[2], &level, &option) != 0)
         return -LINUX_ENOPROTOOPT;
     if (number == LINUX_NR_SETSOCKOPT)
@@ -420,21 +649,35 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     struct msghdr host;
     struct sockaddr_storage address;
     socklen_t address_length;
+    void *control = 0;
+    size_t control_length = 0;
     int flags;
     int converted;
     ssize_t result;
     if (arguments[1] == 0) return -EFAULT;
     memcpy(&guest, (void *)arguments[1], sizeof(guest));
-    if (guest.control != 0 || guest.control_length != 0)
-        return -LINUX_EOPNOTSUPP;
     if (message_flags(arguments[2], &flags) != 0) return -EINVAL;
     memset(&host, 0, sizeof(host));
     host.msg_iov = (struct iovec *)guest.iov;
     host.msg_iovlen = guest.iov_count;
-    if (number == LINUX_NR_SENDMSG && guest.name != 0) {
-        converted = guest_address((void *)guest.name, guest.name_length,
-            &address, &address_length);
+    if (number == LINUX_NR_SENDMSG && guest.control_length != 0) {
+        if (guest.control == 0) return -EFAULT;
+        converted = send_control((void *)guest.control, guest.control_length,
+            &control, &control_length);
         if (converted != 0) return converted;
+        host.msg_control = control;
+        host.msg_controllen = control_length;
+    } else if (number == LINUX_NR_RECVMSG && guest.control_length != 0) {
+        if (guest.control == 0) return -EFAULT;
+        control = calloc(1, guest.control_length);
+        if (control == 0) return -ENOMEM;
+        host.msg_control = control;
+        host.msg_controllen = guest.control_length;
+    }
+    if (number == LINUX_NR_SENDMSG && guest.name != 0) {
+        converted = guest_address((void *)guest.name, guest.name_length, 0,
+            &address, &address_length);
+        if (converted != 0) { free(control); return converted; }
         host.msg_name = &address;
         host.msg_namelen = address_length;
     } else if (number == LINUX_NR_RECVMSG && guest.name != 0) {
@@ -444,18 +687,40 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     result = number == LINUX_NR_SENDMSG ?
         sendmsg((int)arguments[0], &host, flags) :
         recvmsg((int)arguments[0], &host, flags);
-    if (result < 0) return -(int32_t)linux_errno_number(errno);
+    if (result < 0) {
+        int saved_errno = errno;
+        free(control);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
     if (number == LINUX_NR_RECVMSG) {
         guest.flags = linux_message_flags(host.msg_flags);
         if (guest.name != 0) {
             uint32_t capacity = guest.name_length;
             converted = store_address((void *)guest.name, &capacity,
                 (struct sockaddr *)&address, host.msg_namelen);
-            if (converted != 0) return converted;
+            if (converted != 0) {
+                close_received_rights(&host);
+                free(control);
+                return converted;
+            }
             guest.name_length = capacity;
+        }
+        if (guest.control_length != 0) {
+            uint32_t received_length = 0;
+            converted = receive_control(&host, (void *)guest.control,
+                guest.control_length,
+                (arguments[2] & LINUX_MSG_CMSG_CLOEXEC) != 0,
+                &received_length, &guest.flags);
+            if (converted != 0) {
+                close_received_rights(&host);
+                free(control);
+                return converted;
+            }
+            guest.control_length = received_length;
         }
         memcpy((void *)arguments[1], &guest, sizeof(guest));
     }
+    free(control);
     return (int32_t)result;
 }
 

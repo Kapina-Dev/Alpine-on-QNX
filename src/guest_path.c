@@ -18,6 +18,32 @@ static int resolve_guest_device(const char *guest_path, char *host_path,
     static const char *const devices[] = { "/dev/null" };
     size_t i;
 
+    if (strncmp(guest_path, "/dev/pts/", 9) == 0) {
+        const char *number = guest_path + 9;
+        unsigned value = 0;
+        int length;
+        if (*number == '\0') { errno = ENOENT; return -1; }
+        while (*number != '\0') {
+            unsigned digit;
+            if (*number < '0' || *number > '9') {
+                errno = ENOENT;
+                return -1;
+            }
+            digit = (unsigned)(*number++ - '0');
+            if (value > (999u - digit) / 10u) {
+                errno = ENOENT;
+                return -1;
+            }
+            value = value * 10u + digit;
+        }
+        length = snprintf(host_path, host_path_size, "/dev/ttyp%u", value);
+        if (length < 0 || (size_t)length >= host_path_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 1;
+    }
+
     for (i = 0; i != ARRAY_COUNT(devices); ++i) {
         if (strcmp(guest_path, devices[i]) != 0) continue;
         if (strlen(devices[i]) + 1 > host_path_size) {
