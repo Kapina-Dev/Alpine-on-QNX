@@ -41,6 +41,12 @@ PTY/forkpty workflows backed by QNX pseudoterminals.
   outside the v0.1 surface.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.
+- Terminal descriptors are exposed through `/proc/self/fd/N` as guest
+  `/dev/pts/N` names. Detached tmux server, session, and pane workflows pass,
+  but an attached tmux client does not yet complete its terminal-identification
+  handshake and can leave Term49 unresponsive.
+- Term49 cannot reliably absorb cmatrix's default refresh rate. The bounded
+  `cmatrix -s -u 10` mode is usable and exits on the first keypress.
 - `eventfd2` implements the pipe-backed wake descriptor form needed by libcurl,
   rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file

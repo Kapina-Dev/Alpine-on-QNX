@@ -28,8 +28,9 @@ alpinx
   to QNX `tcsetsid` semantics.
 - Add direct pathname-socket, descriptor-passing, peer-credential, and
   forkpty regressions.
-- Validate tmux 3.7c server startup, client authentication, session creation,
-  pane output capture, and clean shutdown.
+- Validate detached tmux 3.7c server startup, client authentication, session
+  creation, pane output capture, and clean shutdown. Attached tmux clients
+  remain a documented limitation.
 
 The complete 14-suite regression remains green, including the 100-connection
 threaded Python server, Git HTTPS workflows, Bash interactive shell, package

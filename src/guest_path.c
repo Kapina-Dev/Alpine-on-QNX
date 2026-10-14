@@ -328,8 +328,43 @@ int guest_path_getcwd(char *buffer, size_t size)
 
 int guest_path_readlink(const char *path, char *buffer, size_t size)
 {
+    char normalized[PATH_MAX];
     char candidate[PATH_MAX];
+    const char *descriptor_text;
+    char *end;
+    long descriptor;
+    const char *target;
+    char guest_terminal[PATH_MAX];
     ssize_t count;
+
+    if (normalize_guest_path(path, normalized, sizeof(normalized)) != 0)
+        return -1;
+
+    descriptor_text = 0;
+    if (strncmp(normalized, "/proc/self/fd/", 14) == 0)
+        descriptor_text = normalized + 14;
+    if (descriptor_text != 0 && *descriptor_text != '\0') {
+        errno = 0;
+        descriptor = strtol(descriptor_text, &end, 10);
+        if (errno == 0 && *end == '\0' && descriptor >= 0 &&
+                descriptor <= INT_MAX) {
+            target = ttyname((int)descriptor);
+            if (target == 0) return -1;
+            if (strncmp(target, "/dev/ttyp", 9) == 0) {
+                int length = snprintf(guest_terminal, sizeof(guest_terminal),
+                    "/dev/pts/%s", target + 9);
+                if (length < 0 || (size_t)length >= sizeof(guest_terminal)) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+                target = guest_terminal;
+            }
+            count = (ssize_t)strlen(target);
+            if ((size_t)count > size) count = (ssize_t)size;
+            memcpy(buffer, target, (size_t)count);
+            return (int)count;
+        }
+    }
 
     if (guest_path_resolve_nofollow(path, candidate, sizeof(candidate)) != 0)
         return -1;

@@ -41,6 +41,18 @@ echo "busybox_epoch=$epoch"
 run_guest sleep "$busybox" sleep 0.01
 
 if [ -t 0 ]; then
+    terminal_name=$(LINUXEMU_ROOT="$alpine_root" "$linuxemu" "$busybox" tty)
+    terminal_status=$?
+    echo "guest_terminal=$terminal_name"
+    case "$terminal_name" in
+        /dev/*) :;;
+        *) echo "tty did not resolve the guest terminal name" >&2
+           failures=$((failures + 1));;
+    esac
+    if [ "$terminal_status" -ne 0 ]; then
+        echo "tty failed with status $terminal_status" >&2
+        failures=$((failures + 1))
+    fi
     interactive=$(LINUXEMU_ROOT="$alpine_root" "$linuxemu" "$busybox" \
         sh -i -c 'echo interactive_shell_ok' 2>&1)
     interactive_status=$?
