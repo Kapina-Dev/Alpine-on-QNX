@@ -651,15 +651,23 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     socklen_t address_length;
     void *control = 0;
     size_t control_length = 0;
+    size_t payload_length = 0;
     int flags;
     int converted;
+    int descriptor_status;
     ssize_t result;
+    uint32_t iov_index;
     if (arguments[1] == 0) return -EFAULT;
     memcpy(&guest, (void *)arguments[1], sizeof(guest));
     if (message_flags(arguments[2], &flags) != 0) return -EINVAL;
     memset(&host, 0, sizeof(host));
     host.msg_iov = (struct iovec *)guest.iov;
     host.msg_iovlen = guest.iov_count;
+    for (iov_index = 0; iov_index != guest.iov_count; ++iov_index) {
+        if (host.msg_iov[iov_index].iov_len > SIZE_MAX - payload_length)
+            return -EINVAL;
+        payload_length += host.msg_iov[iov_index].iov_len;
+    }
     if (number == LINUX_NR_SENDMSG && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         converted = send_control((void *)guest.control, guest.control_length,
@@ -667,6 +675,27 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
         if (converted != 0) return converted;
         host.msg_control = control;
         host.msg_controllen = control_length;
+        /* QNX can lose SCM_RIGHTS when a large nonblocking AF_UNIX stream
+           frame reaches its small default send-buffer limit.  Linux uses a
+           substantially larger default; grow the host buffer before such a
+           frame so the descriptor and data remain one intact sendmsg. */
+        descriptor_status = fcntl((int)arguments[0], F_GETFL);
+        if (descriptor_status >= 0 && (descriptor_status & O_NONBLOCK) != 0 &&
+            payload_length > 1024) {
+            int send_buffer = 0;
+            socklen_t option_length = sizeof(send_buffer);
+            if (getsockopt((int)arguments[0], SOL_SOCKET, SO_SNDBUF,
+                    &send_buffer, &option_length) == 0 &&
+                send_buffer < 65536) {
+                send_buffer = 65536;
+                if (setsockopt((int)arguments[0], SOL_SOCKET, SO_SNDBUF,
+                        &send_buffer, sizeof(send_buffer)) != 0) {
+                    int saved_errno = errno;
+                    free(control);
+                    return -(int32_t)linux_errno_number(saved_errno);
+                }
+            }
+        }
     } else if (number == LINUX_NR_RECVMSG && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         control = calloc(1, guest.control_length);

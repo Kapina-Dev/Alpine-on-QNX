@@ -50,6 +50,29 @@ Score each application separately for:
 
 Installation alone must not count as application compatibility.
 
+### Phase 0 terminal checkpoint (2026-10-14)
+
+The attached tmux failure with `TERM=xterm-256color` was traced to a host
+semantic mismatch rather than missing terminal escape handling. tmux batches a
+large terminal-description frame with an `SCM_RIGHTS` descriptor on a
+nonblocking UNIX stream socket. QNX's smaller default send buffer returned
+`EAGAIN` under pressure and subsequently delivered the bytes without a usable
+descriptor. Linuxemu now grows that host buffer before a large descriptor
+frame, keeping the Linux message and descriptor intact.
+
+The permanent socket regression now covers a 2 KiB nonblocking
+`SCM_RIGHTS` frame. On-device acceptance covers an attached tmux 3.7c client
+with normal `TERM=xterm-256color`, default-speed cmatrix through an isolated
+SSH pseudo-terminal, and Ctrl-C cleanup. Physical Term49 acceptance and a
+second-device run remain required before publishing the release.
+
+The release regression on the current long-running device session passes the
+first 12 suites and the final Git suite. Python startup currently faults at
+guest PC `0x60067dc4` with a null address before its first test marker. An A/B
+run reproduces the identical fault with the installed pre-Phase-0 core and the
+candidate, and both runs restore the rootfs package set. Treat this as a
+fresh-device acceptance blocker, not as evidence against the socket fix.
+
 ### Validated device finding: threaded server teardown
 
 On 2026-10-01, the Python HTTP failure described in the v3 roadmap was

@@ -28,8 +28,11 @@ fork/exec/wait and `posix_spawn`, pthreads and the required futex operations,
 Linux ARM signal frames and cancellation, detached-thread self-stack cleanup,
 runtime executable mappings, Python application workflows including a
 100-connection threaded HTTP server, local plus HTTPS Git workflows, pathname
-UNIX sockets, `SCM_RIGHTS` descriptor passing, peer credentials, and Linux
-PTY/forkpty workflows backed by QNX pseudoterminals.
+UNIX sockets, `SCM_RIGHTS` descriptor passing (including large nonblocking
+frames), peer credentials, and Linux PTY/forkpty workflows backed by QNX
+pseudoterminals. An attached tmux 3.7c client is verified with
+`TERM=xterm-256color` through an SSH pseudo-terminal, including clean signal
+handling under a full-screen workload.
 
 ## Deliberate limits
 
@@ -42,11 +45,12 @@ PTY/forkpty workflows backed by QNX pseudoterminals.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.
 - Terminal descriptors are exposed through `/proc/self/fd/N` as guest
-  `/dev/pts/N` names. Detached tmux server, session, and pane workflows pass,
-  but an attached tmux client does not yet complete its terminal-identification
-  handshake and can leave Term49 unresponsive.
-- Term49 cannot reliably absorb cmatrix's default refresh rate. The bounded
-  `cmatrix -s -u 10` mode is usable and exits on the first keypress.
+  `/dev/pts/N` names. Detached and attached tmux workflows pass. Attached tmux
+  depends on Linuxemu growing QNX's small UNIX-socket send buffer before a
+  large nonblocking `SCM_RIGHTS` terminal-identification frame.
+- Default-speed cmatrix and Ctrl-C pass through an SSH pseudo-terminal. The
+  physical Term49 renderer still needs on-device acceptance at that output
+  rate; `cmatrix -s -u 10` remains the conservative Term49 command.
 - `eventfd2` implements the pipe-backed wake descriptor form needed by libcurl,
   rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file

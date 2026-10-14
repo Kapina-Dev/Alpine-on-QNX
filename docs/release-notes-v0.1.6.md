@@ -23,18 +23,23 @@ alpinx
 - Support `SCM_RIGHTS` file-descriptor passing, including
   `MSG_CMSG_CLOEXEC`, and translate QNX peer identity to Linux
   `SO_PEERCRED`.
+- Grow QNX's small UNIX-socket send buffer before large nonblocking
+  `SCM_RIGHTS` frames. This prevents descriptor loss during tmux's full
+  `xterm-256color` terminal-identification handshake.
 - Back Linux `/dev/ptmx` and `/dev/pts/N` with the finite QNX legacy PTY pool.
 - Translate PTY allocation/unlock queries and Linux controlling-terminal setup
   to QNX `tcsetsid` semantics.
 - Add direct pathname-socket, descriptor-passing, peer-credential, and
   forkpty regressions.
 - Validate detached tmux 3.7c server startup, client authentication, session
-  creation, pane output capture, and clean shutdown. Attached tmux clients
-  remain a documented limitation.
+  creation, pane output capture, and clean shutdown, plus an attached
+  `TERM=xterm-256color` client over an SSH pseudo-terminal.
 
-The complete 14-suite regression remains green, including the 100-connection
-threaded Python server, Git HTTPS workflows, Bash interactive shell, package
-transactions, signals, and thread lifecycle stress.
+Publishing remains gated on a fresh-device rerun of the complete 14-suite
+regression. The Phase 0 candidate passes the first 12 suites and the final Git
+suite; on the current long-running device session, Python startup faults at the
+same guest address with both the installed pre-Phase-0 core and the candidate,
+so that failure is not attributed to this socket change.
 
 Read `linuxemu-compatibility-0.1.6.md` for the supported surface and
 `SHA256SUMS` before using the attached files.

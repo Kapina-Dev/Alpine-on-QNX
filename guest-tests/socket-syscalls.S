@@ -42,23 +42,35 @@ _start:
 
     ldr r0, =send_control
     str r4, [r0, #12]
+    /* Exercise the large nonblocking SCM_RIGHTS compatibility path. */
+    mov r0, r4
+    mov r1, #4
+    movw r2, #0x800
+    movw r7, #221
+    svc #0
+    cmp r0, #0
+    bne fail_sendmsg
+
     mov r0, r4
     ldr r1, =send_header
     mov r2, #0
     movw r7, #296
     svc #0
-    cmp r0, #12
+    movw r1, #2048
+    cmp r0, r1
     bne fail_sendmsg
+
     mov r0, r5
     ldr r1, =receive_header
     ldr r2, =0x40000000
     movw r7, #297
     svc #0
-    cmp r0, #12
+    movw r1, #2048
+    cmp r0, r1
     bne fail_recvmsg
     ldr r0, =message_two
     ldr r1, =receive_buffer_two
-    mov r2, #12
+    movw r2, #2048
     bl compare_bytes
     cmp r0, #0
     bne fail_recvmsg
@@ -454,7 +466,9 @@ compare_bytes:
 
     .section .rodata
 pair_message: .ascii "phase5_socket"
-message_two: .ascii "message_path"
+message_two:
+    .ascii "message_path"
+    .space 2036
 udp_message: .ascii "udp_phase5"
 unix_message: .ascii "unix_path"
 unix_address:
@@ -485,8 +499,8 @@ unix_client_fd: .word -1
 unix_accepted_fd: .word -1
 unix_returned_length: .word 110
 unix_peer_length: .word 12
-send_iov: .word message_two, 12
-receive_iov: .word receive_buffer_two, 12
+send_iov: .word message_two, 2048
+receive_iov: .word receive_buffer_two, 2048
 send_control: .word 16, 1, 1, -1
 send_header: .word 0, 0, send_iov, 1, send_control, 16, 0
 receive_header: .word 0, 0, receive_iov, 1, receive_control, 16, 0
@@ -495,7 +509,7 @@ legacy_socket_arguments: .word 2, 2, 0, 0, 0, 0
     .section .bss
     .align 2
 receive_buffer: .space 16
-receive_buffer_two: .space 16
+receive_buffer_two: .space 2048
 udp_receive: .space 16
 bound_address: .space 16
 second_address: .space 16
