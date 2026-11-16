@@ -146,6 +146,10 @@ static int restore_vfp(ucontext_t *host, const struct linux_ucontext *guest)
     return 0;
 }
 
+/* Host si_signo tag for siginfo queued by the guest itself
+   (rt_tgsigqueueinfo): the other fields already hold Linux values. */
+#define GUEST_NATIVE_SIGINFO (-1)
+
 static void fill_siginfo(unsigned char destination[128], int linux_signal,
     const siginfo_t *source)
 {
@@ -153,6 +157,14 @@ static void fill_siginfo(unsigned char destination[128], int linux_signal,
     memset(destination, 0, 128);
     words[0] = linux_signal;
     if (source == 0) return;
+    if (source->si_signo == GUEST_NATIVE_SIGINFO) {
+        words[1] = source->si_errno;
+        words[2] = source->si_code;
+        words[3] = source->si_pid;
+        words[4] = (int32_t)source->si_uid;
+        words[5] = source->si_value.sival_int;
+        return;
+    }
     words[1] = linux_errno_number(source->si_errno);
     words[2] = source->si_code;
     if (linux_signal == 4 || linux_signal == 7 || linux_signal == 8 ||
@@ -379,6 +391,40 @@ int32_t guest_signal_send_thread(int32_t process, int32_t thread,
     host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
     if (linux_signal != 0 && host_signal == 0) return -EINVAL;
     return guest_thread_kill(thread, host_signal);
+}
+
+/*
+ * rt_tgsigqueueinfo. Linux hands the caller's siginfo to the handler as
+ * written. That is exact here for a signal to the calling thread with a
+ * handler installed: it is queued on this thread and delivered on return
+ * from the syscall, as on Linux. Default and ignored actions, and other
+ * threads, take the tgkill path, so their handler sees host-made siginfo.
+ * Only this process can be targeted, as with tgkill.
+ */
+int32_t guest_signal_queue_thread(int32_t process, int32_t thread,
+    int linux_signal, const void *guest_information)
+{
+    int32_t words[6];
+    siginfo_t information;
+
+    if (process <= 0 || thread <= 0) return -EINVAL;
+    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT ||
+        (linux_signal != 0 && linux_signal_to_host(linux_signal) == 0))
+        return -EINVAL;
+    if (process != (int32_t)getpid()) return -ESRCH;
+    if (linux_signal == 0 || thread != guest_thread_tid() ||
+        guest_actions[linux_signal].handler <= 1u)
+        return guest_signal_send_thread(process, thread, linux_signal);
+    memcpy(words, guest_information, sizeof(words));
+    memset(&information, 0, sizeof(information));
+    information.si_signo = GUEST_NATIVE_SIGINFO;
+    information.si_errno = words[1];
+    information.si_code = words[2];
+    information.si_pid = words[3];
+    information.si_uid = (uid_t)words[4];
+    information.si_value.sival_int = words[5];
+    guest_thread_signal_pending(linux_signal, &information);
+    return 0;
 }
 
 int32_t guest_signal_action(int linux_signal, const void *guest_action,

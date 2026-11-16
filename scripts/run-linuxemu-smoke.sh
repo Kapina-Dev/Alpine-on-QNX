@@ -44,5 +44,13 @@ status=$?
 echo "file-syscalls exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+# execve needs a guest root; "/" maps guest paths to host paths unchanged.
+echo "=== guest: android-process-syscalls ==="
+LINUXEMU_ROOT=/ "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/android-process-syscalls"
+status=$?
+echo "android-process-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 echo "linuxemu_smoke_failures=$failures"
 test "$failures" -eq 0

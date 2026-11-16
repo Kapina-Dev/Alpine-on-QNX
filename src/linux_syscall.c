@@ -101,6 +101,13 @@
 #define LINUX_NR_CLOCK_NANOSLEEP 265
 #define LINUX_NR_FSTATFS64 267
 #define LINUX_NR_TGKILL 268
+#define LINUX_NR_PERSONALITY 136
+#define LINUX_NR_SCHED_GETSCHEDULER 157
+#define LINUX_NR_PRCTL 172
+#define LINUX_NR_RT_TGSIGQUEUEINFO 363
+#define LINUX_PR_SET_NAME 15
+#define LINUX_PR_GET_NAME 16
+#define LINUX_PR_SET_VMA 0x53564d41
 #define LINUX_NR_SOCKET 281
 #define LINUX_NR_BIND 282
 #define LINUX_NR_CONNECT 283
@@ -1182,6 +1189,42 @@ static int32_t linux_flock(int descriptor, uint32_t operation)
     return linux_host_result(fcntl(descriptor, command, &lock));
 }
 
+/*
+ * sched_getscheduler. Guests cannot change their policy (sched_setscheduler
+ * is not implemented), so every existing task is SCHED_OTHER (0), Linux's
+ * default. 0 means the caller; a negative pid is EINVAL; ESRCH if no task.
+ */
+static int32_t linux_sched_getscheduler(int32_t pid)
+{
+    if (pid < 0) return -EINVAL;
+    if (pid == 0 || guest_thread_kill(pid, 0) == 0) return 0;
+    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) return 0;
+    return -ESRCH;
+}
+
+/* prctl options bionic uses at start-up. PR_SET_VMA (anonymous mapping
+   names) is not available here: EINVAL, as on a Linux kernel without
+   CONFIG_ANON_VMA_NAME. Unknown options are EINVAL, as on Linux. */
+static int32_t linux_prctl(const uint32_t *arguments)
+{
+    char name[16];
+    switch (arguments[0]) {
+    case LINUX_PR_SET_NAME:
+        memset(name, 0, sizeof(name));
+        strncpy(name, (const char *)(uintptr_t)arguments[1],
+            sizeof(name) - 1);
+        guest_thread_name_set(name);
+        return 0;
+    case LINUX_PR_GET_NAME:
+        guest_thread_name_get(name);
+        memcpy((void *)(uintptr_t)arguments[1], name, sizeof(name));
+        return 0;
+    case LINUX_PR_SET_VMA:
+    default:
+        return -EINVAL;
+    }
+}
+
 void linux_syscall_dispatch(ucontext_t *context)
 {
     uint32_t number = context->uc_mcontext.cpu.gpr[7];
@@ -1644,6 +1687,24 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int32_t)context->uc_mcontext.cpu.gpr[0],
             (int32_t)context->uc_mcontext.cpu.gpr[1],
             (int)context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_RT_TGSIGQUEUEINFO:
+        result = guest_signal_queue_thread(
+            (int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int32_t)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2],
+            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_PERSONALITY:
+        result = (int32_t)guest_process_personality(
+            context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_SCHED_GETSCHEDULER:
+        result = linux_sched_getscheduler(
+            (int32_t)context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_PRCTL:
+        result = linux_prctl(context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_TIME:
     case LINUX_NR_GETTIMEOFDAY:

@@ -13,7 +13,13 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 2];
+static char *host_environment[MAX_EXEC_VECTOR + 4];
+static char personality_variable[48];
+static char comm_variable[48];
+static uint32_t guest_personality;
+
+#define PERSONALITY_VARIABLE "LINUXEMU_GUEST_PERSONALITY="
+#define COMM_VARIABLE "LINUXEMU_GUEST_COMM="
 static char shebang_interpreter[PATH_MAX];
 static char shebang_option[256];
 static char shebang_host_path[PATH_MAX];
@@ -28,8 +34,29 @@ static int hidden_environment(const char *value)
 
 int guest_process_initialize(const char *emulator)
 {
+    const char *value = getenv("LINUXEMU_GUEST_PERSONALITY");
     if (emulator == 0 || realpath(emulator, emulator_path) == 0) return -1;
+    /* Linux keeps the personality across execve. */
+    guest_personality = value == 0 ? 0 : (uint32_t)strtoul(value, 0, 0);
     return 0;
+}
+
+uint32_t guest_process_personality(uint32_t persona)
+{
+    uint32_t old = guest_personality;
+    if (persona != 0xffffffffu) guest_personality = persona;
+    return old;
+}
+
+/* Linux names a process after the basename of the file passed to execve,
+   truncated to 15 characters. */
+const char *guest_process_initial_name(const char *loaded_path)
+{
+    const char *value = getenv("LINUXEMU_GUEST_COMM");
+    const char *slash;
+    if (value != 0) return value;
+    slash = strrchr(loaded_path, '/');
+    return slash != 0 ? slash + 1 : loaded_path;
 }
 
 int guest_process_retry_load(char *const arguments[])
@@ -138,6 +165,17 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     }
     if (runtime_trace_enabled())
         host_environment[environment_count++] = "LINUXEMU_SYSTRACE=1";
+    if (guest_personality != 0) {
+        snprintf(personality_variable, sizeof(personality_variable),
+            PERSONALITY_VARIABLE "0x%08x", (unsigned)guest_personality);
+        host_environment[environment_count++] = personality_variable;
+    }
+    {
+        const char *slash = strrchr(guest_executable, '/');
+        snprintf(comm_variable, sizeof(comm_variable), COMM_VARIABLE "%.15s",
+            slash != 0 ? slash + 1 : guest_executable);
+        host_environment[environment_count++] = comm_variable;
+    }
     host_environment[environment_count] = 0;
 
     host_arguments[0] = emulator_path;

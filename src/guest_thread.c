@@ -62,6 +62,7 @@ struct guest_thread_state {
     uint32_t altstack_size;
     uintptr_t deferred_unmap_start;
     size_t deferred_unmap_length;
+    char name[16]; /* Linux comm: NUL-padded, at most 15 characters */
     struct guest_thread_state *next;
 };
 
@@ -222,6 +223,7 @@ int32_t guest_thread_clone(ucontext_t *context)
         parent->guest_tls;
     memcpy(state->signal_mask, parent->signal_mask,
         sizeof(state->signal_mask));
+    memcpy(state->name, parent->name, sizeof(state->name));
     state->tid = allocate_guest_tid();
     tid = state->tid;
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0)
@@ -298,8 +300,11 @@ void guest_thread_after_fork(void)
     uint32_t signal_mask[2] = { 0, 0 };
     uint32_t altstack_pointer = state == 0 ? 0 : state->altstack_pointer;
     uint32_t altstack_size = state == 0 ? 0 : state->altstack_size;
-    if (state != 0)
+    char name[16] = { 0 };
+    if (state != 0) {
         memcpy(signal_mask, state->signal_mask, sizeof(signal_mask));
+        memcpy(name, state->name, sizeof(name));
+    }
     for (cursor = thread_registry; cursor != 0; cursor = cursor->next) {
         if (cursor->signal_wait_read_fd >= 0)
             close(cursor->signal_wait_read_fd);
@@ -317,6 +322,7 @@ void guest_thread_after_fork(void)
         sizeof(main_thread.signal_mask));
     main_thread.altstack_pointer = altstack_pointer;
     main_thread.altstack_size = altstack_size;
+    memcpy(main_thread.name, name, sizeof(main_thread.name));
     main_thread.tid = initial_guest_tid();
     main_thread.host_thread = pthread_self();
     next_tid = (uint32_t)main_thread.tid + 1u;
@@ -589,6 +595,21 @@ int32_t guest_thread_kill(int32_t tid, int host_signal)
     }
     pthread_mutex_unlock(&thread_registry_lock);
     return error == 0 ? 0 : -(int32_t)linux_errno_number(error);
+}
+
+void guest_thread_name_set(const char *name)
+{
+    struct guest_thread_state *state = current_thread();
+    if (state == 0) return;
+    strncpy(state->name, name, sizeof(state->name) - 1);
+    state->name[sizeof(state->name) - 1] = '\0';
+}
+
+void guest_thread_name_get(char name[16])
+{
+    struct guest_thread_state *state = current_thread();
+    if (state == 0) memset(name, 0, 16);
+    else memcpy(name, state->name, 16);
 }
 
 uint32_t runtime_guest_tls(void)

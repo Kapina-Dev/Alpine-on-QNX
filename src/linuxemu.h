@@ -98,6 +98,8 @@ const char *guest_path_root(void);
 const char *guest_path_cwd(void);
 
 int guest_process_initialize(const char *emulator);
+uint32_t guest_process_personality(uint32_t persona);
+const char *guest_process_initial_name(const char *loaded_path);
 int guest_process_retry_load(char *const arguments[]);
 int guest_process_exec(const char *host_executable, const char *guest_executable,
     char *const guest_argv[], char *const guest_envp[]);
@@ -107,6 +109,8 @@ int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
     size_t signal_set_size);
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
 int32_t guest_signal_send(pid_t process, int linux_signal);
+int32_t guest_signal_queue_thread(int32_t process, int32_t thread,
+    int linux_signal, const void *guest_information);
 int32_t guest_signal_send_thread(int32_t process, int32_t thread,
     int linux_signal);
 int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
@@ -134,6 +138,8 @@ void linux_futex_after_fork(void);
 int guest_thread_initialize(void);
 int32_t guest_thread_clone(ucontext_t *context);
 int32_t guest_thread_tid(void);
+void guest_thread_name_set(const char *name);
+void guest_thread_name_get(char name[16]);
 int32_t guest_thread_set_tid_address(uint32_t *address);
 int guest_thread_defer_active_stack_unmap(uintptr_t address, size_t length);
 void guest_thread_after_fork(void);
