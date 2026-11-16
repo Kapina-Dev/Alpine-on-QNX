@@ -279,7 +279,7 @@ static int restartable_syscall(uint32_t number)
 }
 
 int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
-    uint32_t original_r0)
+    uint32_t original_r0, uint32_t instruction_width)
 {
     siginfo_t information;
     int has_information;
@@ -290,7 +290,7 @@ int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
         (guest_actions[linux_signal].flags & LINUX_SA_RESTART) != 0 &&
         restartable_syscall(syscall_number)) {
         context->uc_mcontext.cpu.gpr[0] = original_r0;
-        context->uc_mcontext.cpu.gpr[15] -= 4u;
+        context->uc_mcontext.cpu.gpr[15] -= instruction_width;
     }
     return guest_signal_deliver(context, linux_signal,
         has_information ? &information : 0) == 0 ? 1 : -1;

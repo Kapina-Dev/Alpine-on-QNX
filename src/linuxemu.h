@@ -61,11 +61,22 @@ void guest_memory_after_fork(void);
 int guest_brk_initialize(uintptr_t initial_break);
 uintptr_t guest_brk_set(uintptr_t requested);
 
+/* A patched instruction. ARM sites are 4 bytes. Thumb sites are a 4-byte
+   TPIDRURO read (original holds both halfwords, first in the high half, so
+   it matches the ARM 0xee1d0f70 pattern) or a 2-byte svc #0. */
+struct arm_patch_site {
+    uintptr_t address;
+    uint32_t original;
+    uint8_t width;
+    uint8_t thumb;
+};
+
 int arm_patch_range(uintptr_t start, size_t length);
+int arm_patch_thumb_range(uintptr_t start, size_t length);
 int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
     size_t length);
 void arm_patch_forget_range(uintptr_t address, size_t length);
-const uint32_t *arm_patch_original(uintptr_t address);
+const struct arm_patch_site *arm_patch_lookup(uintptr_t address);
 size_t arm_patch_count(void);
 void arm_patch_rollback(size_t patch_count);
 
@@ -103,7 +114,7 @@ int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
 int guest_signal_deliver(ucontext_t *context, int linux_signal,
     const siginfo_t *host_info);
 int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
-    uint32_t original_r0);
+    uint32_t original_r0, uint32_t instruction_width);
 int guest_signal_return(ucontext_t *context, int realtime);
 int32_t guest_signal_altstack(ucontext_t *context, const void *guest_stack,
     void *guest_old_stack);

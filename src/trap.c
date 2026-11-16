@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #define ARM_LINUX_SVC_0 0xef000000u
+#define THUMB_LINUX_SVC_0 0xdf00u
 #define ARM_TPIDRURO_MASK 0xffff0fffu
 #define ARM_TPIDRURO_READ 0xee1d0f70u
 #define LINUX_KUSER_MEMORY_BARRIER 0xffff0fa0u
@@ -46,7 +47,11 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
 {
     ucontext_t *context = argument;
     uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
-    const uint32_t *original = arm_patch_original(pc);
+    const struct arm_patch_site *site = arm_patch_lookup(pc);
+    uint32_t original = site != 0 ? site->original : 0;
+    uint32_t width = site != 0 ? site->width : 4u;
+    int is_svc = site != 0 && (site->thumb ?
+        original == THUMB_LINUX_SVC_0 : original == ARM_LINUX_SVC_0);
 
     if (sig == SIGILL && pc == (uintptr_t)linuxemu_signal_return_trampoline) {
         if (guest_signal_return(context, 0) == 0) return;
@@ -92,15 +97,16 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
         fatal_signal(sig, info, pc);
     }
     if (sig != SIGILL) fatal_signal(sig, info, pc);
-    if (original == 0) {
-        if (guest_memory_is_executable(pc, 4) &&
+    if (site == 0) {
+        if (guest_memory_is_executable(pc, 2) &&
             guest_signal_deliver(context, 4, info) == 0) return;
         fatal_signal(sig, info, pc);
     }
-    if ((*original & ARM_TPIDRURO_MASK) == ARM_TPIDRURO_READ) {
-        unsigned destination = (*original >> 12) & 15u;
+    if (width == 4u &&
+        (original & ARM_TPIDRURO_MASK) == ARM_TPIDRURO_READ) {
+        unsigned destination = (original >> 12) & 15u;
         context->uc_mcontext.cpu.gpr[destination] = runtime_guest_tls();
-    } else if (*original == ARM_LINUX_SVC_0) {
+    } else if (is_svc) {
         uint32_t syscall_number = context->uc_mcontext.cpu.gpr[7];
         uint32_t original_r0 = context->uc_mcontext.cpu.gpr[0];
         if (context->uc_mcontext.cpu.gpr[7] == 119u) {
@@ -114,13 +120,14 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
         guest_thread_syscall_enter();
         linux_syscall_dispatch(context);
         guest_thread_syscall_leave();
-        context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
-        guest_signal_deliver_pending(context, syscall_number, original_r0);
+        context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + width);
+        guest_signal_deliver_pending(context, syscall_number, original_r0,
+            width);
         return;
     } else {
         fatal_signal(sig, info, pc);
     }
-    context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + 4u);
+    context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + width);
 }
 
 int install_guest_traps(void)

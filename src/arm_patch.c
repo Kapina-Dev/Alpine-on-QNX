@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "thumb_decode.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -9,13 +10,9 @@
 #define ARM_TPIDRURO_MASK 0xffff0fffu
 #define ARM_TPIDRURO_READ 0xee1d0f70u
 #define ARM_UDF_TRAP 0xe7f000f0u
+#define THUMB_UDF_TRAP 0xde00u
 
-struct patch_record {
-    uintptr_t address;
-    uint32_t original;
-};
-
-static struct patch_record patches[MAX_PATCHES];
+static struct arm_patch_site patches[MAX_PATCHES];
 static size_t patch_count;
 
 int arm_patch_range(uintptr_t start, size_t length)
@@ -43,19 +40,57 @@ int arm_patch_range(uintptr_t start, size_t length)
         }
         patches[patch_count].address = address;
         patches[patch_count].original = word;
+        patches[patch_count].width = 4;
+        patches[patch_count].thumb = 0;
         patch_count++;
         *instruction = ARM_UDF_TRAP;
     }
     return 0;
 }
 
-const uint32_t *arm_patch_original(uintptr_t address)
+int arm_patch_thumb_range(uintptr_t start, size_t length)
+{
+    const uint16_t *code = (const uint16_t *)start;
+    struct thumb_patch *found;
+    size_t count;
+    size_t i;
+
+    if ((start & 1u) != 0 || (length & 1u) != 0 ||
+        length > UINTPTR_MAX - start) {
+        errno = ENOEXEC;
+        return -1;
+    }
+    count = thumb_scan(code, length / 2u, 0, 0);
+    if (count == 0) return 0;
+    if (count > ARRAY_COUNT(patches) - patch_count) {
+        errno = E2BIG;
+        return -1;
+    }
+    found = malloc(count * sizeof(*found));
+    if (found == 0) return -1;
+    thumb_scan(code, length / 2u, found, count);
+    for (i = 0; i < count; ++i) {
+        uint16_t *instruction = (uint16_t *)(start + found[i].offset);
+        struct arm_patch_site *site = &patches[patch_count++];
+
+        site->address = (uintptr_t)instruction;
+        site->original = found[i].width == 4 ?
+            ((uint32_t)instruction[0] << 16) | instruction[1] : instruction[0];
+        site->width = (uint8_t)found[i].width;
+        site->thumb = 1;
+        instruction[0] = THUMB_UDF_TRAP;
+    }
+    free(found);
+    return 0;
+}
+
+const struct arm_patch_site *arm_patch_lookup(uintptr_t address)
 {
     size_t i;
 
     for (i = 0; i < patch_count; ++i) {
         if (patches[i].address == address) {
-            return &patches[i].original;
+            return &patches[i];
         }
     }
     return 0;
@@ -144,6 +179,13 @@ void arm_patch_rollback(size_t retained_count)
 {
     while (patch_count > retained_count) {
         patch_count--;
-        *(uint32_t *)patches[patch_count].address = patches[patch_count].original;
+        if (!patches[patch_count].thumb)
+            *(uint32_t *)patches[patch_count].address =
+                patches[patch_count].original;
+        else
+            *(uint16_t *)patches[patch_count].address =
+                (uint16_t)(patches[patch_count].width == 4 ?
+                    patches[patch_count].original >> 16 :
+                    patches[patch_count].original);
     }
 }
