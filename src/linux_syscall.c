@@ -154,8 +154,9 @@
 #define LINUX_MAP_PRIVATE 0x00000002u
 #define LINUX_MAP_FIXED 0x00000010u
 #define LINUX_MAP_ANONYMOUS 0x00000020u
+#define LINUX_MAP_NORESERVE 0x00004000u
 #define LINUX_MAP_KNOWN (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE | \
-    LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS)
+    LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS | LINUX_MAP_NORESERVE)
 #define LINUX_PROT_READ 0x1u
 #define LINUX_PROT_WRITE 0x2u
 #define LINUX_PROT_EXEC 0x4u
@@ -993,6 +994,10 @@ static int32_t linux_mmap2(ucontext_t *context)
         host_flags |= MAP_FIXED;
     }
     if ((linux_flags & LINUX_MAP_ANONYMOUS) != 0) host_flags |= MAP_ANON;
+    /* Linux MAP_NORESERVE skips commit accounting; QNX's nearest is
+       MAP_LAZY (acquire memory on first touch). Never pass 0x4000 through:
+       on QNX it is MAP_NOINIT, which would hand out unzeroed pages. */
+    if ((linux_flags & LINUX_MAP_NORESERVE) != 0) host_flags |= MAP_LAZY;
     if ((linux_flags & LINUX_MAP_SHARED) != 0 &&
         (host_protection & PROT_EXEC) != 0) return -EOPNOTSUPP;
     offset = (off_t)context->uc_mcontext.cpu.gpr[5] * 4096;
