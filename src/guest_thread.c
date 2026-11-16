@@ -628,7 +628,11 @@ void guest_thread_exit(int status)
 {
     struct guest_thread_state *state = current_thread();
     (void)status;
-    if (state == 0 || state == &main_thread) _exit(status & 0xff);
+    if (state == 0 || state == &main_thread) {
+        linux_diag_flush();
+        _exit(status & 0xff);
+    }
     siglongjmp(state->exit_context, 1);
+    linux_diag_flush();
     _exit(126);
 }

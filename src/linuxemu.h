@@ -100,6 +100,9 @@ const char *guest_path_cwd(void);
 int guest_process_initialize(const char *emulator);
 uint32_t guest_process_personality(uint32_t persona);
 const char *guest_process_initial_name(const char *loaded_path);
+void guest_process_record_executable(const char *loaded_path);
+const char *guest_process_executable(void);
+void linux_diag_flush(void);
 int guest_process_retry_load(char *const arguments[]);
 int guest_process_exec(const char *host_executable, const char *guest_executable,
     char *const guest_argv[], char *const guest_envp[]);

@@ -40,6 +40,7 @@ static void fatal_signal(int sig, siginfo_t *info, uintptr_t pc)
     length = append_hex32(message, length, (uint32_t)(uintptr_t)info->si_addr);
     message[length++] = '\n';
     write(STDERR_FILENO, message, length);
+    linux_diag_flush();
     _exit(125);
 }
 

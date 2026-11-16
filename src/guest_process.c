@@ -13,9 +13,12 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 4];
+static char *host_environment[MAX_EXEC_VECTOR + 6];
 static char personality_variable[48];
 static char comm_variable[48];
+static char diagnostics_variable[PATH_MAX + 32];
+static char executable_variable[PATH_MAX + 32];
+static char guest_executable_path[PATH_MAX];
 static uint32_t guest_personality;
 
 #define PERSONALITY_VARIABLE "LINUXEMU_GUEST_PERSONALITY="
@@ -46,6 +49,20 @@ uint32_t guest_process_personality(uint32_t persona)
     uint32_t old = guest_personality;
     if (persona != 0xffffffffu) guest_personality = persona;
     return old;
+}
+
+/* The guest path of the running image, for diagnostics: the path given to
+   execve when this image was exec'd, else the path Linuxemu was started on. */
+void guest_process_record_executable(const char *loaded_path)
+{
+    const char *value = getenv("LINUXEMU_GUEST_EXE");
+    snprintf(guest_executable_path, sizeof(guest_executable_path), "%s",
+        value != 0 ? value : loaded_path);
+}
+
+const char *guest_process_executable(void)
+{
+    return guest_executable_path;
 }
 
 /* Linux names a process after the basename of the file passed to execve,
@@ -176,6 +193,17 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
             slash != 0 ? slash + 1 : guest_executable);
         host_environment[environment_count++] = comm_variable;
     }
+    {
+        const char *diagnostics = getenv("LINUXEMU_DIAGNOSTICS");
+        if (diagnostics != 0 && diagnostics[0] != '\0') {
+            snprintf(diagnostics_variable, sizeof(diagnostics_variable),
+                "LINUXEMU_DIAGNOSTICS=%s", diagnostics);
+            host_environment[environment_count++] = diagnostics_variable;
+        }
+    }
+    snprintf(executable_variable, sizeof(executable_variable),
+        "LINUXEMU_GUEST_EXE=%s", guest_executable);
+    host_environment[environment_count++] = executable_variable;
     host_environment[environment_count] = 0;
 
     host_arguments[0] = emulator_path;
@@ -201,6 +229,7 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     sigaddset(&trap_signals, SIGILL);
     sigaddset(&trap_signals, SIGSEGV);
     if (sigprocmask(SIG_UNBLOCK, &trap_signals, &old_mask) != 0) return -1;
+    linux_diag_flush();
     execve(emulator_path, host_arguments, host_environment);
     {
         int saved_errno = errno;

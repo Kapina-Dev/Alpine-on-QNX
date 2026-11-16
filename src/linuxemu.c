@@ -76,6 +76,7 @@ int main(int argc, char **argv)
         return 1;
     }
     guest_thread_name_set(guest_process_initial_name(load_path));
+    guest_process_record_executable(load_path);
 #ifdef LINUXEMU_TESTING
     if (occupy_test_range() != 0) {
         perror("linuxemu test setup");

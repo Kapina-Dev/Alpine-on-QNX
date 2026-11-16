@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "linux_diagnostics.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -341,6 +342,7 @@ static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
     if (process < 0) return -(int32_t)linux_errno_number(errno);
     if (process == 0) {
         guest_thread_after_fork();
+        linux_diag_reset();
         if (child_stack != 0)
             context->uc_mcontext.cpu.gpr[13] = child_stack;
     }
@@ -1791,6 +1793,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_EXIT_GROUP:
+        linux_diag_flush();
         _exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));
         return;
     case LINUX_NR_EXIT:
@@ -1801,6 +1804,8 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = 0;
         break;
     default:
+        linux_diag_record(number, LINUX_ENOSYS, 0,
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
         result = -LINUX_ENOSYS;
         break;
     }

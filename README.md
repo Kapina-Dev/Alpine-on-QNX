@@ -243,6 +243,27 @@ Release inputs and excluded development material are described in
 - `runtime.c`: process entry, initial guest stack, and auxiliary vectors.
 - `linuxemu.c`: initialization and handoff only.
 
+## Diagnostics
+
+Set `LINUXEMU_DIAGNOSTICS=<file>` to record the unsupported Linux syscalls
+and unsupported behaviour a guest hits. Each guest process appends its own
+report when it exits, crashes, or calls `execve`, with one line per distinct
+call:
+
+```text
+linuxemu-unsupported exe=/bin/x pid=42 nr=999 name=unknown error=ENOSYS count=2 detail=- args=0x00000001,0x00000002,0x00000003,0x00000004,0x00000005,0x00000006
+```
+
+- `exe` is the guest path, percent-encoded so each field is one token.
+- `args` are r0–r5 of the first occurrence, as raw register values. Memory
+  isn't read.
+- `detail` names the unsupported case when the syscall itself exists, for
+  example `prctl-set-vma`.
+
+After 64 distinct entries, further ones are counted in a
+`linuxemu-unsupported-overflow ... dropped=<n>` line. With the variable
+unset, nothing is written and behaviour is unchanged.
+
 ## Current limits
 
 - Dynamic support is currently limited to the pinned Alpine 3.24 musl package

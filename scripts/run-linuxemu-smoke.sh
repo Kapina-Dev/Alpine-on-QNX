@@ -52,5 +52,75 @@ status=$?
 echo "android-process-syscalls exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+diag_dir="$project_dir/build/diag"
+rm -rf "$diag_dir"
+mkdir -p "$diag_dir"
+
+diag_fail()
+{
+    echo "$1: FAIL $2"
+    failures=$((failures + 1))
+}
+
+diag_field()
+{
+    sed -n "s/.* $2=\([^ ]*\).*/\1/p" "$1"
+}
+
+echo "=== diagnostics: diag-basic ==="
+report="$diag_dir/basic.txt"
+LINUXEMU_ROOT=/ LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/diagnostics-syscalls"
+status=$?
+grep 'nr=999 name=unknown error=ENOSYS' "$report" > "$diag_dir/basic.999" \
+    2>/dev/null
+lines=$(wc -l < "$diag_dir/basic.999" | tr -d ' ')
+grep 'count=2 ' "$diag_dir/basic.999" > "$diag_dir/basic.c2"
+grep 'count=1 ' "$diag_dir/basic.999" > "$diag_dir/basic.c1"
+grep 'count=3 ' "$diag_dir/basic.999" > "$diag_dir/basic.c3"
+parent_pid=$(diag_field "$diag_dir/basic.c2" pid)
+child_pid=$(diag_field "$diag_dir/basic.c1" pid)
+exec_pid=$(diag_field "$diag_dir/basic.c3" pid)
+echo "diag-basic exit=$status lines=$lines parent=$parent_pid" \
+    "child=$child_pid exec=$exec_pid"
+if [ "$status" -ne 0 ] || [ "$lines" != 3 ] || [ -z "$parent_pid" ] ||
+    [ -z "$child_pid" ] || [ "$exec_pid" != "$parent_pid" ] ||
+    [ "$child_pid" = "$parent_pid" ]; then
+    diag_fail diag-basic "unexpected report"
+    cat "$report" 2>/dev/null
+fi
+
+echo "=== diagnostics: diag-fatal ==="
+report="$diag_dir/fatal.txt"
+LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/diagnostics-fatal"
+status=$?
+echo "diag-fatal exit=$status expected=125"
+if [ "$status" -ne 125 ] ||
+    ! grep -q 'nr=999 name=unknown error=ENOSYS count=1 ' "$report" \
+        2>/dev/null; then
+    diag_fail diag-fatal "no report from the fatal path"
+fi
+
+echo "=== diagnostics: diag-off ==="
+before=$(ls "$diag_dir" | wc -l | tr -d ' ')
+LINUXEMU_ROOT=/ "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/diagnostics-syscalls"
+status=$?
+after=$(ls "$diag_dir" | wc -l | tr -d ' ')
+echo "diag-off exit=$status files_before=$before files_after=$after"
+if [ "$status" -ne 0 ] || [ "$before" != "$after" ]; then
+    diag_fail diag-off "unset variable changed behaviour"
+fi
+
+echo "=== diagnostics: diag-unwritable ==="
+LINUXEMU_ROOT=/ LINUXEMU_DIAGNOSTICS=/nonexistent-dir/r.txt \
+    "$timeout_command" 10 "$linuxemu" "$guest_dir/diagnostics-syscalls"
+status=$?
+echo "diag-unwritable exit=$status expected=0"
+if [ "$status" -ne 0 ]; then
+    diag_fail diag-unwritable "guest status changed"
+fi
+
 echo "linuxemu_smoke_failures=$failures"
 test "$failures" -eq 0
