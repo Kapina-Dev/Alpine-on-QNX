@@ -645,47 +645,42 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
 {
     unsigned char *buffer = guest_buffer;
     size_t used = 0;
-    DIR *directory;
-    struct dirent *entry;
     struct guest_fd_object *object = guest_fd_acquire(fd);
-    int saved_errno;
+    int32_t result = 0;
 
     if (object == 0) return -EBADF;
-    directory = guest_fd_object_directory(object);
-    if (directory == 0) {
-        saved_errno = errno;
-        guest_fd_put(object);
-        return -(int32_t)linux_errno_number(saved_errno);
-    }
-    errno = 0;
     for (;;) {
-        long previous_offset = telldir(directory);
-        entry = readdir(directory);
-        if (entry == 0) break;
-        size_t name_length = strlen(entry->d_name) + 1;
-        size_t record_length = (19 + name_length + 7) & ~(size_t)7;
-        uint64_t inode = (uint64_t)entry->d_ino;
-        int64_t offset = (int64_t)telldir(directory);
-        uint16_t short_length = (uint16_t)record_length;
-        if (record_length > capacity - used) {
-            seekdir(directory, previous_offset);
+        uint64_t inode;
+        int64_t offset;
+        const char *name;
+        size_t name_length, record_length;
+        uint16_t short_length;
+        int status = guest_fd_object_directory_entry(object, &inode, &name,
+            &offset);
+        if (status < 0) {
+            if (used == 0) result = -(int32_t)linux_errno_number(errno);
             break;
         }
+        if (status == 0) break;
+        name_length = strlen(name) + 1;
+        record_length = (19 + name_length + 7) & ~(size_t)7;
+        if (record_length > capacity - used) {
+            /* Linux: a buffer too small for one entry is EINVAL. */
+            if (used == 0) result = -EINVAL;
+            break;
+        }
+        short_length = (uint16_t)record_length;
         memset(buffer + used, 0, record_length);
         memcpy(buffer + used, &inode, 8);
         memcpy(buffer + used + 8, &offset, 8);
         memcpy(buffer + used + 16, &short_length, 2);
         buffer[used + 18] = 0;
-        memcpy(buffer + used + 19, entry->d_name, name_length);
+        memcpy(buffer + used + 19, name, name_length);
         used += record_length;
-        errno = 0;
+        guest_fd_object_directory_advance(object);
     }
-    saved_errno = errno;
-    guest_fd_object_directory_done(object, directory);
     guest_fd_put(object);
-    if (used == 0 && saved_errno != 0)
-        return -(int32_t)linux_errno_number(saved_errno);
-    return (int32_t)used;
+    return result != 0 ? result : (int32_t)used;
 }
 
 static int32_t linux_close_fd(int fd)

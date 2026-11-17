@@ -153,9 +153,12 @@ static void path_record_shared_across_dup(void)
         guest_fd_path(copy, path, sizeof(path)) == 0 && strcmp(path, "/") == 0);
     object = guest_fd_acquire(copy);
     if (object != 0) {
-        DIR *directory = guest_fd_object_directory(object);
-        CHECK("path_record_shared_across_dup", directory != 0);
-        if (directory != 0) guest_fd_object_directory_done(object, directory);
+        uint64_t inode;
+        const char *name;
+        int64_t offset;
+        CHECK("path_record_shared_across_dup",
+            guest_fd_object_directory_entry(object, &inode, &name,
+                &offset) == 1);
         guest_fd_put(object);
     } else CHECK("path_record_shared_across_dup", object != 0);
     CHECK("path_record_shared_across_dup",

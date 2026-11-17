@@ -69,12 +69,15 @@ int guest_fd_is_typed(int fd);
 int guest_fd_record_path(int fd, const char *host_path);
 /* 0, or -1 with errno EBADF (no record) or ENAMETOOLONG (buffer too small). */
 int guest_fd_path(int fd, char *host_path, size_t size);
-/* A directory stream on a referenced GUEST_FD_PATH object, positioned where
-   the last getdents stopped; 0 + errno.  Hand it back with
-   guest_fd_object_directory_done, which saves the position and closes it. */
-DIR *guest_fd_object_directory(struct guest_fd_object *object);
-void guest_fd_object_directory_done(struct guest_fd_object *object,
-    DIR *directory);
+/* getdents on a referenced GUEST_FD_PATH object.  The first call takes a
+   snapshot of the directory into the shared object; entries are then served
+   from it, so deleting entries while iterating (rm -r) never shifts the
+   position, and no directory stream stays open between calls.
+   Returns 1 with the entry at the cursor (not consumed), 0 at the end, or
+   -1 with errno.  *offset is the d_off cookie of the following entry. */
+int guest_fd_object_directory_entry(struct guest_fd_object *object,
+    uint64_t *inode, const char **name, int64_t *offset);
+void guest_fd_object_directory_advance(struct guest_fd_object *object);
 
 /* Dispatch to a typed object's ops.  Return 0 when the fd is native (or
    the object lacks the op): the caller does the native call.  The read and

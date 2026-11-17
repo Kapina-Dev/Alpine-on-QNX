@@ -184,18 +184,31 @@ int guest_fd_is_typed(int fd)
     return valid_fd(fd) && typed[fd] != 0;
 }
 
-/* No directory stream is kept open between getdents calls: the saved
-   position resumes a fresh stream, so no emulator-owned fd is left at a
-   guest-visible number. */
+struct directory_entry {
+    uint64_t inode;
+    char *name;
+};
+
 struct path_data {
     char *path;
-    long position;
-    int positioned;
+    struct directory_entry *entries;
+    size_t count, capacity, cursor;
+    int loaded;
 };
+
+static void free_entries(struct path_data *data)
+{
+    size_t i;
+    for (i = 0; i != data->count; ++i) free(data->entries[i].name);
+    free(data->entries);
+    data->entries = 0;
+    data->count = data->capacity = 0;
+}
 
 static void path_release(struct guest_fd_object *object)
 {
     struct path_data *data = guest_fd_object_data(object);
+    free_entries(data);
     free(data->path);
 }
 
@@ -259,27 +272,60 @@ int guest_fd_path(int fd, char *host_path, size_t size)
     return result;
 }
 
-DIR *guest_fd_object_directory(struct guest_fd_object *object)
+static int load_directory(struct path_data *data)
 {
-    struct path_data *data;
-    DIR *directory;
-    if (object == 0 || object->type != GUEST_FD_PATH) {
-        errno = EBADF;
-        return 0;
+    DIR *directory = opendir(data->path);
+    struct dirent *entry;
+    if (directory == 0) return -1;
+    errno = 0;
+    while ((entry = readdir(directory)) != 0) {
+        if (data->count == data->capacity) {
+            size_t capacity = data->capacity == 0 ? 32 : 2 * data->capacity;
+            struct directory_entry *grown = realloc(data->entries,
+                capacity * sizeof(*grown));
+            if (grown == 0) { errno = ENOMEM; break; }
+            data->entries = grown;
+            data->capacity = capacity;
+        }
+        data->entries[data->count].name = strdup(entry->d_name);
+        if (data->entries[data->count].name == 0) { errno = ENOMEM; break; }
+        data->entries[data->count++].inode = (uint64_t)entry->d_ino;
+        errno = 0;
     }
-    data = guest_fd_object_data(object);
-    directory = opendir(data->path);
-    if (directory != 0 && data->positioned) seekdir(directory, data->position);
-    return directory;
+    if (errno != 0) {
+        int saved_errno = errno;
+        closedir(directory);
+        free_entries(data);
+        errno = saved_errno;
+        return -1;
+    }
+    closedir(directory);
+    data->loaded = 1;
+    data->cursor = 0;
+    return 0;
 }
 
-void guest_fd_object_directory_done(struct guest_fd_object *object,
-    DIR *directory)
+int guest_fd_object_directory_entry(struct guest_fd_object *object,
+    uint64_t *inode, const char **name, int64_t *offset)
+{
+    struct path_data *data;
+    if (object == 0 || object->type != GUEST_FD_PATH) {
+        errno = EBADF;
+        return -1;
+    }
+    data = guest_fd_object_data(object);
+    if (!data->loaded && load_directory(data) != 0) return -1;
+    if (data->cursor >= data->count) return 0;
+    *inode = data->entries[data->cursor].inode;
+    *name = data->entries[data->cursor].name;
+    *offset = (int64_t)data->cursor + 1;
+    return 1;
+}
+
+void guest_fd_object_directory_advance(struct guest_fd_object *object)
 {
     struct path_data *data = guest_fd_object_data(object);
-    data->position = telldir(directory);
-    data->positioned = 1;
-    closedir(directory);
+    if (data->cursor < data->count) ++data->cursor;
 }
 
 static struct guest_fd_object *typed_object(int fd)

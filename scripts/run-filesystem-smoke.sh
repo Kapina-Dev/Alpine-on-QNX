@@ -101,5 +101,12 @@ run_fd_guest getdents-chunks
 run_fd_guest fd-close-all
 run_fd_guest fd-exhaust
 
+echo "=== filesystem guest: getdents-unlink ==="
+LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+    "$project_dir/guest-tests/fixtures/getdents-unlink-armhf"
+status=$?
+echo "getdents-unlink exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 echo "linuxemu_filesystem_smoke_failures=$failures"
 test "$failures" -eq 0
