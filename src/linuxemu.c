@@ -1,5 +1,6 @@
 #include "linuxemu.h"
 #include "linux_diagnostics.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -74,6 +75,10 @@ int main(int argc, char **argv)
             guest_memory_initialize(page_size) != 0 ||
             install_guest_traps() != 0) {
         perror("linuxemu initialization");
+        return 1;
+    }
+    if (guest_fd_initialize() != 0) {
+        perror("linuxemu fd table");
         return 1;
     }
     guest_thread_name_set(guest_process_initial_name(load_path));

@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -331,6 +332,7 @@ void guest_thread_after_fork(void)
     pthread_setspecific(thread_state_key, &main_thread);
     linux_futex_after_fork();
     guest_memory_after_fork();
+    guest_fd_after_fork();
 }
 
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)
