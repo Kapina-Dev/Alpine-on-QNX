@@ -128,7 +128,7 @@ and Classic devices. **Linuxemu has not reproduced any of them yet.**
 
 ## 2026-11-17 — First device probes (Passport, devuser)
 
-**Device:** Passport at 192.168.0.3, QNX 8.0.0 build 2018/02/21. Run over SSH
+**Device:** Passport (LAN address omitted), QNX 8.0.0 build 2018/02/21. Run over SSH
 as devuser: uid 101431000, gid 10143, groups 1000,1005,1001,750. The 4.3
 runtime's nodes were present (created Nov 16 22:12).
 

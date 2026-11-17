@@ -60,7 +60,7 @@ reference-counted record layer. Then fix the descriptor defects it exposes:
 - Commit messages end with the session's attribution lines.
 
 **Device commands** (dev checkout `D=/accounts/1000/shared/misc/linuxemu-dev`,
-`ssh -o HostName=192.168.0.3 bb10`; copy changed files with `scp` first):
+`ssh -o HostName=<passport-ip> bb10`; copy changed files with `scp` first):
 
 - **Core build:**
   ```sh
