@@ -352,7 +352,7 @@ static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
     if (process < 0) return -(int32_t)linux_errno_number(errno);
     if (process == 0) {
         guest_thread_after_fork();
-        linux_diag_reset();
+        linux_diag_after_fork();
         if (child_stack != 0)
             context->uc_mcontext.cpu.gpr[13] = child_stack;
     }

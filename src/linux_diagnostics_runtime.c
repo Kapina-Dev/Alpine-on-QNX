@@ -16,18 +16,27 @@ void linux_diag_flush(void)
 {
     static char report[16384];
     const char *path = getenv("LINUXEMU_DIAGNOSTICS");
+    const char *executable = guest_process_executable();
+    int32_t pid = (int32_t)getpid();
+    uint32_t cursor = 0;
     size_t length;
     int descriptor;
 
     if (path == 0 || path[0] == '\0') return;
-    length = linux_diag_format(report, sizeof(report),
-        guest_process_executable(), (int32_t)getpid());
+    length = linux_diag_format(report, sizeof(report), executable, pid,
+        &cursor);
     if (length == 0) return;
     descriptor = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (descriptor >= 0) {
-        ssize_t written = write(descriptor, report, length);
-        (void)written;
-        close(descriptor);
+    /* The report is written in buffer-sized chunks of whole lines, so no
+       line is lost however long the executable path is. */
+    while (length != 0) {
+        if (descriptor >= 0) {
+            ssize_t written = write(descriptor, report, length);
+            (void)written;
+        }
+        length = linux_diag_format(report, sizeof(report), executable, pid,
+            &cursor);
     }
+    if (descriptor >= 0) close(descriptor);
     linux_diag_reset();
 }

@@ -127,6 +127,18 @@ if [ "$status" -ne 134 ] ||
     diag_fail diag-abort "no report before default-action SIGABRT"
 fi
 
+echo "=== diagnostics: diag-sigpipe ==="
+report="$diag_dir/sigpipe.txt"
+LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/diagnostics-sigpipe"
+status=$?
+echo "diag-sigpipe exit=$status expected=141"
+if [ "$status" -ne 141 ] ||
+    ! grep -q 'nr=999 name=unknown error=ENOSYS count=1 ' "$report" \
+        2>/dev/null; then
+    diag_fail diag-sigpipe "no report before kernel-sent SIGPIPE"
+fi
+
 echo "=== diagnostics: diag-off ==="
 before=$(ls "$diag_dir" | wc -l | tr -d ' ')
 LINUXEMU_ROOT=/ "$timeout_command" 10 \

@@ -82,7 +82,7 @@ for guest in write-exit unknown-syscall exit-status initial-stack \
     futex-contention-stress \
     clone-vfork-syscalls signal-frame-syscalls signal-queue-wait-syscalls \
     android-process-syscalls diagnostics-syscalls diagnostics-fatal \
-    diagnostics-abort; do
+    diagnostics-abort diagnostics-sigpipe; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \

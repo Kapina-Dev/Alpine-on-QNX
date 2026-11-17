@@ -400,6 +400,57 @@ static void flush_before_self_signal(int linux_signal)
         linux_diag_flush();
 }
 
+/*
+ * With LINUXEMU_DIAGNOSTICS set, a signal whose action is the default and
+ * whose Linux default ends the process (SIGPIPE from a closed pipe, SIGALRM,
+ * SIGXCPU, a kill from another process, ...) gets this host handler instead
+ * of SIG_DFL: it writes the report, then restores SIG_DFL and re-raises, so
+ * the process still ends by the same signal. With diagnostics off nothing
+ * changes: the host action stays SIG_DFL.
+ */
+static int diagnostics_handlers;
+
+static void diagnostics_terminate_handler(int host_signal)
+{
+    struct sigaction default_action;
+    sigset_t unblock;
+
+    linux_diag_flush();
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    sigaction(host_signal, &default_action, 0);
+    sigemptyset(&unblock);
+    sigaddset(&unblock, host_signal);
+    pthread_sigmask(SIG_UNBLOCK, &unblock, 0);
+    pthread_kill(pthread_self(), host_signal);
+}
+
+/* SIGILL and SIGSEGV belong to the trap handler; KILL and STOP can't be
+   caught. */
+static int diagnostics_catchable(int linux_signal)
+{
+    return default_action_terminates(linux_signal) && linux_signal != 4 &&
+        linux_signal != 9 && linux_signal != 11 && linux_signal != 19;
+}
+
+void guest_signal_diagnostics_initialize(void)
+{
+    struct sigaction action;
+    int linux_signal;
+
+    diagnostics_handlers = 1;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = diagnostics_terminate_handler;
+    sigemptyset(&action.sa_mask);
+    for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        int host_signal = linux_signal_to_host(linux_signal);
+        if (host_signal == 0 || !diagnostics_catchable(linux_signal) ||
+            guest_actions[linux_signal].handler != 0) continue;
+        sigaction(host_signal, &action, 0);
+    }
+}
+
 int32_t guest_signal_send(pid_t process, int linux_signal)
 {
     int host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
@@ -474,7 +525,10 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
     if (linux_signal == 4 || linux_signal == 11) return 0;
     memset(&host_action, 0, sizeof(host_action));
     if (action.handler == 1) host_action.sa_handler = SIG_IGN;
-    else if (action.handler == 0) host_action.sa_handler = SIG_DFL;
+    else if (action.handler == 0)
+        host_action.sa_handler = diagnostics_handlers &&
+            diagnostics_catchable(linux_signal) ?
+            diagnostics_terminate_handler : SIG_DFL;
     else {
         host_action.sa_sigaction = host_signal_handler;
         host_action.sa_flags = SA_SIGINFO;

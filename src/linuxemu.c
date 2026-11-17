@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "linux_diagnostics.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -77,6 +78,12 @@ int main(int argc, char **argv)
     }
     guest_thread_name_set(guest_process_initial_name(load_path));
     guest_process_record_executable(load_path);
+    {
+        const char *diagnostics = getenv("LINUXEMU_DIAGNOSTICS");
+        int enabled = diagnostics != 0 && diagnostics[0] != '\0';
+        linux_diag_set_enabled(enabled);
+        if (enabled) guest_signal_diagnostics_initialize();
+    }
 #ifdef LINUXEMU_TESTING
     if (occupy_test_range() != 0) {
         perror("linuxemu test setup");

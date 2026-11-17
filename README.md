@@ -247,8 +247,10 @@ Release inputs and excluded development material are described in
 
 Set `LINUXEMU_DIAGNOSTICS=<file>` to record the unsupported Linux syscalls
 and unsupported behaviour a guest hits. Each guest process appends its own
-report when it exits, crashes, calls `execve`, or sends itself a signal that
-will end it (as `abort()` does), with one line per distinct call:
+report when it exits, crashes, calls `execve`, or is ended by a signal, with
+one line per distinct call. That includes signals it sends itself, such as
+`abort()`, kernel signals such as SIGPIPE and SIGALRM, and signals from other
+processes:
 
 ```text
 linuxemu-unsupported exe=/bin/x pid=42 nr=999 name=unknown error=ENOSYS count=2 detail=- args=0x00000001,0x00000002,0x00000003,0x00000004,0x00000005,0x00000006
@@ -264,8 +266,11 @@ After 64 distinct entries, further ones are counted in a
 `linuxemu-unsupported-overflow ... dropped=<n>` line. With the variable
 unset, nothing is written and behaviour is unchanged.
 
-A process killed by a signal from another process (for example `kill -9`)
-ends without writing its report.
+Only SIGKILL (`kill -9`) ends a process without a report, because it can't
+be caught. A process can write more than one line for the same call: it
+writes again each time it flushes (for example, every time it sends itself a
+blocked signal), so add up lines with the same `pid`, `nr`, `error` and
+`detail`.
 
 ## Current limits
 

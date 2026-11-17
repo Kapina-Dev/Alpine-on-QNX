@@ -17,6 +17,7 @@ static struct diag_entry entries[LINUX_DIAG_MAX_ENTRIES];
 static volatile uint32_t entry_count;
 static volatile uint32_t dropped;
 static volatile int table_lock;
+static volatile int enabled;
 
 static const struct {
     int32_t number;
@@ -76,6 +77,7 @@ void linux_diag_record(uint32_t number, int32_t linux_error,
 {
     uint32_t i;
 
+    if (!enabled) return;
     lock_table();
     for (i = 0; i < entry_count; ++i) {
         if (entries[i].number == number && entries[i].error == linux_error &&
@@ -106,6 +108,18 @@ void linux_diag_reset(void)
     entry_count = 0;
     dropped = 0;
     unlock_table();
+}
+
+void linux_diag_set_enabled(int value)
+{
+    enabled = value != 0;
+}
+
+void linux_diag_after_fork(void)
+{
+    entry_count = 0;
+    dropped = 0;
+    __sync_lock_release(&table_lock);
 }
 
 /* A bounded line builder: appends fail once the line would not fit. */
@@ -203,14 +217,14 @@ static void put_prefix(struct line *line, const char *tag,
 }
 
 size_t linux_diag_format(char *buffer, size_t capacity,
-    const char *executable, int32_t pid)
+    const char *executable, int32_t pid, uint32_t *cursor)
 {
     size_t used = 0;
     uint32_t count = entry_count;
-    uint32_t i;
 
     __sync_synchronize();
-    for (i = 0; i <= count; ++i) {
+    while (*cursor <= count) {
+        uint32_t i = *cursor;
         struct line line;
 
         line.text = buffer + used;
@@ -244,15 +258,25 @@ size_t linux_diag_format(char *buffer, size_t capacity,
                 put_hex32(&line, entry->args[arg]);
             }
         } else {
-            if (dropped == 0) break;
+            if (dropped == 0) {
+                *cursor = count + 1;
+                break;
+            }
             put_prefix(&line, "linuxemu-unsupported-overflow", executable,
                 pid);
             put_text(&line, " dropped=");
             put_decimal(&line, dropped);
         }
         put_char(&line, '\n');
-        if (line.full) break;
+        if (line.full) {
+            /* Leave it for the next call, unless it cannot fit even in an
+               empty buffer: then skip it rather than stall forever. */
+            if (used != 0) break;
+            (*cursor)++;
+            continue;
+        }
         used += line.length;
+        (*cursor)++;
     }
     return used;
 }
