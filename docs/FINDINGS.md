@@ -439,3 +439,43 @@ inert leftovers are confined to our own dirs: the probe binaries and
 `shrimp-probe.c`/`shrimp-probe` (a variant of `rim-binder-probe` that
 writes its report to a file), plus `shrimp.orig` and the wrapper backup
 under the dev checkout's `build/`.
+
+## 2026-11-17 — tmux attach freeze: QNX drops SCM_RIGHTS on a full receiver
+
+Root cause of attached tmux stalling (and freezing Term49), found with
+native QNX probes and confirmed in the emulator:
+
+- **Native QNX loses descriptor-bearing AF_UNIX stream messages.** QNX's
+  stream defaults are `SO_SNDBUF` 7168 and `SO_RCVBUF` 5120, so a sender can
+  queue more unread data than the receiver holds. A `sendmsg` carrying
+  `SCM_RIGHTS` that no longer fits the receiver is **dropped with its
+  payload** while `sendmsg` reports success (the classic BSD
+  `sbappendcontrol` failure path). Linux never loses it.
+- Measured with `native-probes/unix-rights-pressure.c` variants: an fd frame
+  sent behind ≤2000 unread bytes always arrives; behind 4000 bytes a 16-byte
+  frame fits but a 1968-byte one is dropped; behind 5893 bytes the 16-byte
+  frame is dropped. It doesn't depend on the signal handler, a tty fd,
+  the control-buffer size or the record size. Draining first avoids it.
+- The 2026-10-14 note that native tests "receive both descriptors and every
+  payload" was wrong: parent and child shared one terminal and the output
+  interleaved. With separate logs, native QNX loses the frame too.
+- tmux's identify handshake is exactly this pattern: ~5.8 KiB of plain
+  frames, then the terminal fds. The server never receives them and both
+  ends wait forever.
+- The earlier mitigation (raising the *sender's* `SO_SNDBUF` to 64 KiB) was
+  the wrong side and made it worse (more unread backlog allowed).
+- **Fix:** every AF_UNIX stream/seqpacket socket Linuxemu creates gets a
+  256 KiB `SO_RCVBUF` (`socket`, `socketpair`; accepted sockets inherit it
+  from the listener). Native confirmation: a 256 KiB receive buffer set on
+  the listener delivered both fds in 9/9 runs, including a delayed receiver.
+  The `SO_SNDBUF` adjustment was removed.
+- **Evidence:** new guest test `unix-rights-backlog` (5893 unread bytes,
+  then 16 bytes + an fd, drained with `MSG_DONTWAIT`): old core exit 124
+  (frame lost) 3/3, fixed core exit 0 5/5. Real attached
+  `tmux new-session` with `TERM=xterm-256color` in an SSH pty: fixed core
+  attaches (`CLIENTS=1`), runs the pane and exits 0 (twice); old core hangs
+  until a watchdog kills it (137). Full device regression on the fixed core:
+  14/14, 0 failures.
+- **Residual:** a receiver that leaves more than 256 KiB unread can still
+  lose an fd frame (Linux would block the sender instead). Not yet
+  confirmed on the physical Term49 terminal (tested over an SSH pty).

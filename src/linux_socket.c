@@ -464,6 +464,27 @@ static int socket_option(int linux_level, int linux_option, int *host_level,
     return -1;
 }
 
+/* QNX's AF_UNIX stream defaults (SO_SNDBUF 7168, SO_RCVBUF 5120) let a
+   sender queue more unread data than the receiver's buffer holds.  A
+   descriptor-bearing message that no longer fits is then dropped, payload
+   included, while sendmsg reports success; Linux never loses it.  A large
+   receive buffer keeps every sender's backlog within the receiver's space.
+   Accepted sockets inherit it from the listener.  Best effort: a refusal
+   leaves QNX's default. */
+#define UNIX_STREAM_RECEIVE_BUFFER (256 * 1024)
+
+static void widen_unix_receive_buffer(int fd, int domain, int type)
+{
+    int size = UNIX_STREAM_RECEIVE_BUFFER;
+    if (domain != AF_UNIX) return;
+    if (type != SOCK_STREAM
+#ifdef SOCK_SEQPACKET
+        && type != SOCK_SEQPACKET
+#endif
+        ) return;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+}
+
 static int32_t make_socket(uint32_t *arguments)
 {
     int domain = host_domain((int)arguments[0]);
@@ -473,6 +494,7 @@ static int32_t make_socket(uint32_t *arguments)
             &descriptor_flags) != 0) return -EINVAL;
     fd = socket(domain, type, (int)arguments[2]);
     if (fd < 0) return -(int32_t)linux_errno_number(errno);
+    widen_unix_receive_buffer(fd, domain, type);
     if (configure_socket(fd, status_flags, descriptor_flags) != 0) {
         int saved_errno = errno; close(fd); errno = saved_errno;
         return -(int32_t)linux_errno_number(errno);
@@ -536,6 +558,8 @@ static int32_t socket_pair(uint32_t *arguments)
             &descriptor_flags) != 0) return -EINVAL;
     if (socketpair(domain, type, (int)arguments[2], descriptors) != 0)
         return -(int32_t)linux_errno_number(errno);
+    widen_unix_receive_buffer(descriptors[0], domain, type);
+    widen_unix_receive_buffer(descriptors[1], domain, type);
     if (configure_socket(descriptors[0], status_flags, descriptor_flags) != 0 ||
         configure_socket(descriptors[1], status_flags, descriptor_flags) != 0) {
         int saved_errno = errno;
@@ -654,7 +678,6 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     size_t payload_length = 0;
     int flags;
     int converted;
-    int descriptor_status;
     ssize_t result;
     uint32_t iov_index;
     if (arguments[1] == 0) return -EFAULT;
@@ -675,27 +698,6 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
         if (converted != 0) return converted;
         host.msg_control = control;
         host.msg_controllen = control_length;
-        /* QNX can lose SCM_RIGHTS when a large nonblocking AF_UNIX stream
-           frame reaches its small default send-buffer limit.  Linux uses a
-           substantially larger default; grow the host buffer before such a
-           frame so the descriptor and data remain one intact sendmsg. */
-        descriptor_status = fcntl((int)arguments[0], F_GETFL);
-        if (descriptor_status >= 0 && (descriptor_status & O_NONBLOCK) != 0 &&
-            payload_length > 1024) {
-            int send_buffer = 0;
-            socklen_t option_length = sizeof(send_buffer);
-            if (getsockopt((int)arguments[0], SOL_SOCKET, SO_SNDBUF,
-                    &send_buffer, &option_length) == 0 &&
-                send_buffer < 65536) {
-                send_buffer = 65536;
-                if (setsockopt((int)arguments[0], SOL_SOCKET, SO_SNDBUF,
-                        &send_buffer, sizeof(send_buffer)) != 0) {
-                    int saved_errno = errno;
-                    free(control);
-                    return -(int32_t)linux_errno_number(saved_errno);
-                }
-            }
-        }
     } else if (number == LINUX_NR_RECVMSG && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         control = calloc(1, guest.control_length);

@@ -76,7 +76,7 @@ set -x
 mkdir -p "$project_dir/build/guest-tests"
 for guest in write-exit unknown-syscall exit-status initial-stack \
     memory-syscalls runtime-exec-syscalls file-syscalls \
-    terminal-time-syscalls socket-syscalls \
+    terminal-time-syscalls socket-syscalls unix-rights-backlog \
     network-connect-syscalls entropy-syscalls thread-futex-syscalls \
     thread-lifecycle-stress thread-self-unmap-syscalls \
     futex-contention-stress \
