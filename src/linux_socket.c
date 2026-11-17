@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -350,6 +351,8 @@ static int receive_control(const struct msghdr *host, void *guest_control,
         if (payload_length == 0 || payload_length % sizeof(int) != 0)
             return -EINVAL;
         descriptors = (int *)CMSG_DATA(header);
+        for (index = 0; index != payload_length / sizeof(int); ++index)
+            guest_fd_received(descriptors[index]);
         if (close_on_exec)
             for (index = 0; index != payload_length / sizeof(int); ++index) {
                 int flags = fcntl(descriptors[index], F_GETFD);
@@ -494,6 +497,7 @@ static int32_t make_socket(uint32_t *arguments)
             &descriptor_flags) != 0) return -EINVAL;
     fd = socket(domain, type, (int)arguments[2]);
     if (fd < 0) return -(int32_t)linux_errno_number(errno);
+    guest_fd_clear(fd);
     widen_unix_receive_buffer(fd, domain, type);
     if (configure_socket(fd, status_flags, descriptor_flags) != 0) {
         int saved_errno = errno; close(fd); errno = saved_errno;
@@ -536,6 +540,7 @@ static int32_t accept_socket(uint32_t *arguments, int with_flags)
     fd = accept((int)arguments[0], arguments[1] == 0 ? 0 :
         (struct sockaddr *)&address, arguments[1] == 0 ? 0 : &length);
     if (fd < 0) return -(int32_t)linux_errno_number(errno);
+    guest_fd_clear(fd);
     if (configure_socket(fd, status_flags, descriptor_flags) != 0) {
         int saved_errno = errno; close(fd); errno = saved_errno;
         return -(int32_t)linux_errno_number(errno);
@@ -558,6 +563,8 @@ static int32_t socket_pair(uint32_t *arguments)
             &descriptor_flags) != 0) return -EINVAL;
     if (socketpair(domain, type, (int)arguments[2], descriptors) != 0)
         return -(int32_t)linux_errno_number(errno);
+    guest_fd_clear(descriptors[0]);
+    guest_fd_clear(descriptors[1]);
     widen_unix_receive_buffer(descriptors[0], domain, type);
     widen_unix_receive_buffer(descriptors[1], domain, type);
     if (configure_socket(descriptors[0], status_flags, descriptor_flags) != 0 ||

@@ -163,6 +163,27 @@ static void path_record_shared_across_dup(void)
     close(copy);
 }
 
+static void stale_slot_cleared_on_create(void)
+{
+    int p[2], q[2], n;
+    struct guest_fd_object *object;
+    if (pipe(p) != 0) { ++failures; return; }
+    releases = 0;
+    n = p[0];
+    object = new_object(n);
+    guest_fd_attach(n, object);
+    guest_fd_put(object);
+    /* A creation path that forgot to clear: close natively, reuse N. */
+    close(n);
+    if (pipe(q) != 0) { ++failures; return; }
+    if (q[0] != n) { close(q[0]); q[0] = dup2(q[1], n); }
+    guest_fd_received(n);
+    CHECK("stale_slot_cleared_on_create", releases == 1);
+    CHECK("stale_slot_cleared_on_create", guest_fd_acquire(n) == 0);
+    CHECK("stale_slot_cleared_on_create", !guest_fd_is_typed(n));
+    close(n); close(p[1]); close(q[1]);
+}
+
 int main(void)
 {
     if (guest_fd_initialize() != 0) {
@@ -175,6 +196,7 @@ int main(void)
     fd_above_256();
     hide_moves_above_base();
     path_record_shared_across_dup();
+    stale_slot_cleared_on_create();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;
 }

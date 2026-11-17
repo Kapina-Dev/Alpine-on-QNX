@@ -56,6 +56,9 @@ void guest_fd_clear(int fd);
 int guest_fd_duplicate(int source, int destination);
 /* Referenced object or 0.  Validates identity; drops a mismatched record. */
 struct guest_fd_object *guest_fd_acquire(int fd);
+/* A number that arrived from outside the table (SCM_RIGHTS): drop any
+   stale record so it starts native. */
+void guest_fd_received(int fd);
 /* Lock-free hint: the number carries an object with its own I/O behaviour
    (any type except GUEST_FD_PATH).  Gates the slower dispatch paths. */
 int guest_fd_is_typed(int fd);

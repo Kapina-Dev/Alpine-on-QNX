@@ -110,6 +110,11 @@ void guest_fd_clear(int fd)
     guest_fd_put(old);
 }
 
+void guest_fd_received(int fd)
+{
+    guest_fd_clear(fd);
+}
+
 int guest_fd_duplicate(int source, int destination)
 {
     struct guest_fd_object *old, *object;

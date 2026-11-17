@@ -400,7 +400,8 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
                 return -ENAMETOOLONG;
             fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
             if (fd >= 0) {
-                (void)guest_fd_record_path(fd, host_path);
+                if (guest_fd_record_path(fd, host_path) != 0)
+                    guest_fd_clear(fd);
                 return fd;
             }
             if (errno == ENOENT) break;
@@ -415,7 +416,8 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
     fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
-    if (fd >= 0) (void)guest_fd_record_path(fd, host_path);
+    if (fd >= 0 && guest_fd_record_path(fd, host_path) != 0)
+        guest_fd_clear(fd);
     return linux_host_result(fd);
 }
 
