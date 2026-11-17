@@ -351,6 +351,17 @@ static int receive_control(const struct msghdr *host, void *guest_control,
         if (payload_length == 0 || payload_length % sizeof(int) != 0)
             return -EINVAL;
         descriptors = (int *)CMSG_DATA(header);
+        /* A received fd in the hidden range means the guest is out of
+           numbers: drop them all and report MSG_CTRUNC, as Linux does when
+           it cannot install a received fd. */
+        for (index = 0; index != payload_length / sizeof(int); ++index)
+            if (guest_fd_is_hidden(descriptors[index])) break;
+        if (index != payload_length / sizeof(int)) {
+            *linux_flags |= 0x0008u;
+            for (index = 0; index != payload_length / sizeof(int); ++index)
+                close(descriptors[index]);
+            continue;
+        }
         for (index = 0; index != payload_length / sizeof(int); ++index)
             guest_fd_received(descriptors[index]);
         if (close_on_exec)
@@ -495,7 +506,7 @@ static int32_t make_socket(uint32_t *arguments)
     int fd;
     if (domain < 0 || socket_type(arguments[1], &type, &status_flags,
             &descriptor_flags) != 0) return -EINVAL;
-    fd = socket(domain, type, (int)arguments[2]);
+    fd = guest_fd_admit(socket(domain, type, (int)arguments[2]));
     if (fd < 0) return -(int32_t)linux_errno_number(errno);
     guest_fd_clear(fd);
     widen_unix_receive_buffer(fd, domain, type);
@@ -537,8 +548,8 @@ static int32_t accept_socket(uint32_t *arguments, int with_flags)
     int converted;
     if (with_flags && socket_type(SOCK_STREAM | arguments[3], &ignored_type,
             &status_flags, &descriptor_flags) != 0) return -EINVAL;
-    fd = accept((int)arguments[0], arguments[1] == 0 ? 0 :
-        (struct sockaddr *)&address, arguments[1] == 0 ? 0 : &length);
+    fd = guest_fd_admit(accept((int)arguments[0], arguments[1] == 0 ? 0 :
+        (struct sockaddr *)&address, arguments[1] == 0 ? 0 : &length));
     if (fd < 0) return -(int32_t)linux_errno_number(errno);
     guest_fd_clear(fd);
     if (configure_socket(fd, status_flags, descriptor_flags) != 0) {
@@ -563,6 +574,11 @@ static int32_t socket_pair(uint32_t *arguments)
             &descriptor_flags) != 0) return -EINVAL;
     if (socketpair(domain, type, (int)arguments[2], descriptors) != 0)
         return -(int32_t)linux_errno_number(errno);
+    if (guest_fd_is_hidden(descriptors[0]) || guest_fd_is_hidden(descriptors[1])) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return -EMFILE;
+    }
     guest_fd_clear(descriptors[0]);
     guest_fd_clear(descriptors[1]);
     widen_unix_receive_buffer(descriptors[0], domain, type);

@@ -421,13 +421,17 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
                 "/dev/ptyp%u", index);
             if (length < 0 || (size_t)length >= sizeof(host_path))
                 return -ENAMETOOLONG;
-            fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
+            fd = guest_fd_admit(open(host_path, host_flags,
+                (mode_t)(mode & 07777u)));
             if (fd >= 0) {
                 if (guest_fd_record_path(fd, host_path) != 0)
                     guest_fd_clear(fd);
                 return fd;
             }
-            if (errno == ENOENT) break;
+            if (errno == ENOENT || errno == EMFILE) {
+                saved_errno = errno;
+                break;
+            }
             if (errno != EBUSY) saved_errno = errno;
         }
         return -(int32_t)linux_errno_number(saved_errno);
@@ -438,7 +442,7 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
                 (LINUX_O_CREAT | LINUX_O_EXCL), host_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
-    fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
+    fd = guest_fd_admit(open(host_path, host_flags, (mode_t)(mode & 07777u)));
     if (fd >= 0 && guest_fd_record_path(fd, host_path) != 0)
         guest_fd_clear(fd);
     return linux_host_result(fd);
@@ -699,10 +703,10 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     if ((command == 0 || command == 1030) &&
             (int)argument >= guest_fd_hidden_base()) return -EINVAL;
     switch (command) {
-    case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
+    case 0: result = guest_fd_admit(fcntl(fd, F_DUPFD, (int)argument)); break;
     case 1030:
-        result = fcntl(fd, F_DUPFD, (int)argument);
-        if (result >= 0 && fcntl(result, F_SETFD, FD_CLOEXEC) != 0) {
+        result = guest_fd_admit(fcntl(fd, F_DUPFD, (int)argument));
+        if (result >= 0 && fcntl(result, F_SETFD, FD_CLOEXEC) < 0) {
             int saved_errno = errno;
             close(result);
             errno = saved_errno;
@@ -779,6 +783,11 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
 
     if ((flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)) != 0) return -EINVAL;
     if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
+    if (guest_fd_is_hidden(descriptors[0]) || guest_fd_is_hidden(descriptors[1])) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return -EMFILE;
+    }
     if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
     if ((host_status_flags != 0 &&
             (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
@@ -909,6 +918,11 @@ static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
             "eventfd-form", args);
     }
     if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
+    if (guest_fd_is_hidden(descriptors[0])) {
+        close(descriptors[0]);
+        close(descriptors[1]);
+        return -EMFILE;
+    }
     if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
     if ((host_status_flags != 0 &&
             (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
@@ -1529,7 +1543,8 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     }
     case LINUX_NR_DUP:
-        result = linux_host_result(dup((int)context->uc_mcontext.cpu.gpr[0]));
+        result = linux_host_result(guest_fd_admit(
+            dup((int)context->uc_mcontext.cpu.gpr[0])));
         if (result >= 0) (void)guest_fd_duplicate(
             (int)context->uc_mcontext.cpu.gpr[0], result);
         break;

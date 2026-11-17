@@ -537,6 +537,16 @@ int guest_fd_is_hidden(int fd)
     return fd >= hidden_base;
 }
 
+int guest_fd_admit(int fd)
+{
+    if (fd >= 0 && guest_fd_is_hidden(fd)) {
+        close(fd);
+        errno = EMFILE;
+        return -1;
+    }
+    return fd;
+}
+
 int guest_fd_poll_target(int fd)
 {
     struct guest_fd_object *object = typed_object(fd);

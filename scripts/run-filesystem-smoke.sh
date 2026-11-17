@@ -99,6 +99,7 @@ run_fd_guest fd-path-records
 run_fd_guest wake-eventfd-dup
 run_fd_guest getdents-chunks
 run_fd_guest fd-close-all
+run_fd_guest fd-exhaust
 
 echo "linuxemu_filesystem_smoke_failures=$failures"
 test "$failures" -eq 0

@@ -114,6 +114,10 @@ void guest_fd_after_fork(void);
 int guest_fd_hidden_base(void);
 /* Numbers at or above the hidden base are not the guest's. */
 int guest_fd_is_hidden(int fd);
+/* A descriptor the host just created for the guest: one that landed in the
+   hidden range (the guest is out of numbers below its limit) is closed and
+   -1/EMFILE returned, as Linux returns EMFILE at RLIMIT_NOFILE. */
+int guest_fd_admit(int fd);
 /* The native fd QNX poll()/select() should watch for guest fd. */
 int guest_fd_poll_target(int fd);
 /* The guest's RLIMIT_NOFILE is virtual: it starts at the hidden base, a
