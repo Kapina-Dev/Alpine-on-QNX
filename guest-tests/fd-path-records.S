@@ -68,11 +68,41 @@ _start:
     cmp r0, #0
     bne fail_survive
 
+    /* fcntl64 F_SETFD and F_SETFL return exactly 0, not the previous
+       flags (QNX returns those): set each twice, check the second call. */
+    movw r0, #300
+    mov r1, #2
+    mov r2, #1
+    movw r7, #221
+    svc #0
+    movw r0, #300
+    mov r1, #2
+    mov r2, #1
+    movw r7, #221
+    svc #0
+    cmp r0, #0
+    bne fail_setfd
+    movw r0, #300
+    mov r1, #4
+    mov r2, #0x800
+    movw r7, #221
+    svc #0
+    movw r0, #300
+    mov r1, #4
+    mov r2, #0x800
+    movw r7, #221
+    svc #0
+    cmp r0, #0
+    bne fail_setfl
+
     movw r0, #300
     mov r7, #6
     svc #0
     mov r0, #0
     b exit_guest
+
+fail_setfd: mov r0, #136; b exit_guest
+fail_setfl: mov r0, #137; b exit_guest
 
 fail_open: mov r0, #130; b exit_guest
 fail_getdents: mov r0, #131; b exit_guest

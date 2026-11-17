@@ -692,8 +692,11 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
         }
         break;
     case 1: result = fcntl(fd, F_GETFD); break;
-    case 2: result = fcntl(fd, F_SETFD,
-        (argument & 1u) != 0 ? FD_CLOEXEC : 0); break;
+    case 2:
+        /* QNX returns the previous flags; Linux returns 0. */
+        result = fcntl(fd, F_SETFD, (argument & 1u) != 0 ? FD_CLOEXEC : 0);
+        if (result > 0) result = 0;
+        break;
     case 3:
         typed_status = guest_fd_dispatch_get_status(fd, &result);
         if (typed_status == 0) result = fcntl(fd, F_GETFL);
@@ -712,6 +715,7 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
         typed_status = guest_fd_dispatch_set_status(fd, current);
         result = typed_status == 0 ? fcntl(fd, F_SETFL, current) :
             typed_status > 0 ? 0 : -1;
+        if (result > 0) result = 0;
         break;
     }
     case 12:
@@ -859,7 +863,7 @@ static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
             (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
             fcntl(descriptors[1], F_SETFL, host_status_flags) != 0)) ||
         ((flags & LINUX_O_CLOEXEC) != 0 &&
-            fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0))
+            fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) < 0))
         goto fail_both;
     descriptors[1] = guest_fd_hide(descriptors[1]);
     if (descriptors[1] < 0) {

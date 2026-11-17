@@ -306,7 +306,7 @@ int guest_fd_hide(int fd)
 {
     int hidden = fcntl(fd, F_DUPFD, hidden_base);
     if (hidden < 0) return -1;
-    if (fcntl(hidden, F_SETFD, FD_CLOEXEC) != 0) {
+    if (fcntl(hidden, F_SETFD, FD_CLOEXEC) < 0) {
         int saved_errno = errno;
         close(hidden);
         errno = saved_errno;
