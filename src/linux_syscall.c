@@ -1,5 +1,6 @@
 #include "linuxemu.h"
 #include "linux_diagnostics.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -180,8 +181,6 @@
 #define LINUX_SIGCHLD 17u
 #define MAX_TRACKED_FDS 256
 
-static DIR *directory_streams[MAX_TRACKED_FDS];
-static char *fd_paths[MAX_TRACKED_FDS];
 static int eventfd_write_peers[MAX_TRACKED_FDS];
 
 static int is_wake_eventfd(int fd)
@@ -386,30 +385,16 @@ static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
     return linux_result(result);
 }
 
-static int directory_path(int directory_fd, const char *guest_path,
-    const char **host_directory)
-{
-    if ((guest_path != 0 && guest_path[0] == '/') ||
-        directory_fd == LINUX_AT_FDCWD) {
-        *host_directory = 0;
-        return 0;
-    }
-    if (directory_fd < 0 || directory_fd >= MAX_TRACKED_FDS ||
-        fd_paths[directory_fd] == 0) {
-        errno = EBADF;
-        return -1;
-    }
-    *host_directory = fd_paths[directory_fd];
-    return 0;
-}
-
 static int resolve_at(int directory_fd, const char *guest_path,
     int allow_missing_leaf, int nofollow, char *host_path, size_t host_path_size)
 {
-    const char *base;
-    if (directory_path(directory_fd, guest_path, &base) != 0) return -1;
-    if (base != 0) return guest_path_resolve_at(base, guest_path,
-        allow_missing_leaf, nofollow, host_path, host_path_size);
+    char base[PATH_MAX];
+    if ((guest_path == 0 || guest_path[0] != '/') &&
+            directory_fd != LINUX_AT_FDCWD) {
+        if (guest_fd_path(directory_fd, base, sizeof(base)) != 0) return -1;
+        return guest_path_resolve_at(base, guest_path,
+            allow_missing_leaf, nofollow, host_path, host_path_size);
+    }
     return nofollow ? guest_path_resolve_nofollow(guest_path, host_path,
         host_path_size) : guest_path_resolve(guest_path, allow_missing_leaf,
         host_path, host_path_size);
@@ -433,10 +418,7 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
                 return -ENAMETOOLONG;
             fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
             if (fd >= 0) {
-                if (fd < MAX_TRACKED_FDS) {
-                    free(fd_paths[fd]);
-                    fd_paths[fd] = strdup(host_path);
-                }
+                (void)guest_fd_record_path(fd, host_path);
                 return fd;
             }
             if (errno == ENOENT) break;
@@ -451,10 +433,7 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
     fd = open(host_path, host_flags, (mode_t)(mode & 07777u));
-    if (fd >= 0 && fd < MAX_TRACKED_FDS) {
-        free(fd_paths[fd]);
-        fd_paths[fd] = strdup(host_path);
-    }
+    if (fd >= 0) (void)guest_fd_record_path(fd, host_path);
     return linux_host_result(fd);
 }
 
@@ -657,14 +636,15 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
     size_t used = 0;
     DIR *directory;
     struct dirent *entry;
+    struct guest_fd_object *object = guest_fd_acquire(fd);
+    int saved_errno;
 
-    if (fd < 0 || fd >= MAX_TRACKED_FDS) return -EBADF;
-    directory = directory_streams[fd];
+    if (object == 0) return -EBADF;
+    directory = guest_fd_object_directory(object);
     if (directory == 0) {
-        if (fd_paths[fd] == 0) return -EBADF;
-        directory = opendir(fd_paths[fd]);
-        if (directory == 0) return -(int32_t)linux_errno_number(errno);
-        directory_streams[fd] = directory;
+        saved_errno = errno;
+        guest_fd_put(object);
+        return -(int32_t)linux_errno_number(saved_errno);
     }
     errno = 0;
     for (;;) {
@@ -689,34 +669,18 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
         used += record_length;
         errno = 0;
     }
-    if (used == 0 && errno != 0) return -(int32_t)linux_errno_number(errno);
+    saved_errno = errno;
+    guest_fd_put(object);
+    if (used == 0 && saved_errno != 0)
+        return -(int32_t)linux_errno_number(saved_errno);
     return (int32_t)used;
 }
 
 static int32_t linux_close_fd(int fd)
 {
-    if (fd >= 0 && fd < MAX_TRACKED_FDS && directory_streams[fd] != 0) {
-        closedir(directory_streams[fd]);
-        directory_streams[fd] = 0;
-    }
-    if (fd >= 0 && fd < MAX_TRACKED_FDS) {
-        release_wake_eventfd(fd);
-        free(fd_paths[fd]);
-        fd_paths[fd] = 0;
-    }
+    release_wake_eventfd(fd);
+    guest_fd_clear(fd);
     return linux_host_result(close(fd));
-}
-
-static void copy_fd_path(int source, int destination)
-{
-    if (destination < 0 || destination >= MAX_TRACKED_FDS) return;
-    if (directory_streams[destination] != 0) {
-        closedir(directory_streams[destination]);
-        directory_streams[destination] = 0;
-    }
-    free(fd_paths[destination]);
-    fd_paths[destination] = source >= 0 && source < MAX_TRACKED_FDS &&
-        fd_paths[source] != 0 ? strdup(fd_paths[source]) : 0;
 }
 
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
@@ -789,7 +753,7 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     default: return -EINVAL;
     }
     if ((command == 0 || command == 1030) && result >= 0)
-        copy_fd_path(fd, result);
+        (void)guest_fd_duplicate(fd, result);
     return linux_host_result(result);
 }
 
@@ -813,8 +777,8 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
         errno = saved_errno;
         return -(int32_t)linux_errno_number(errno);
     }
-    copy_fd_path(-1, descriptors[0]);
-    copy_fd_path(-1, descriptors[1]);
+    guest_fd_clear(descriptors[0]);
+    guest_fd_clear(descriptors[1]);
     memcpy(guest_descriptors, descriptors, sizeof(descriptors));
     return 0;
 }
@@ -852,7 +816,7 @@ static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
         return -(int32_t)linux_errno_number(errno);
     }
     eventfd_write_peers[descriptors[0]] = descriptors[1] + 1;
-    copy_fd_path(-1, descriptors[0]);
+    guest_fd_clear(descriptors[0]);
     return descriptors[0];
 }
 
@@ -1471,7 +1435,7 @@ void linux_syscall_dispatch(ucontext_t *context)
         else {
             result = linux_host_result(dup(
                 (int)context->uc_mcontext.cpu.gpr[0]));
-            if (result >= 0) copy_fd_path(
+            if (result >= 0) (void)guest_fd_duplicate(
                 (int)context->uc_mcontext.cpu.gpr[0], result);
         }
         break;
@@ -1496,7 +1460,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             }
             if (result >= 0 &&
                 (int)context->uc_mcontext.cpu.gpr[0] != result)
-                copy_fd_path((int)context->uc_mcontext.cpu.gpr[0], result);
+                (void)guest_fd_duplicate((int)context->uc_mcontext.cpu.gpr[0], result);
         }
         break;
     case LINUX_NR_ACCESS: {
@@ -1620,9 +1584,10 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     case LINUX_NR_FCHDIR: {
         int fd = (int)context->uc_mcontext.cpu.gpr[0];
-        if (fd < 0 || fd >= MAX_TRACKED_FDS || fd_paths[fd] == 0)
-            result = -EBADF;
-        else result = guest_path_fchdir(fd_paths[fd]) == 0 ? 0 :
+        char path[PATH_MAX];
+        if (guest_fd_path(fd, path, sizeof(path)) != 0)
+            result = -(int32_t)linux_errno_number(errno);
+        else result = guest_path_fchdir(path) == 0 ? 0 :
             -(int32_t)linux_errno_number(errno);
         break;
     }
@@ -1813,7 +1778,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
                 fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)
                 result = -(int32_t)linux_errno_number(errno);
-            if (result >= 0) copy_fd_path(source, destination);
+            if (result >= 0) (void)guest_fd_duplicate(source, destination);
         }
         break;
     }

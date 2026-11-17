@@ -136,6 +136,33 @@ static void hide_moves_above_base(void)
     close(hidden); close(p[0]);
 }
 
+static void path_record_shared_across_dup(void)
+{
+    char path[64];
+    int d, copy;
+    struct guest_fd_object *object;
+    d = open("/", O_RDONLY);
+    if (d < 0) { ++failures; return; }
+    CHECK("path_record_shared_across_dup", guest_fd_record_path(d, "/") == 0);
+    CHECK("path_record_shared_across_dup", !guest_fd_is_typed(d));
+    copy = dup(d);
+    guest_fd_duplicate(d, copy);
+    guest_fd_clear(d);
+    close(d);
+    CHECK("path_record_shared_across_dup",
+        guest_fd_path(copy, path, sizeof(path)) == 0 && strcmp(path, "/") == 0);
+    object = guest_fd_acquire(copy);
+    CHECK("path_record_shared_across_dup",
+        object != 0 && guest_fd_object_directory(object) != 0);
+    if (object != 0) guest_fd_put(object);
+    CHECK("path_record_shared_across_dup",
+        guest_fd_path(copy, path, 1) != 0);
+    guest_fd_clear(copy);
+    CHECK("path_record_shared_across_dup",
+        guest_fd_path(copy, path, sizeof(path)) != 0);
+    close(copy);
+}
+
 int main(void)
 {
     if (guest_fd_initialize() != 0) {
@@ -147,6 +174,7 @@ int main(void)
     identity_mismatch_drops_record();
     fd_above_256();
     hide_moves_above_base();
+    path_record_shared_across_dup();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;
 }

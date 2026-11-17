@@ -84,5 +84,18 @@ run_guest redirect 0 sh -c 'echo phase2_redirect_works > /tmp/linuxemu-phase2.tx
 run_guest redirected-cat 0 cat /tmp/linuxemu-phase2.txt
 require_line redirected-cat '^phase2_redirect_works$'
 
+run_fd_guest()
+{
+    name=$1
+    echo "=== filesystem guest: $name ==="
+    LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+        "$project_dir/build/guest-tests/$name"
+    status=$?
+    echo "$name exit=$status expected=0"
+    if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+}
+
+run_fd_guest fd-path-records
+
 echo "linuxemu_filesystem_smoke_failures=$failures"
 test "$failures" -eq 0

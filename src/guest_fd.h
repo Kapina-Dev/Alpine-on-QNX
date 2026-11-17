@@ -11,6 +11,7 @@
  * whose number was reused behind the table's back is detected and dropped.
  */
 
+#include <dirent.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -58,6 +59,15 @@ struct guest_fd_object *guest_fd_acquire(int fd);
 /* Lock-free hint: the number carries an object with its own I/O behaviour
    (any type except GUEST_FD_PATH).  Gates the slower dispatch paths. */
 int guest_fd_is_typed(int fd);
+
+/* Path records (GUEST_FD_PATH): the host path an fd was opened by, for
+   *at directory fds, fchdir and getdents. */
+int guest_fd_record_path(int fd, const char *host_path);
+/* 0, or -1 with errno EBADF (no record) or ENAMETOOLONG (buffer too small). */
+int guest_fd_path(int fd, char *host_path, size_t size);
+/* Lazily opened directory stream owned by a referenced GUEST_FD_PATH
+   object; valid while the caller holds that reference.  0 + errno. */
+DIR *guest_fd_object_directory(struct guest_fd_object *object);
 
 int guest_fd_initialize(void);
 void guest_fd_after_fork(void);

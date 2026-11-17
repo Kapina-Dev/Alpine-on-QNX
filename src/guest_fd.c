@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -149,6 +150,72 @@ struct guest_fd_object *guest_fd_acquire(int fd)
 int guest_fd_is_typed(int fd)
 {
     return valid_fd(fd) && typed[fd] != 0;
+}
+
+struct path_data {
+    char *path;
+    DIR *directory;
+};
+
+static void path_release(struct guest_fd_object *object)
+{
+    struct path_data *data = guest_fd_object_data(object);
+    if (data->directory != 0) closedir(data->directory);
+    free(data->path);
+}
+
+static const struct guest_fd_ops path_ops = {
+    0, 0, 0, 0, 0, path_release, 0
+};
+
+int guest_fd_record_path(int fd, const char *host_path)
+{
+    struct guest_fd_object *object;
+    struct path_data *data;
+    object = guest_fd_object_new(GUEST_FD_PATH, &path_ops, fd,
+        sizeof(struct path_data));
+    if (object == 0) return -1;
+    data = guest_fd_object_data(object);
+    data->path = strdup(host_path);
+    if (data->path == 0 || guest_fd_attach(fd, object) != 0) {
+        guest_fd_put(object);
+        return -1;
+    }
+    guest_fd_put(object);
+    return 0;
+}
+
+int guest_fd_path(int fd, char *host_path, size_t size)
+{
+    struct guest_fd_object *object = guest_fd_acquire(fd);
+    struct path_data *data;
+    size_t length;
+    int result = 0;
+    if (object == 0 || object->type != GUEST_FD_PATH) {
+        guest_fd_put(object);
+        errno = EBADF;
+        return -1;
+    }
+    data = guest_fd_object_data(object);
+    length = strlen(data->path);
+    if (length >= size) {
+        errno = ENAMETOOLONG;
+        result = -1;
+    } else memcpy(host_path, data->path, length + 1);
+    guest_fd_put(object);
+    return result;
+}
+
+DIR *guest_fd_object_directory(struct guest_fd_object *object)
+{
+    struct path_data *data;
+    if (object == 0 || object->type != GUEST_FD_PATH) {
+        errno = EBADF;
+        return 0;
+    }
+    data = guest_fd_object_data(object);
+    if (data->directory == 0) data->directory = opendir(data->path);
+    return data->directory;
 }
 
 int guest_fd_initialize(void)
