@@ -327,9 +327,19 @@ static int32_t linux_host_result(int result)
     return result < 0 ? -(int32_t)linux_errno_number(errno) : result;
 }
 
+/* QNX fork() duplicates the fd table through each descriptor's manager and
+   fails with EBADF when another thread closes a descriptor meanwhile; Linux
+   fork() never fails that way.  A failed fork creates no child, so retry.
+   Measured: about 1 in 3 attempts succeeds under continuous fd churn, so the
+   bound is only a guard against an fd that is genuinely broken. */
+#define FORK_EBADF_RETRIES 1000
+
 static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
 {
-    pid_t process = fork();
+    pid_t process;
+    int attempts = 0;
+    do process = fork();
+    while (process < 0 && errno == EBADF && ++attempts < FORK_EBADF_RETRIES);
     if (process < 0) return -(int32_t)linux_errno_number(errno);
     if (process == 0) {
         guest_thread_after_fork();

@@ -73,5 +73,24 @@ run_shell shebang-exec 0 "$guest_shebang"
 require_line shebang-exec '^phase6_shebang_ok$'
 run_shell shell-exit 37 'exit 37'
 
+# C guest fixtures that exec themselves run from inside the rootfs, so
+# their own path resolves after exec.
+run_rootfs_fixture()
+{
+    name=$1
+    fixture="$project_dir/guest-tests/fixtures/$name-armhf"
+    guest_copy=/tmp/linuxemu-fixture-$name
+    echo "=== process guest: $name ==="
+    cp "$fixture" "$alpine_root$guest_copy"
+    "$linuxemu" --linuxemu-exec "$alpine_root" / "$alpine_root$guest_copy" \
+        "$guest_copy"
+    status=$?
+    rm -f "$alpine_root$guest_copy"
+    echo "$name exit=$status expected=0"
+    if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+}
+
+run_rootfs_fixture fork-fd-churn
+
 echo "linuxemu_process_smoke_failures=$failures"
 test "$failures" -eq 0
