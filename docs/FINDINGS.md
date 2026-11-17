@@ -282,3 +282,19 @@ patching: 14/14 suites, `linuxemu_full_regression_failures=0`.
     `gettid`, `kill`, `wait4`, fork return values, `si_pid` and `/proc`.
   - Recorded as a Phase 6 requirement. Work returns to roadmap phase order
     (Phase 0 next).
+
+## 2026-11-17 — First structured diagnostics report (Passport, devuser)
+
+Phase 0A diagnostics (`LINUXEMU_DIAGNOSTICS=<file>`) now write one line per
+distinct unsupported call per process. `bionic-probe-armv7` (exit 134,
+SIGABRT from bionic's pid ≤ 65535 check) reports:
+
+```text
+linuxemu-unsupported exe=build/guest-tests/bionic-probe-armv7 pid=171241710 nr=172 name=prctl error=EINVAL count=3 detail=prctl-set-vma args=0x53564d41,0x00000000,0x103af000,0x00004000,0x00015428,0x00000000
+```
+
+So before the pid abort, bionic start-up needs nothing else that Linuxemu
+lacks. Its only unsupported call is naming anonymous mappings, which it
+tolerates. The report was written because the self-sent SIGABRT now
+flushes diagnostics first. A signal from another process still can't be
+intercepted.

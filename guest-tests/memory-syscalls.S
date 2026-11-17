@@ -93,7 +93,23 @@ _start:
     cmp r0, #0
     bne fail_munmap
 
+    /* Shared executable mappings are unsupported: the guest must see the
+       Linux EOPNOTSUPP (95), not QNX's value (103). */
     mov r0, #0
+    mov r1, #0x1000
+    mov r2, #5
+    mov r3, #0x21
+    mvn r4, #0
+    mov r5, #0
+    mov r7, #192
+    svc #0
+    cmn r0, #95
+    bne fail_shared_exec
+
+    mov r0, #0
+    b exit_guest
+fail_shared_exec:
+    mov r0, #60
     b exit_guest
 fail_noreserve:
     mov r0, #58

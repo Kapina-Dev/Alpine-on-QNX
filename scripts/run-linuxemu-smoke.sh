@@ -90,6 +90,19 @@ if [ "$status" -ne 0 ] || [ "$lines" != 3 ] || [ -z "$parent_pid" ] ||
     cat "$report" 2>/dev/null
 fi
 
+echo "=== diagnostics: diag-prctl ==="
+report="$diag_dir/prctl.txt"
+LINUXEMU_ROOT=/ LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/android-process-syscalls"
+status=$?
+lines=$(grep -c 'nr=172 name=prctl error=EINVAL ' "$report" 2>/dev/null)
+echo "diag-prctl exit=$status prctl_lines=${lines:-0}"
+if [ "$status" -ne 0 ] || [ "${lines:-0}" != 2 ] ||
+    ! grep -q 'count=1 detail=prctl-set-vma ' "$report" ||
+    ! grep -q 'count=1 detail=prctl-option ' "$report"; then
+    diag_fail diag-prctl "missing prctl records"
+fi
+
 echo "=== diagnostics: diag-fatal ==="
 report="$diag_dir/fatal.txt"
 LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
@@ -100,6 +113,18 @@ if [ "$status" -ne 125 ] ||
     ! grep -q 'nr=999 name=unknown error=ENOSYS count=1 ' "$report" \
         2>/dev/null; then
     diag_fail diag-fatal "no report from the fatal path"
+fi
+
+echo "=== diagnostics: diag-abort ==="
+report="$diag_dir/abort.txt"
+LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/diagnostics-abort"
+status=$?
+echo "diag-abort exit=$status expected=134"
+if [ "$status" -ne 134 ] ||
+    ! grep -q 'nr=999 name=unknown error=ENOSYS count=1 ' "$report" \
+        2>/dev/null; then
+    diag_fail diag-abort "no report before default-action SIGABRT"
 fi
 
 echo "=== diagnostics: diag-off ==="

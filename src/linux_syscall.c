@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #define LINUX_ENOSYS 38
+#define LINUX_EINVAL 22
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_NR_EXIT 1
 #define LINUX_NR_FORK 2
@@ -282,6 +283,15 @@ static size_t append_hex32(char *buffer, size_t position, uint32_t value)
     for (shift = 28; shift >= 0; shift -= 4)
         buffer[position++] = digits[(value >> shift) & 15u];
     return position;
+}
+
+/* Unsupported behaviour of an implemented syscall: report it for
+   LINUXEMU_DIAGNOSTICS and return the Linux error. */
+static int32_t linux_unsupported(uint32_t number, int32_t linux_error,
+    const char *detail, const uint32_t *args)
+{
+    linux_diag_record(number, linux_error, detail, args);
+    return -linux_error;
 }
 
 static void trace_call(uint32_t number, const ucontext_t *context)
@@ -564,7 +574,13 @@ static int32_t linux_utimensat(int directory_fd, const char *guest_path,
     if ((flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
         if (lstat(host_path, &status) != 0)
             return -(int32_t)linux_errno_number(errno);
-        if (S_ISLNK(status.st_mode)) return -LINUX_EOPNOTSUPP;
+        if (S_ISLNK(status.st_mode)) {
+            const uint32_t args[6] = { (uint32_t)directory_fd,
+                (uint32_t)(uintptr_t)guest_path,
+                (uint32_t)(uintptr_t)guest_times, flags, 0, 0 };
+            return linux_unsupported(LINUX_NR_UTIMENSAT, LINUX_EOPNOTSUPP,
+                "utimensat-symlink", args);
+        }
     } else if (stat(host_path, &status) != 0)
         return -(int32_t)linux_errno_number(errno);
     now = time(0);
@@ -706,8 +722,12 @@ static void copy_fd_path(int source, int destination)
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
 {
     int result;
-    if ((command == 0 || command == 1030) && is_wake_eventfd(fd))
-        return -LINUX_EOPNOTSUPP;
+    if ((command == 0 || command == 1030) && is_wake_eventfd(fd)) {
+        const uint32_t args[6] = { (uint32_t)fd, (uint32_t)command,
+            argument, 0, 0, 0 };
+        return linux_unsupported(LINUX_NR_FCNTL64, LINUX_EOPNOTSUPP,
+            "wake-eventfd", args);
+    }
     switch (command) {
     case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
     case 1030:
@@ -807,8 +827,11 @@ static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
     if ((flags & ~(LINUX_EFD_SEMAPHORE | LINUX_O_NONBLOCK |
             LINUX_O_CLOEXEC)) != 0) return -EINVAL;
     /* The pipe-backed form is the wake descriptor subset used by libcurl. */
-    if (initial_value != 0 || flags != (LINUX_O_NONBLOCK | LINUX_O_CLOEXEC))
-        return -LINUX_EOPNOTSUPP;
+    if (initial_value != 0 || flags != (LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)) {
+        const uint32_t args[6] = { initial_value, flags, 0, 0, 0, 0 };
+        return linux_unsupported(LINUX_NR_EVENTFD2, LINUX_EOPNOTSUPP,
+            "eventfd-form", args);
+    }
     if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
     if (descriptors[0] < 0 || descriptors[0] >= MAX_TRACKED_FDS) {
         close(descriptors[0]);
@@ -980,7 +1003,9 @@ static int32_t linux_mmap2(ucontext_t *context)
 
     if (translate_protection(context->uc_mcontext.cpu.gpr[2],
             &host_protection) != 0) return -EINVAL;
-    if ((linux_flags & ~LINUX_MAP_KNOWN) != 0) return -EINVAL;
+    if ((linux_flags & ~LINUX_MAP_KNOWN) != 0)
+        return linux_unsupported(LINUX_NR_MMAP2, LINUX_EINVAL, "mmap-flags",
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
     if ((linux_flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)) ==
             (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)) return -EINVAL;
     if ((linux_flags & LINUX_MAP_SHARED) != 0) host_flags |= MAP_SHARED;
@@ -1001,7 +1026,9 @@ static int32_t linux_mmap2(ucontext_t *context)
        on QNX it is MAP_NOINIT, which would hand out unzeroed pages. */
     if ((linux_flags & LINUX_MAP_NORESERVE) != 0) host_flags |= MAP_LAZY;
     if ((linux_flags & LINUX_MAP_SHARED) != 0 &&
-        (host_protection & PROT_EXEC) != 0) return -EOPNOTSUPP;
+        (host_protection & PROT_EXEC) != 0)
+        return linux_unsupported(LINUX_NR_MMAP2, LINUX_EOPNOTSUPP,
+            "mmap-shared-exec", (const uint32_t *)context->uc_mcontext.cpu.gpr);
     offset = (off_t)context->uc_mcontext.cpu.gpr[5] * 4096;
     host_descriptor = (int)context->uc_mcontext.cpu.gpr[4];
     copy_executable_file =
@@ -1227,8 +1254,11 @@ static int32_t linux_prctl(const uint32_t *arguments)
         memcpy((void *)(uintptr_t)arguments[1], name, sizeof(name));
         return 0;
     case LINUX_PR_SET_VMA:
+        return linux_unsupported(LINUX_NR_PRCTL, LINUX_EINVAL,
+            "prctl-set-vma", arguments);
     default:
-        return -EINVAL;
+        return linux_unsupported(LINUX_NR_PRCTL, LINUX_EINVAL,
+            "prctl-option", arguments);
     }
 }
 
@@ -1436,7 +1466,8 @@ void linux_syscall_dispatch(ucontext_t *context)
     }
     case LINUX_NR_DUP:
         if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = -LINUX_EOPNOTSUPP;
+            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
+                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
         else {
             result = linux_host_result(dup(
                 (int)context->uc_mcontext.cpu.gpr[0]));
@@ -1452,7 +1483,8 @@ void linux_syscall_dispatch(ucontext_t *context)
                 -(int32_t)linux_errno_number(errno) :
                 (int)context->uc_mcontext.cpu.gpr[0];
         else if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = -LINUX_EOPNOTSUPP;
+            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
+                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
         else {
             int source = (int)context->uc_mcontext.cpu.gpr[0];
             int destination = (int)context->uc_mcontext.cpu.gpr[1];
@@ -1771,7 +1803,8 @@ void linux_syscall_dispatch(ucontext_t *context)
         if (source == destination || (flags & ~LINUX_O_CLOEXEC) != 0)
             result = -EINVAL;
         else if (is_wake_eventfd(source))
-            result = -LINUX_EOPNOTSUPP;
+            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
+                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
         else if (fcntl(source, F_GETFD, 0) < 0)
             result = -(int32_t)linux_errno_number(errno);
         else {

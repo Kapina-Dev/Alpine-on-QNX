@@ -247,8 +247,8 @@ Release inputs and excluded development material are described in
 
 Set `LINUXEMU_DIAGNOSTICS=<file>` to record the unsupported Linux syscalls
 and unsupported behaviour a guest hits. Each guest process appends its own
-report when it exits, crashes, or calls `execve`, with one line per distinct
-call:
+report when it exits, crashes, calls `execve`, or sends itself a signal that
+will end it (as `abort()` does), with one line per distinct call:
 
 ```text
 linuxemu-unsupported exe=/bin/x pid=42 nr=999 name=unknown error=ENOSYS count=2 detail=- args=0x00000001,0x00000002,0x00000003,0x00000004,0x00000005,0x00000006
@@ -263,6 +263,9 @@ linuxemu-unsupported exe=/bin/x pid=42 nr=999 name=unknown error=ENOSYS count=2 
 After 64 distinct entries, further ones are counted in a
 `linuxemu-unsupported-overflow ... dropped=<n>` line. With the variable
 unset, nothing is written and behaviour is unchanged.
+
+A process killed by a signal from another process (for example `kill -9`)
+ends without writing its report.
 
 ## Current limits
 

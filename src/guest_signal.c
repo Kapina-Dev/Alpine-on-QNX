@@ -375,10 +375,38 @@ static void host_signal_handler(int host_signal, siginfo_t *information,
     guest_thread_signal_pending(linux_signal, information);
 }
 
+/* Linux signals whose default action does not end the process: SIGCHLD,
+   SIGCONT, SIGURG and SIGWINCH are ignored; SIGSTOP/TSTP/TTIN/TTOU stop. */
+static int default_action_terminates(int linux_signal)
+{
+    switch (linux_signal) {
+    case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 28:
+        return 0;
+    default:
+        return linux_signal > 0 && linux_signal <= LINUX_SIGNAL_COUNT;
+    }
+}
+
+/*
+ * A signal this process sends itself with the default action may be the
+ * last thing it does (abort() does exactly this), and the host kernel ends
+ * it without returning here, so write the diagnostics report first. A
+ * signal sent by another process cannot be intercepted this way.
+ */
+static void flush_before_self_signal(int linux_signal)
+{
+    if (default_action_terminates(linux_signal) &&
+        guest_actions[linux_signal].handler == 0)
+        linux_diag_flush();
+}
+
 int32_t guest_signal_send(pid_t process, int linux_signal)
 {
     int host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
     if (linux_signal != 0 && host_signal == 0) return -EINVAL;
+    if (process == 0 || process == -1 || process == getpid() ||
+        process == -getpgrp())
+        flush_before_self_signal(linux_signal);
     return kill(process, host_signal) == 0 ? 0 :
         -(int32_t)linux_errno_number(errno);
 }
@@ -390,6 +418,7 @@ int32_t guest_signal_send_thread(int32_t process, int32_t thread,
     if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
     host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
     if (linux_signal != 0 && host_signal == 0) return -EINVAL;
+    flush_before_self_signal(linux_signal);
     return guest_thread_kill(thread, host_signal);
 }
 
