@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -74,8 +75,13 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     if (count > 65536u) return -EINVAL;
     host = host_count == 0 ? 0 : calloc(host_count, sizeof(*host));
     if (host_count != 0 && host == 0) return -ENOMEM;
+    for (i = 0; i != count; ++i)
+        if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd)) timeout = 0;
     for (i = 0; i != count; ++i) {
-        host[i].fd = guest[i].fd;
+        /* Hidden numbers are not the guest's: QNX skips a negative fd and
+           the guest sees POLLNVAL, as Linux reports for a closed one. */
+        host[i].fd = guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd) ? -1 :
+            guest_fd_poll_target(guest[i].fd);
         host[i].events = poll_events_to_host(guest[i].events);
     }
     if (signal_wait_fd >= 0) {
@@ -91,8 +97,13 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
         errno = EINTR;
     }
     if (result >= 0)
-        for (i = 0; i != count; ++i)
+        for (i = 0; i != count; ++i) {
             guest[i].revents = poll_events_to_linux(host[i].revents);
+            if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd)) {
+                guest[i].revents = 0x20;
+                ++result;
+            }
+        }
     free(host);
     return result < 0 ? -(int32_t)linux_errno_number(errno) : result;
 }
@@ -131,6 +142,15 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
     int host_count = count;
     int result;
     if (count < 0 || count > FD_SETSIZE) return -EINVAL;
+    {
+        int fd;
+        for (fd = guest_fd_hidden_base(); fd < count; ++fd)
+            if ((guest_read != 0 && (guest_read[fd / 32] >> (fd % 32)) & 1u) ||
+                (guest_write != 0 && (guest_write[fd / 32] >> (fd % 32)) & 1u) ||
+                (guest_except != 0 &&
+                    (guest_except[fd / 32] >> (fd % 32)) & 1u))
+                return -EBADF;
+    }
     fdset_to_host(guest_read, count, &read_set);
     fdset_to_host(guest_write, count, &write_set);
     fdset_to_host(guest_except, count, &except_set);

@@ -31,6 +31,8 @@ static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct guest_fd_object *slots[GUEST_FD_SLOTS];
 static volatile unsigned char typed[GUEST_FD_SLOTS];
 static int hidden_base = HIDDEN_BASE_CAP;
+static uint64_t nofile_soft = HIDDEN_BASE_CAP;
+static uint64_t nofile_hard = HIDDEN_BASE_CAP;
 
 static int valid_fd(int fd)
 {
@@ -327,6 +329,13 @@ int guest_fd_exec_records(char *buffer, size_t size)
     carried_hidden_count = 0;
     if (size <= used) return -1;
     memcpy(buffer, RECORDS_PREFIX, used);
+    if (nofile_soft != (uint64_t)hidden_base ||
+            nofile_hard != (uint64_t)hidden_base) {
+        int written = snprintf(buffer + used, size - used, "limit:%llu:%llu;",
+            (unsigned long long)nofile_soft, (unsigned long long)nofile_hard);
+        if (written < 0 || (size_t)written >= size - used) return -1;
+        used += (size_t)written;
+    }
     for (fd = 0; fd != GUEST_FD_SLOTS && !failed; ++fd) {
         struct guest_fd_object *object = guest_fd_acquire(fd);
         char body[2 * PATH_MAX + 32];
@@ -396,6 +405,19 @@ static int hex_value(char c)
     return -1;
 }
 
+static int restore_limit(const char *record, size_t length)
+{
+    char text[64];
+    unsigned long long soft, hard;
+    char extra;
+    if (length >= sizeof(text)) return -1;
+    memcpy(text, record, length);
+    text[length] = '\0';
+    if (sscanf(text, "limit:%llu:%llu%c", &soft, &hard, &extra) != 2)
+        return -1;
+    return guest_fd_nofile_set(soft, hard);
+}
+
 static int restore_one(const char *record, size_t length)
 {
     char path[PATH_MAX];
@@ -446,7 +468,9 @@ int guest_fd_restore_records(const char *value)
     while (*value != '\0') {
         const char *end = strchr(value, ';');
         size_t length = end == 0 ? strlen(value) : (size_t)(end - value);
-        if (end != 0 && restore_one(value, length) == 0) ++restored;
+        if (end != 0 && (strncmp(value, "limit:", 6) == 0 ?
+                restore_limit(value, length) : restore_one(value, length)) == 0)
+            ++restored;
         if (end == 0) break;
         value = end + 1;
     }
@@ -471,6 +495,7 @@ int guest_fd_initialize(void)
         errno = EMFILE;
         return -1;
     }
+    nofile_soft = nofile_hard = (uint64_t)hidden_base;
     return 0;
 }
 
@@ -482,6 +507,37 @@ void guest_fd_after_fork(void)
 int guest_fd_hidden_base(void)
 {
     return hidden_base;
+}
+
+int guest_fd_is_hidden(int fd)
+{
+    return fd >= hidden_base;
+}
+
+int guest_fd_poll_target(int fd)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int target = fd;
+    if (object != 0 && object->ops->poll_fd != 0)
+        target = object->ops->poll_fd(object, fd);
+    guest_fd_put(object);
+    return target;
+}
+
+void guest_fd_nofile_get(uint64_t *soft, uint64_t *hard)
+{
+    *soft = nofile_soft;
+    *hard = nofile_hard;
+}
+
+int guest_fd_nofile_set(uint64_t soft, uint64_t hard)
+{
+    if (soft > hard) { errno = EINVAL; return -1; }
+    if (hard > (uint64_t)hidden_base) hard = (uint64_t)hidden_base;
+    if (soft > hard) soft = hard;
+    nofile_soft = soft;
+    nofile_hard = hard;
+    return 0;
 }
 
 int guest_fd_hide(int fd)

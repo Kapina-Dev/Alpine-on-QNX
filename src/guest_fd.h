@@ -111,6 +111,15 @@ void guest_fd_after_fork(void);
 
 /* Emulator-owned fds live at or above the hidden base. */
 int guest_fd_hidden_base(void);
+/* Numbers at or above the hidden base are not the guest's. */
+int guest_fd_is_hidden(int fd);
+/* The native fd QNX poll()/select() should watch for guest fd. */
+int guest_fd_poll_target(int fd);
+/* The guest's RLIMIT_NOFILE is virtual: it starts at the hidden base, a
+   raise is clamped to the base, and the host limit is never changed.  A
+   lowered limit is stored and reported but not enforced. */
+void guest_fd_nofile_get(uint64_t *soft, uint64_t *hard);
+int guest_fd_nofile_set(uint64_t soft, uint64_t hard);
 /* Moves an emulator-owned fd to >= the hidden base with close-on-exec set;
    returns the new number and closes the old one, or -1 (errno set). */
 int guest_fd_hide(int fd);

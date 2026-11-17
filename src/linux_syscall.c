@@ -236,6 +236,19 @@ static int32_t linux_prlimit64(int32_t process, uint32_t resource,
     int host_resource = linux_resource_number(resource);
     if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
     if (host_resource < 0) return -EINVAL;
+    if (host_resource == RLIMIT_NOFILE) {
+        uint64_t soft, hard;
+        guest_fd_nofile_get(&soft, &hard);
+        if (guest_new_limit != 0 &&
+                guest_fd_nofile_set(guest_new_limit->current,
+                    guest_new_limit->maximum) != 0)
+            return -(int32_t)linux_errno_number(errno);
+        if (guest_old_limit != 0) {
+            guest_old_limit->current = soft;
+            guest_old_limit->maximum = hard;
+        }
+        return 0;
+    }
     if (getrlimit(host_resource, &host_limit) != 0)
         return -(int32_t)linux_errno_number(errno);
     if (guest_old_limit != 0) {
@@ -673,6 +686,7 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
 
 static int32_t linux_close_fd(int fd)
 {
+    if (guest_fd_is_hidden(fd)) return -EBADF;
     guest_fd_clear(fd);
     return linux_host_result(close(fd));
 }
@@ -681,6 +695,9 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
 {
     int result;
     int typed_status;
+    if (guest_fd_is_hidden(fd)) return -EBADF;
+    if ((command == 0 || command == 1030) &&
+            (int)argument >= guest_fd_hidden_base()) return -EINVAL;
     switch (command) {
     case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
     case 1030:
@@ -1523,6 +1540,9 @@ void linux_syscall_dispatch(ucontext_t *context)
                 (int)context->uc_mcontext.cpu.gpr[0], F_GETFD, 0)) < 0 ?
                 -(int32_t)linux_errno_number(errno) :
                 (int)context->uc_mcontext.cpu.gpr[0];
+        else if (guest_fd_is_hidden((int)context->uc_mcontext.cpu.gpr[0]) ||
+                guest_fd_is_hidden((int)context->uc_mcontext.cpu.gpr[1]))
+            result = -EBADF;
         else {
             int source = (int)context->uc_mcontext.cpu.gpr[0];
             int destination = (int)context->uc_mcontext.cpu.gpr[1];
@@ -1838,6 +1858,8 @@ void linux_syscall_dispatch(ucontext_t *context)
         uint32_t flags = context->uc_mcontext.cpu.gpr[2];
         if (source == destination || (flags & ~LINUX_O_CLOEXEC) != 0)
             result = -EINVAL;
+        else if (guest_fd_is_hidden(source) || guest_fd_is_hidden(destination))
+            result = -EBADF;
         else if (fcntl(source, F_GETFD, 0) < 0)
             result = -(int32_t)linux_errno_number(errno);
         else {

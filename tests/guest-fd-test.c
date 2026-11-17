@@ -293,6 +293,41 @@ static void exec_records_alias_shares_object(void)
     close(d); close(copy);
 }
 
+static void nofile_virtual_limit(void)
+{
+    uint64_t soft, hard, base = (uint64_t)guest_fd_hidden_base();
+    guest_fd_nofile_get(&soft, &hard);
+    CHECK("nofile_virtual_limit", soft == base && hard == base);
+    CHECK("nofile_virtual_limit", guest_fd_nofile_set(base + 100, base + 100) == 0);
+    guest_fd_nofile_get(&soft, &hard);
+    CHECK("nofile_virtual_limit", soft == base && hard == base);
+    CHECK("nofile_virtual_limit", guest_fd_nofile_set(10, 20) == 0);
+    guest_fd_nofile_get(&soft, &hard);
+    CHECK("nofile_virtual_limit", soft == 10 && hard == 20);
+    CHECK("nofile_virtual_limit", guest_fd_nofile_set(30, 20) != 0);
+    CHECK("nofile_virtual_limit", guest_fd_is_hidden((int)base) &&
+        !guest_fd_is_hidden((int)base - 1));
+    guest_fd_nofile_set(base, base);
+}
+
+static void exec_records_carry_limit(void)
+{
+    char records[256];
+    uint64_t soft, hard, base = (uint64_t)guest_fd_hidden_base();
+    guest_fd_nofile_set(50, 60);
+    CHECK("exec_records_carry_limit",
+        guest_fd_exec_records(records, sizeof(records)) > 0 &&
+        strstr(records, "limit:50:60;") != 0);
+    guest_fd_nofile_set(base, base);
+    CHECK("exec_records_carry_limit",
+        guest_fd_restore_records("limit:50:60;") == 1);
+    guest_fd_nofile_get(&soft, &hard);
+    CHECK("exec_records_carry_limit", soft == 50 && hard == 60);
+    CHECK("exec_records_carry_limit",
+        guest_fd_restore_records("limit:x:1;limit:5;limit:1:2:3;") == 0);
+    guest_fd_nofile_set(base, base);
+}
+
 static void exec_records_reject_malformed(void)
 {
     static char huge[100001];
@@ -322,6 +357,8 @@ int main(void)
     exec_records_round_trip();
     exec_records_alias_shares_object();
     exec_records_reject_malformed();
+    nofile_virtual_limit();
+    exec_records_carry_limit();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;
 }
