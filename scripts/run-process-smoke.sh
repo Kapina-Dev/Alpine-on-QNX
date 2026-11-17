@@ -91,6 +91,7 @@ run_rootfs_fixture()
 }
 
 run_rootfs_fixture fork-fd-churn
+run_rootfs_fixture fd-exec-carry
 
 echo "linuxemu_process_smoke_failures=$failures"
 test "$failures" -eq 0

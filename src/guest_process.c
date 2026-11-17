@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,7 +14,9 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 6];
+static char *host_environment[MAX_EXEC_VECTOR + 7];
+/* Fd records carried into the new image (guest_fd_exec_records). */
+static char fd_records_variable[32768];
 static char personality_variable[48];
 static char comm_variable[48];
 static char diagnostics_variable[PATH_MAX + 32];
@@ -32,7 +35,8 @@ static int hidden_environment(const char *value)
 {
     return strncmp(value, "LINUXEMU_ROOT=", 14) == 0 ||
         strncmp(value, "LINUXEMU_GUEST_", 15) == 0 ||
-        strncmp(value, "LD_LIBRARY_PATH=", 16) == 0;
+        strncmp(value, "LD_LIBRARY_PATH=", 16) == 0 ||
+        strncmp(value, "LINUXEMU_FD_RECORDS=", 20) == 0;
 }
 
 int guest_process_initialize(const char *emulator)
@@ -204,6 +208,11 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     snprintf(executable_variable, sizeof(executable_variable),
         "LINUXEMU_GUEST_EXE=%s", guest_executable);
     host_environment[environment_count++] = executable_variable;
+    /* Records that do not fit are dropped: the fds still survive exec,
+       they just start native in the new image. */
+    if (guest_fd_exec_records(fd_records_variable,
+            sizeof(fd_records_variable)) > 0)
+        host_environment[environment_count++] = fd_records_variable;
     host_environment[environment_count] = 0;
 
     host_arguments[0] = emulator_path;
@@ -230,6 +239,7 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     sigaddset(&trap_signals, SIGSEGV);
     if (sigprocmask(SIG_UNBLOCK, &trap_signals, &old_mask) != 0) return -1;
     linux_diag_flush();
+    (void)guest_fd_exec_prepare();
     execve(emulator_path, host_arguments, host_environment);
     {
         int saved_errno = errno;

@@ -664,6 +664,7 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
         errno = 0;
     }
     saved_errno = errno;
+    guest_fd_object_directory_done(object, directory);
     guest_fd_put(object);
     if (used == 0 && saved_errno != 0)
         return -(int32_t)linux_errno_number(saved_errno);
@@ -836,10 +837,43 @@ static void wake_eventfd_release(struct guest_fd_object *object)
     close(data->write_fd);
 }
 
+static int wake_eventfd_serialize(struct guest_fd_object *object, int fd,
+    char *buffer, size_t size)
+{
+    struct wake_eventfd *data = guest_fd_object_data(object);
+    int length = snprintf(buffer, size, "%d:", data->write_fd);
+    (void)fd;
+    return length < 0 || (size_t)length >= size ? -1 : length;
+}
+
 static const struct guest_fd_ops wake_eventfd_ops = {
     wake_eventfd_read, wake_eventfd_write, wake_eventfd_poll_fd,
-    wake_eventfd_get_status, wake_eventfd_set_status, wake_eventfd_release, 0
+    wake_eventfd_get_status, wake_eventfd_set_status, wake_eventfd_release,
+    wake_eventfd_serialize
 };
+
+static int wake_eventfd_restore(int fd, int hidden_fd, const char *host_path)
+{
+    struct guest_fd_object *object;
+    (void)host_path;
+    if (hidden_fd < 0) return -1;
+    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &wake_eventfd_ops,
+        fd, sizeof(struct wake_eventfd));
+    if (object == 0) return -1;
+    ((struct wake_eventfd *)guest_fd_object_data(object))->write_fd =
+        hidden_fd;
+    if (guest_fd_attach(fd, object) != 0) {
+        guest_fd_put(object);
+        return -1;
+    }
+    guest_fd_put(object);
+    return 0;
+}
+
+void linux_syscall_register_fd_types(void)
+{
+    guest_fd_register_restore(GUEST_FD_WAKE_EVENTFD, wake_eventfd_restore);
+}
 
 static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
 {

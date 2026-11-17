@@ -152,9 +152,12 @@ static void path_record_shared_across_dup(void)
     CHECK("path_record_shared_across_dup",
         guest_fd_path(copy, path, sizeof(path)) == 0 && strcmp(path, "/") == 0);
     object = guest_fd_acquire(copy);
-    CHECK("path_record_shared_across_dup",
-        object != 0 && guest_fd_object_directory(object) != 0);
-    if (object != 0) guest_fd_put(object);
+    if (object != 0) {
+        DIR *directory = guest_fd_object_directory(object);
+        CHECK("path_record_shared_across_dup", directory != 0);
+        if (directory != 0) guest_fd_object_directory_done(object, directory);
+        guest_fd_put(object);
+    } else CHECK("path_record_shared_across_dup", object != 0);
     CHECK("path_record_shared_across_dup",
         guest_fd_path(copy, path, 1) != 0);
     guest_fd_clear(copy);
@@ -184,6 +187,125 @@ static void stale_slot_cleared_on_create(void)
     close(n); close(p[1]); close(q[1]);
 }
 
+/* A typed test object that carries a hidden fd across exec. */
+struct carried { int hidden; };
+static int restored_hidden;
+
+static void carried_release(struct guest_fd_object *object)
+{
+    struct carried *data = guest_fd_object_data(object);
+    close(data->hidden);
+}
+
+static int carried_serialize(struct guest_fd_object *object, int fd,
+    char *buffer, size_t size)
+{
+    struct carried *data = guest_fd_object_data(object);
+    (void)fd;
+    return snprintf(buffer, size, "%d:", data->hidden);
+}
+
+static const struct guest_fd_ops carried_ops = {
+    0, 0, 0, 0, 0, carried_release, carried_serialize
+};
+
+static int carried_restore(int fd, int hidden_fd, const char *host_path)
+{
+    struct guest_fd_object *object;
+    (void)host_path;
+    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &carried_ops, fd,
+        sizeof(struct carried));
+    if (object == 0) return -1;
+    ((struct carried *)guest_fd_object_data(object))->hidden = hidden_fd;
+    restored_hidden = hidden_fd;
+    guest_fd_attach(fd, object);
+    guest_fd_put(object);
+    return 0;
+}
+
+static void exec_records_round_trip(void)
+{
+    char records[512], path[64];
+    int d, p[2], hidden, flags;
+    struct guest_fd_object *object, *found;
+    d = open("/", O_RDONLY);
+    if (d < 0 || pipe(p) != 0) { ++failures; return; }
+    guest_fd_register_restore(GUEST_FD_WAKE_EVENTFD, carried_restore);
+    guest_fd_record_path(d, "/");
+    hidden = guest_fd_hide(p[1]);
+    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &carried_ops, p[0],
+        sizeof(struct carried));
+    ((struct carried *)guest_fd_object_data(object))->hidden = hidden;
+    guest_fd_attach(p[0], object);
+    guest_fd_put(object);
+    CHECK("exec_records_round_trip",
+        guest_fd_exec_records(records, sizeof(records)) > 0);
+    CHECK("exec_records_round_trip",
+        strncmp(records, "LINUXEMU_FD_RECORDS=", 20) == 0);
+    CHECK("exec_records_round_trip", guest_fd_exec_prepare() == 0);
+    flags = fcntl(hidden, F_GETFD);
+    CHECK("exec_records_round_trip", flags >= 0 && (flags & FD_CLOEXEC) == 0);
+    /* Simulate the new image: the table is empty and the guest fds are
+       still open.  Clearing released the old object, which closed its
+       hidden fd, so stand up a fresh inherited one. */
+    guest_fd_clear(d);
+    guest_fd_clear(p[0]);
+    hidden = guest_fd_hide(dup(p[0]));
+    snprintf(records, sizeof(records), "%d:%d:-1:2f;%d:%d:%d:;", d,
+        (int)GUEST_FD_PATH, p[0], (int)GUEST_FD_WAKE_EVENTFD, hidden);
+    CHECK("exec_records_round_trip", guest_fd_restore_records(records) == 2);
+    CHECK("exec_records_round_trip",
+        guest_fd_path(d, path, sizeof(path)) == 0 && strcmp(path, "/") == 0);
+    found = guest_fd_acquire(p[0]);
+    CHECK("exec_records_round_trip", found != 0 &&
+        guest_fd_object_type(found) == GUEST_FD_WAKE_EVENTFD);
+    if (found != 0) guest_fd_put(found);
+    CHECK("exec_records_round_trip", restored_hidden == hidden);
+    flags = fcntl(hidden, F_GETFD);
+    CHECK("exec_records_round_trip", flags >= 0 && (flags & FD_CLOEXEC) != 0);
+    guest_fd_clear(d);
+    guest_fd_clear(p[0]);
+    close(d); close(p[0]);
+}
+
+static void exec_records_alias_shares_object(void)
+{
+    char records[512];
+    int d, copy;
+    struct guest_fd_object *a, *b;
+    d = open("/", O_RDONLY);
+    if (d < 0) { ++failures; return; }
+    copy = dup(d);
+    guest_fd_record_path(d, "/");
+    guest_fd_duplicate(d, copy);
+    CHECK("exec_records_alias_shares_object",
+        guest_fd_exec_records(records, sizeof(records)) > 0);
+    guest_fd_clear(d);
+    guest_fd_clear(copy);
+    CHECK("exec_records_alias_shares_object",
+        guest_fd_restore_records(records + 20) == 2);
+    a = guest_fd_acquire(d);
+    b = guest_fd_acquire(copy);
+    CHECK("exec_records_alias_shares_object", a != 0 && a == b);
+    if (a != 0) guest_fd_put(a);
+    if (b != 0) guest_fd_put(b);
+    guest_fd_clear(d); guest_fd_clear(copy);
+    close(d); close(copy);
+}
+
+static void exec_records_reject_malformed(void)
+{
+    static char huge[100001];
+    const char *bad[] = { "5:2:x:;", "5:99:-1:;", "5:1:-1:zz;", "7",
+        "-3:1:-1:2f;", "5:1:-1:2;", "999999:1:-1:2f;", huge };
+    size_t i;
+    memset(huge, '9', sizeof(huge) - 1);
+    for (i = 0; i != sizeof(bad) / sizeof(bad[0]); ++i)
+        CHECK("exec_records_reject_malformed",
+            guest_fd_restore_records(bad[i]) == 0);
+    CHECK("exec_records_reject_malformed", guest_fd_restore_records(0) == 0);
+}
+
 int main(void)
 {
     if (guest_fd_initialize() != 0) {
@@ -197,6 +319,9 @@ int main(void)
     hide_moves_above_base();
     path_record_shared_across_dup();
     stale_slot_cleared_on_create();
+    exec_records_round_trip();
+    exec_records_alias_shares_object();
+    exec_records_reject_malformed();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;
 }

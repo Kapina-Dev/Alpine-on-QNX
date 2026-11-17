@@ -1,6 +1,8 @@
 #include "guest_fd.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -157,20 +159,41 @@ int guest_fd_is_typed(int fd)
     return valid_fd(fd) && typed[fd] != 0;
 }
 
+/* No directory stream is kept open between getdents calls: the saved
+   position resumes a fresh stream, so no emulator-owned fd is left at a
+   guest-visible number. */
 struct path_data {
     char *path;
-    DIR *directory;
+    long position;
+    int positioned;
 };
 
 static void path_release(struct guest_fd_object *object)
 {
     struct path_data *data = guest_fd_object_data(object);
-    if (data->directory != 0) closedir(data->directory);
     free(data->path);
 }
 
+static int path_serialize(struct guest_fd_object *object, int fd,
+    char *buffer, size_t size)
+{
+    static const char digits[] = "0123456789abcdef";
+    struct path_data *data = guest_fd_object_data(object);
+    size_t length = strlen(data->path), i;
+    (void)fd;
+    if (size < 3 + 2 * length + 1) return -1;
+    memcpy(buffer, "-1:", 3);
+    for (i = 0; i != length; ++i) {
+        unsigned char byte = (unsigned char)data->path[i];
+        buffer[3 + 2 * i] = digits[byte >> 4];
+        buffer[3 + 2 * i + 1] = digits[byte & 15];
+    }
+    buffer[3 + 2 * length] = '\0';
+    return (int)(3 + 2 * length);
+}
+
 static const struct guest_fd_ops path_ops = {
-    0, 0, 0, 0, 0, path_release, 0
+    0, 0, 0, 0, 0, path_release, path_serialize
 };
 
 int guest_fd_record_path(int fd, const char *host_path)
@@ -214,13 +237,24 @@ int guest_fd_path(int fd, char *host_path, size_t size)
 DIR *guest_fd_object_directory(struct guest_fd_object *object)
 {
     struct path_data *data;
+    DIR *directory;
     if (object == 0 || object->type != GUEST_FD_PATH) {
         errno = EBADF;
         return 0;
     }
     data = guest_fd_object_data(object);
-    if (data->directory == 0) data->directory = opendir(data->path);
-    return data->directory;
+    directory = opendir(data->path);
+    if (directory != 0 && data->positioned) seekdir(directory, data->position);
+    return directory;
+}
+
+void guest_fd_object_directory_done(struct guest_fd_object *object,
+    DIR *directory)
+{
+    struct path_data *data = guest_fd_object_data(object);
+    data->position = telldir(directory);
+    data->positioned = 1;
+    closedir(directory);
 }
 
 static struct guest_fd_object *typed_object(int fd)
@@ -269,6 +303,154 @@ int guest_fd_dispatch_set_status(int fd, int host_flags)
             1 : -1;
     guest_fd_put(object);
     return handled;
+}
+
+#define RECORDS_PREFIX "LINUXEMU_FD_RECORDS="
+
+static guest_fd_restore_fn restore_functions[GUEST_FD_BINDER + 1];
+static int carried_hidden[GUEST_FD_SLOTS];
+static int carried_hidden_count;
+
+void guest_fd_register_restore(enum guest_fd_type type,
+    guest_fd_restore_fn restore)
+{
+    if ((int)type > 0 && type <= GUEST_FD_BINDER)
+        restore_functions[type] = restore;
+}
+
+int guest_fd_exec_records(char *buffer, size_t size)
+{
+    static struct guest_fd_object *seen[GUEST_FD_SLOTS];
+    static int seen_fd[GUEST_FD_SLOTS];
+    int seen_count = 0, fd, i, failed = 0;
+    size_t used = sizeof(RECORDS_PREFIX) - 1;
+    carried_hidden_count = 0;
+    if (size <= used) return -1;
+    memcpy(buffer, RECORDS_PREFIX, used);
+    for (fd = 0; fd != GUEST_FD_SLOTS && !failed; ++fd) {
+        struct guest_fd_object *object = guest_fd_acquire(fd);
+        char body[2 * PATH_MAX + 32];
+        int flags, written, length = -1;
+        if (object == 0) continue;
+        flags = fcntl(fd, F_GETFD);
+        if (flags < 0 || (flags & FD_CLOEXEC) != 0 ||
+                object->ops->serialize == 0) {
+            guest_fd_put(object);
+            continue;
+        }
+        for (i = 0; i != seen_count; ++i)
+            if (seen[i] == object) break;
+        if (i != seen_count)
+            written = snprintf(buffer + used, size - used, "%d:0:%d:;", fd,
+                seen_fd[i]);
+        else {
+            length = object->ops->serialize(object, fd, body, sizeof(body));
+            written = length < 0 ? -1 : snprintf(buffer + used, size - used,
+                "%d:%d:%s;", fd, (int)object->type, body);
+        }
+        if (written < 0 || (size_t)written >= size - used) failed = 1;
+        else {
+            used += (size_t)written;
+            if (i == seen_count) {
+                long hidden = strtol(body, 0, 10);
+                seen[seen_count] = object;
+                seen_fd[seen_count++] = fd;
+                if (hidden >= 0)
+                    carried_hidden[carried_hidden_count++] = (int)hidden;
+            }
+        }
+        guest_fd_put(object);
+    }
+    if (failed) { carried_hidden_count = 0; return -1; }
+    if (used == sizeof(RECORDS_PREFIX) - 1) { buffer[0] = '\0'; return 0; }
+    return (int)used;
+}
+
+int guest_fd_exec_prepare(void)
+{
+    int i, result = 0;
+    for (i = 0; i != carried_hidden_count; ++i) {
+        int flags = fcntl(carried_hidden[i], F_GETFD);
+        if (flags < 0 || fcntl(carried_hidden[i], F_SETFD,
+                flags & ~FD_CLOEXEC) < 0) result = -1;
+    }
+    return result;
+}
+
+static int parse_number(const char **cursor, long minimum, long maximum,
+    long *value)
+{
+    char *end;
+    errno = 0;
+    *value = strtol(*cursor, &end, 10);
+    if (end == *cursor || *end != ':' || errno != 0 ||
+            *value < minimum || *value > maximum) return -1;
+    *cursor = end + 1;
+    return 0;
+}
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static int restore_one(const char *record, size_t length)
+{
+    char path[PATH_MAX];
+    const char *cursor = record, *hex;
+    long fd, type, hidden;
+    size_t hex_length, i;
+    if (parse_number(&cursor, 0, hidden_base - 1, &fd) != 0 ||
+            parse_number(&cursor, 0, GUEST_FD_BINDER, &type) != 0 ||
+            parse_number(&cursor, -1, INT_MAX, &hidden) != 0) return -1;
+    hex = cursor;
+    hex_length = length - (size_t)(hex - record);
+    if (hex_length % 2 != 0 || hex_length / 2 >= sizeof(path)) return -1;
+    for (i = 0; i != hex_length / 2; ++i) {
+        int high = hex_value(hex[2 * i]), low = hex_value(hex[2 * i + 1]);
+        if (high < 0 || low < 0) return -1;
+        path[i] = (char)(high * 16 + low);
+    }
+    path[hex_length / 2] = '\0';
+    if (fcntl((int)fd, F_GETFD) < 0) return -1;
+    if (type == 0) {
+        struct guest_fd_object *source;
+        if (hidden < 0 || hidden >= GUEST_FD_SLOTS || hex_length != 0)
+            return -1;
+        source = guest_fd_acquire((int)hidden);
+        if (source == 0) return -1;
+        guest_fd_put(source);
+        return guest_fd_duplicate((int)hidden, (int)fd);
+    }
+    if (hidden >= 0 && fcntl((int)hidden, F_GETFD) < 0) return -1;
+    if (type == GUEST_FD_PATH) {
+        if (hex_length == 0 || hidden != -1) return -1;
+        return guest_fd_record_path((int)fd, path);
+    }
+    if (restore_functions[type] == 0 ||
+            restore_functions[type]((int)fd, (int)hidden, path) != 0)
+        return -1;
+    if (hidden >= 0) {
+        int flags = fcntl((int)hidden, F_GETFD);
+        if (flags >= 0) fcntl((int)hidden, F_SETFD, flags | FD_CLOEXEC);
+    }
+    return 0;
+}
+
+int guest_fd_restore_records(const char *value)
+{
+    int restored = 0;
+    if (value == 0) return 0;
+    while (*value != '\0') {
+        const char *end = strchr(value, ';');
+        size_t length = end == 0 ? strlen(value) : (size_t)(end - value);
+        if (end != 0 && restore_one(value, length) == 0) ++restored;
+        if (end == 0) break;
+        value = end + 1;
+    }
+    return restored;
 }
 
 int guest_fd_initialize(void)

@@ -186,6 +186,9 @@ uintptr_t create_guest_stack(int guest_argc, char **guest_argv,
 void linuxemu_enter_guest(uintptr_t entry, uintptr_t stack_pointer);
 
 void linux_syscall_dispatch(ucontext_t *context);
+/* Registers the exec-restore functions of the fd types linux_syscall.c
+   owns.  Call before guest_fd_restore_records. */
+void linux_syscall_register_fd_types(void);
 int install_guest_traps(void);
 
 #endif
