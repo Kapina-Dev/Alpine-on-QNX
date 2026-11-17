@@ -415,15 +415,17 @@ static void diagnostics_terminate_handler(int host_signal)
     struct sigaction default_action;
     sigset_t unblock;
 
-    linux_diag_flush();
+    /* Only async-signal-safe calls here: the signal may interrupt libc
+       holding a lock (a fork child setting up its exec, for example). */
+    linux_diag_flush_final();
     memset(&default_action, 0, sizeof(default_action));
     default_action.sa_handler = SIG_DFL;
     sigemptyset(&default_action.sa_mask);
     sigaction(host_signal, &default_action, 0);
     sigemptyset(&unblock);
     sigaddset(&unblock, host_signal);
-    pthread_sigmask(SIG_UNBLOCK, &unblock, 0);
-    pthread_kill(pthread_self(), host_signal);
+    sigprocmask(SIG_UNBLOCK, &unblock, 0);
+    kill(getpid(), host_signal);
 }
 
 /* SIGILL and SIGSEGV belong to the trap handler; KILL and STOP can't be

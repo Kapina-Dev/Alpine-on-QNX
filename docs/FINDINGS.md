@@ -299,3 +299,52 @@ tolerates. The report was written because the self-sent SIGABRT now
 flushes diagnostics first. After the final review, kernel and external
 signals (SIGPIPE, SIGALRM, SIGTERM, ...) also write the report before the
 process ends; only SIGKILL doesn't.
+
+## 2026-11-17 — First application-corpus baseline (Passport, devuser)
+
+`sh scripts/run-corpus.sh` scored all 11 roadmap apps (full results in
+`docs/corpus-results.md`): **6 of 11 compatible** across all five stages,
+and **7 of 11** after the deadlock fix below.
+- **Compatible:** BusyBox (see below), apk, Python, Git, SQLite, Vim and
+  GCC/make.
+- **nginx and Redis** fail at basic because `epoll_create`/`epoll_create1`
+  return ENOSYS (Phase 3).
+- **inotify-tools** fails at basic because `inotify_init` returns ENOSYS
+  (Phase 3).
+- **Node.js** aborts at startup:
+  - `node::ResetSignalHandlers` asserts that `sigaction(n, NULL, &old)`
+    succeeds for every signal 1–64, as on Linux;
+  - Linuxemu returns EINVAL when a Linux signal has no QNX mapping
+    (`guest_signal_action`); and
+  - the fix is to answer queries for every valid signal number.
+- **BusyBox shutdown found a Linuxemu bug, now fixed:**
+  - A fork child of busybox `sh` (`sleep 30 & kill -TERM $!`) deadlocked:
+    its only thread sat in MUTEX at `0x14f64c4`. It happened in 2 of 10
+    launches done the corpus way (as background jobs) with
+    `LINUXEMU_DIAGNOSTICS` set, and 0 of 10 with it unset.
+  - Cause: the Phase 0A diagnostics terminate handler called `getenv`,
+    `pthread_kill` and `pthread_sigmask` from a signal handler. When SIGTERM
+    arrived while the child was setting up its exec under libc's
+    environment lock, the child deadlocked.
+  - Fix: the report path is cached at start-up, a lock-free final flush is
+    used in the signal handlers, and the handler re-raises with
+    `sigprocmask` + `kill(getpid())`.
+  - Smoke `diag-sigterm-race` went from 2/20 hangs to 0/20, and BusyBox now
+    scores compatible.
+- `statx` returns ENOSYS in every app (thousands of calls). The apps fall
+  back, but it's the most frequent unsupported call.
+
+**BerryCore's GNU `timeout` (coreutils 8.29) never fires on QNX:**
+- `timeout 3 sleep 10` and `timeout -s 9 3 sleep 20` both run the full time
+  and exit 0.
+- A `wget` blocked on a stalled nginx socket stayed REPLY-blocked for
+  minutes under `timeout -s 9 10`. A manual `kill -9` ended it at once, so it
+  was killable.
+- The corpus harness now uses its own watchdog (`corpus_timeout`).
+- **The existing release regression scripts still use `timeout`,** so their
+  hang guards have never worked on the device.
+- **Regression during this work:** 13 of 14 suites passed.
+  `run-python-smoke` failed with the known Phase 0 fault (`fatal signal=0xb
+  pc=0x60067dc4 address=0`). An A/B run with `master`'s binary, which lacks
+  the deadlock fix, fails identically, so it isn't caused by this work. It
+  passed in every earlier full regression the same day.

@@ -139,6 +139,34 @@ if [ "$status" -ne 141 ] ||
     diag_fail diag-sigpipe "no report before kernel-sent SIGPIPE"
 fi
 
+# SIGTERM to a fresh fork child, with diagnostics on, launched as a
+# background job (as the corpus does). The diagnostics terminate handler
+# once deadlocked such children (about 2 in 10).
+echo "=== diagnostics: diag-sigterm-race ==="
+race_failures=0
+race_round=0
+while [ "$race_round" -lt 20 ]; do
+    race_round=$((race_round + 1))
+    LINUXEMU_ROOT="$alpine_root" LINUXEMU_DIAGNOSTICS="$diag_dir/race.txt" \
+        "$linuxemu" "$alpine_root/bin/busybox" sh -c \
+        'sleep 30 & p=$!; kill -TERM $p; wait $p; echo $?' \
+        > "$diag_dir/race.out" 2>&1 &
+    race_pid=$!
+    ( sleep 15; kill -9 "$race_pid" ) </dev/null >/dev/null 2>&1 &
+    race_watchdog=$!
+    wait "$race_pid"
+    status=$?
+    kill -9 "$race_watchdog" 2>/dev/null
+    if [ "$status" -ne 0 ] ||
+        [ "$(tail -n 1 "$diag_dir/race.out")" != 143 ]; then
+        race_failures=$((race_failures + 1))
+    fi
+done
+echo "diag-sigterm-race failures=$race_failures/20"
+if [ "$race_failures" -ne 0 ]; then
+    diag_fail diag-sigterm-race "fork child hung after SIGTERM"
+fi
+
 echo "=== diagnostics: diag-off ==="
 before=$(ls "$diag_dir" | wc -l | tr -d ' ')
 LINUXEMU_ROOT=/ "$timeout_command" 10 \

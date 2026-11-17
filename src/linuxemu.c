@@ -82,6 +82,7 @@ int main(int argc, char **argv)
         const char *diagnostics = getenv("LINUXEMU_DIAGNOSTICS");
         int enabled = diagnostics != 0 && diagnostics[0] != '\0';
         linux_diag_set_enabled(enabled);
+        linux_diag_runtime_initialize();
         if (enabled) guest_signal_diagnostics_initialize();
     }
 #ifdef LINUXEMU_TESTING

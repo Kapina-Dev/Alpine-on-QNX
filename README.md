@@ -272,6 +272,29 @@ writes again each time it flushes (for example, every time it sends itself a
 blocked signal), so add up lines with the same `pid`, `nr`, `error` and
 `detail`.
 
+## Application corpus
+
+Score the pinned application corpus on the device:
+
+```sh
+sh scripts/run-corpus.sh            # all apps in scripts/corpus/apps
+sh scripts/run-corpus.sh git nginx  # selected apps
+```
+
+- **What it scores:** each app is scored on install, startup, basic workload,
+  concurrent workload and clean shutdown. It counts as compatible only when
+  all five pass.
+- **Isolation:** each app runs in a fresh copy of the test rootfs from a
+  pinned package closure (`docs/corpus/<app>-apks.sha256`, fetched with
+  `scripts/corpus/fetch-apks.sh`). The shared test rootfs is never changed.
+- **Results:** they go to `build/corpus/results.tsv` and
+  `build/corpus/summary.txt`, with per-app logs and `LINUXEMU_DIAGNOSTICS`
+  reports in `build/corpus/<app>/`. The current baseline is in
+  `docs/corpus-results.md`.
+- **Not part of the release regression:** the corpus is a separate
+  measurement, and a failing app is a result, not a broken test. The
+  harness's own tests are in `sh tests/corpus-harness-test.sh`.
+
 ## Current limits
 
 - Dynamic support is currently limited to the pinned Alpine 3.24 musl package

@@ -2,7 +2,9 @@
 #include "linux_diagnostics.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 /*
@@ -12,10 +14,22 @@
  * is usable from the fatal-signal path; every error is ignored so that
  * diagnostics never change guest behaviour.
  */
-void linux_diag_flush(void)
+static char report_path[PATH_MAX];
+
+/* Read LINUXEMU_DIAGNOSTICS once at start-up: the flush also runs inside
+   signal handlers, where getenv can deadlock on libc's environment lock. */
+void linux_diag_runtime_initialize(void)
+{
+    const char *path = getenv("LINUXEMU_DIAGNOSTICS");
+    report_path[0] = '\0';
+    if (path != 0 && strlen(path) < sizeof(report_path))
+        memcpy(report_path, path, strlen(path) + 1);
+}
+
+static void write_report(int reset)
 {
     static char report[16384];
-    const char *path = getenv("LINUXEMU_DIAGNOSTICS");
+    const char *path = report_path;
     const char *executable = guest_process_executable();
     int32_t pid = (int32_t)getpid();
     uint32_t cursor = 0;
@@ -38,5 +52,17 @@ void linux_diag_flush(void)
             &cursor);
     }
     if (descriptor >= 0) close(descriptor);
-    linux_diag_reset();
+    if (reset) linux_diag_reset();
+}
+
+void linux_diag_flush(void)
+{
+    write_report(1);
+}
+
+/* For signal handlers on the way out: writes only open/write/close and takes
+   no lock (the interrupted code may hold the table lock). */
+void linux_diag_flush_final(void)
+{
+    write_report(0);
 }
