@@ -328,6 +328,39 @@ static void exec_records_carry_limit(void)
     guest_fd_nofile_set(base, base);
 }
 
+static void received_fd_adopts_known_object(void)
+{
+    int p[2], q[2], received, native_copy, d, dir_copy;
+    struct guest_fd_object *object, *a, *b;
+    if (pipe(p) != 0 || pipe(q) != 0) { ++failures; return; }
+    object = new_object(p[0]);
+    guest_fd_attach(p[0], object);
+    guest_fd_put(object);
+    /* A number that arrived over SCM_RIGHTS for a known eventfd pipe. */
+    received = dup(p[0]);
+    guest_fd_received(received);
+    a = guest_fd_acquire(p[0]);
+    b = guest_fd_acquire(received);
+    CHECK("received_fd_adopts_known_object", a != 0 && a == b);
+    if (a != 0) guest_fd_put(a);
+    if (b != 0) guest_fd_put(b);
+    /* A native pipe is never adopted. */
+    native_copy = dup(q[0]);
+    guest_fd_received(native_copy);
+    CHECK("received_fd_adopts_known_object",
+        guest_fd_acquire(native_copy) == 0);
+    /* Nor is a path record: two opens of one directory share an inode
+       but not an open-file description. */
+    d = open("/", O_RDONLY);
+    guest_fd_record_path(d, "/");
+    dir_copy = open("/", O_RDONLY);
+    guest_fd_received(dir_copy);
+    CHECK("received_fd_adopts_known_object", guest_fd_acquire(dir_copy) == 0);
+    guest_fd_clear(received); guest_fd_clear(p[0]); guest_fd_clear(d);
+    close(received); close(p[0]); close(p[1]); close(native_copy);
+    close(q[0]); close(q[1]); close(d); close(dir_copy);
+}
+
 static void exec_records_reject_malformed(void)
 {
     static char huge[100001];
@@ -359,6 +392,7 @@ int main(void)
     exec_records_reject_malformed();
     nofile_virtual_limit();
     exec_records_carry_limit();
+    received_fd_adopts_known_object();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;
 }

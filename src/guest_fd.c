@@ -114,9 +114,32 @@ void guest_fd_clear(int fd)
     guest_fd_put(old);
 }
 
+/* Narrow adoption (Phase 1): a received pipe-backed object that this
+   process still holds, e.g. one inherited across fork, is the same object,
+   because a pipe's (st_dev, st_ino) is unique to it.  Path records are
+   never adopted: two opens of one directory share an inode but not an
+   open-file description.  Anything else starts native. */
 void guest_fd_received(int fd)
 {
+    struct stat status;
+    struct guest_fd_object *match = 0;
+    int other;
     guest_fd_clear(fd);
+    if (!valid_fd(fd) || fstat(fd, &status) != 0) return;
+    pthread_mutex_lock(&table_lock);
+    for (other = 0; other != GUEST_FD_SLOTS && match == 0; ++other) {
+        struct guest_fd_object *object = slots[other];
+        if (other != fd && object != 0 && object->type != GUEST_FD_PATH &&
+                object->device == status.st_dev &&
+                object->inode == status.st_ino) {
+            match = object;
+            ++match->references;
+        }
+    }
+    pthread_mutex_unlock(&table_lock);
+    if (match == 0) return;
+    (void)guest_fd_attach(fd, match);
+    guest_fd_put(match);
 }
 
 int guest_fd_duplicate(int source, int destination)

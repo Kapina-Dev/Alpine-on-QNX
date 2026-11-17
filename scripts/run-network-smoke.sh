@@ -106,6 +106,13 @@ status=$?
 echo "unix-rights-backlog exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+echo "=== network guest: fd-rights-adopt ==="
+LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+    "$project_dir/guest-tests/fixtures/fd-rights-adopt-armhf"
+status=$?
+echo "fd-rights-adopt exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 run_connect_probe
 run_http numeric-host 127.0.0.1 4
 run_http hosts-name localhost 6
