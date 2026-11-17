@@ -348,3 +348,94 @@ and **7 of 11** after the deadlock fix below.
   pc=0x60067dc4 address=0`). An A/B run with `master`'s binary, which lacks
   the deadlock fix, fails identically, so it isn't caused by this work. It
   passed in every earlier full regression the same day.
+
+## 2026-11-17 (later) — Device spike: reaching the Android player context
+
+A throwaway feasibility spike on the Passport (QNX 8.0.0, as devuser),
+aimed at the one make-or-break Android gate: does our code run in the
+Android *player* context, where RIM's `/dev/binder` accepts credentials,
+and is anonymous W→X memory allowed there? Both are prerequisites for
+running any Android userland under Linuxemu. The spike did **not** reach
+the player context; the reason is itself the finding.
+
+### Proven as devuser (baseline, repeated)
+
+- **W^X PASS.** `rim-binder-probe` mapped RW memory, `mprotect`'d it to RX,
+  and called into it: returned 42. Anonymous W→X executable memory is
+  allowed for the ordinary user. (Still unproven for the player uid
+  specifically, but a strong positive signal for any sandbox we *can*
+  enter, including a BAR app.)
+- **binder EACCES** as devuser (`open("/dev/binder")` → errno 13), as the
+  desk study predicted. `/dev/binder` is `1000:10011` mode 0660.
+- Linuxemu runs guests here (exit-status, memory-syscalls) and reproduces
+  the bionic `pid <= 65535` abort.
+
+### Two ways into the player context, both blocked for an ordinary user
+
+1. **Hooking `restart-android-core-wrapper.sh`** (the research's method:
+   the container `scripts/` dir is 777, and a command prepended to the
+   wrapper runs as the player when the launcher starts the core).
+   - Tested across four reboots. **2 of 2 times the hooked wrapper was in
+     place, root and the Android core failed to come up at boot** (the app
+     reached the end of its loading bar and crashed; no `/dev/binder`, no
+     `/tmp/android_core_started_by_player` marker, no probe output). **2 of
+     2 times with the original wrapper restored, root applied and the core
+     started** (once observed auto-starting at boot without opening an app).
+   - Whether the edit is the cause or merely correlated, a hooked wrapper
+     broke the runtime both times, so this route is not usable here.
+     Restoring the original (byte-identical, same inode 9669) each time
+     brought the runtime back.
+   - Note on root timing: the one successful launch coincided with the
+     "rooted" notification appearing. The core start appears tied to
+     boot-time root patching, not to the wrapper.
+
+2. **Overwriting a core-started binary in place** (keeps the inode's fsecd
+   trust; `shrimp` is the ideal target — started last, backgrounded, and
+   non-critical, after binder is already up; all core binaries under
+   `native/system/bin/` are mode 777 `apps:10011` and writable by devuser,
+   so this needs **no root**).
+   - The in-place write (`cat probe > shrimp`, preserving inode 9866)
+     failed with **`Resource busy`**: `shrimp` is held mapped by a running
+     process. The write failed cleanly every time — `shrimp` stayed the
+     untouched original.
+   - **`slay shrimp` could not stop it:** from the devuser SSH shell, the
+     player's processes are visible as `/proc/<pid>` entries but every
+     `/proc/<pid>/as` read returns "Operation not permitted", and `slay`
+     by name reports "Unable to find process". **The player runs in RIM's
+     own namespace as uid 1000, and the ordinary-user shell is not in it.**
+   - So the file can only be rewritten while its holder is stopped, and we
+     cannot see or signal that holder. The core is up from boot (manual
+     SSH always comes up long after), so there is no write window either.
+
+### Verdict
+
+The binder-from-player gate is **still unproven — not failed.** Entry into
+the player context is gated by **namespace isolation** that an ordinary
+user cannot cross:
+
+- the wrapper route breaks the runtime on this device; and
+- the in-place-binary route needs the core's holder stopped, which needs
+  root acting *inside the player namespace* — and per the SSH/root notes,
+  root here has a minimal trusted PATH and cannot exec our BerryCore-built
+  probes as-is, and is uid 0, not uid 1000-in-namespace, so it likely
+  fails the binder credential check too.
+
+**Implication for the roadmap:** the Android track's first real dependency
+is "run as the player" (a root/namespace problem), *before* any binder
+translation, pid virtualisation or ART work. That is an infrastructure
+gate, not an emulator gate. The emulator-side signals that *were* testable
+(W^X, guest exec) are positive.
+
+**Fully testable without any of this:** whether Linuxemu runs and flips
+memory executable inside an ordinary BAR app sandbox — which is all the
+"Linuxemu + its own terminal BAR app" goal needs. Today's devuser W^X PASS
+is an encouraging early signal for that.
+
+### Device left clean
+
+`shrimp` and the wrapper were verified byte-identical to their originals
+(same inodes) and the core healthy (`/dev/binder` present). The spike's
+inert leftovers are confined to our own dirs: the probe binaries and
+`shrimp-probe.c`/`shrimp-probe` (a variant of `rim-binder-probe` that
+writes its report to a file), plus `shrimp.orig` and the wrapper backup
+under the dev checkout's `build/`.
