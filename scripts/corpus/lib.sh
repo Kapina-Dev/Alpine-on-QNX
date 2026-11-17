@@ -74,19 +74,62 @@ guest_sh()
     guest "$1" /bin/busybox sh -c "$2"
 }
 
-# guest_bg <pidfile> <guest-path> [args...]: background guest, killed at
+# guest_bg <pidfile> <guest-path> [args...]: background guest. Its pid is
+# written to <pidfile>, and its exit status to <pidfile>.status when it
+# ends, so a later stage can signal it and check how it exited. Killed at
 # cleanup by corpus_kill_bg.
 guest_bg()
 {
     guest_pidfile=$1
     guest_program=$2
     shift 2
-    LINUXEMU_ROOT="$alpine_root" \
-        LINUXEMU_DIAGNOSTICS="$corpus_app_out/diagnostics.txt" \
-        "$linuxemu" "$alpine_root$guest_program" ${1+"$@"} \
-        >>"$corpus_app_out/background.log" 2>&1 &
-    echo "$!" > "$guest_pidfile"
-    echo "$!" >> "$corpus_app_out/background.pids"
+    rm -f "$guest_pidfile" "$guest_pidfile.status"
+    (
+        LINUXEMU_ROOT="$alpine_root" \
+            LINUXEMU_DIAGNOSTICS="$corpus_app_out/diagnostics.txt" \
+            "$linuxemu" "$alpine_root$guest_program" ${1+"$@"} \
+            >>"$corpus_app_out/background.log" 2>&1 &
+        guest_bg_pid=$!
+        echo "$guest_bg_pid" > "$guest_pidfile"
+        echo "$guest_bg_pid" >> "$corpus_app_out/background.pids"
+        wait "$guest_bg_pid"
+        echo "$?" > "$guest_pidfile.status"
+    ) &
+    while [ ! -s "$guest_pidfile" ]; do
+        sleep 1
+    done
+}
+
+# wait_gone <pidfile> <seconds>: 0 once the background guest has exited.
+wait_gone()
+{
+    waited=0
+    while [ ! -f "$1.status" ]; do
+        [ "$waited" -ge "$2" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# wait_http <port> <seconds>: 0 once http://127.0.0.1:<port>/ answers.
+wait_http()
+{
+    waited=0
+    until guest 10 /bin/busybox wget -q -T 2 -O /dev/null \
+            "http://127.0.0.1:$1/" 2>/dev/null; do
+        [ "$waited" -ge "$2" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# http_refused <port>: 0 when nothing answers on 127.0.0.1:<port>.
+http_refused()
+{
+    ! guest 10 /bin/busybox wget -q -T 3 -O /dev/null \
+        "http://127.0.0.1:$1/" 2>/dev/null
 }
 
 corpus_kill_bg()
