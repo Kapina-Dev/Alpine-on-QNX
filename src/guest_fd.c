@@ -218,6 +218,54 @@ DIR *guest_fd_object_directory(struct guest_fd_object *object)
     return data->directory;
 }
 
+static struct guest_fd_object *typed_object(int fd)
+{
+    return guest_fd_is_typed(fd) ? guest_fd_acquire(fd) : 0;
+}
+
+int guest_fd_dispatch_read(int fd, void *buffer, size_t length,
+    int32_t *result)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int handled = object != 0 && object->ops->read != 0;
+    if (handled) *result = object->ops->read(object, fd, buffer, length);
+    guest_fd_put(object);
+    return handled;
+}
+
+int guest_fd_dispatch_write(int fd, const void *buffer, size_t length,
+    int32_t *result)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int handled = object != 0 && object->ops->write != 0;
+    if (handled) *result = object->ops->write(object, fd, buffer, length);
+    guest_fd_put(object);
+    return handled;
+}
+
+int guest_fd_dispatch_get_status(int fd, int *host_flags)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int handled = 0;
+    if (object != 0 && object->ops->get_status != 0) {
+        *host_flags = object->ops->get_status(object, fd);
+        handled = *host_flags < 0 ? -1 : 1;
+    }
+    guest_fd_put(object);
+    return handled;
+}
+
+int guest_fd_dispatch_set_status(int fd, int host_flags)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int handled = 0;
+    if (object != 0 && object->ops->set_status != 0)
+        handled = object->ops->set_status(object, fd, host_flags) == 0 ?
+            1 : -1;
+    guest_fd_put(object);
+    return handled;
+}
+
 int guest_fd_initialize(void)
 {
     struct rlimit limit;

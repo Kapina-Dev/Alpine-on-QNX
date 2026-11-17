@@ -179,24 +179,6 @@
 #define LINUX_CLONE_VM 0x00000100u
 #define LINUX_CLONE_VFORK 0x00004000u
 #define LINUX_SIGCHLD 17u
-#define MAX_TRACKED_FDS 256
-
-static int eventfd_write_peers[MAX_TRACKED_FDS];
-
-static int is_wake_eventfd(int fd)
-{
-    return fd >= 0 && fd < MAX_TRACKED_FDS && eventfd_write_peers[fd] != 0;
-}
-
-static void release_wake_eventfd(int fd)
-{
-    int peer;
-
-    if (!is_wake_eventfd(fd)) return;
-    peer = eventfd_write_peers[fd] - 1;
-    eventfd_write_peers[fd] = 0;
-    close(peer);
-}
 
 struct linux_flock64 {
     int16_t type;
@@ -678,7 +660,6 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
 
 static int32_t linux_close_fd(int fd)
 {
-    release_wake_eventfd(fd);
     guest_fd_clear(fd);
     return linux_host_result(close(fd));
 }
@@ -686,12 +667,7 @@ static int32_t linux_close_fd(int fd)
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
 {
     int result;
-    if ((command == 0 || command == 1030) && is_wake_eventfd(fd)) {
-        const uint32_t args[6] = { (uint32_t)fd, (uint32_t)command,
-            argument, 0, 0, 0 };
-        return linux_unsupported(LINUX_NR_FCNTL64, LINUX_EOPNOTSUPP,
-            "wake-eventfd", args);
-    }
+    int typed_status;
     switch (command) {
     case 0: result = fcntl(fd, F_DUPFD, (int)argument); break;
     case 1030:
@@ -707,18 +683,23 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     case 2: result = fcntl(fd, F_SETFD,
         (argument & 1u) != 0 ? FD_CLOEXEC : 0); break;
     case 3:
-        result = fcntl(fd, F_GETFL);
+        typed_status = guest_fd_dispatch_get_status(fd, &result);
+        if (typed_status == 0) result = fcntl(fd, F_GETFL);
         if (result >= 0) return (int32_t)linux_status_flags(result);
         break;
     case 4: {
         int requested;
-        int current = fcntl(fd, F_GETFL);
+        int current;
+        typed_status = guest_fd_dispatch_get_status(fd, &current);
+        if (typed_status == 0) current = fcntl(fd, F_GETFL);
         if (current < 0) return linux_host_result(current);
         if (linux_open_flags(argument & (0x00000400u | 0x00000800u),
                 &requested) != 0) return -EINVAL;
         current &= ~(O_APPEND | O_NONBLOCK);
         current |= requested & (O_APPEND | O_NONBLOCK);
-        result = fcntl(fd, F_SETFL, current);
+        typed_status = guest_fd_dispatch_set_status(fd, current);
+        result = typed_status == 0 ? fcntl(fd, F_SETFL, current) :
+            typed_status > 0 ? 0 : -1;
         break;
     }
     case 12:
@@ -783,10 +764,74 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
     return 0;
 }
 
+/* The wake eventfd: the pipe-backed subset libcurl uses.  The guest holds
+   the read end; the write end is an emulator-owned hidden fd kept in the
+   shared object, closed when the last guest reference goes. */
+struct wake_eventfd {
+    int write_fd;
+};
+
+static int32_t wake_eventfd_read(struct guest_fd_object *object, int fd,
+    void *buffer, size_t length)
+{
+    (void)object;
+    if (length < sizeof(uint64_t)) return -EINVAL;
+    return linux_result(read(fd, buffer, sizeof(uint64_t)));
+}
+
+static int32_t wake_eventfd_write(struct guest_fd_object *object, int fd,
+    const void *buffer, size_t length)
+{
+    struct wake_eventfd *data = guest_fd_object_data(object);
+    uint64_t value;
+
+    (void)fd;
+    if (length < sizeof(value)) return -EINVAL;
+    memcpy(&value, buffer, sizeof(value));
+    if (value != 1) return -EINVAL;
+    return linux_result(write(data->write_fd, &value, sizeof(value)));
+}
+
+static int wake_eventfd_poll_fd(struct guest_fd_object *object, int fd)
+{
+    (void)object;
+    return fd;
+}
+
+static int wake_eventfd_get_status(struct guest_fd_object *object, int fd)
+{
+    (void)object;
+    return fcntl(fd, F_GETFL);
+}
+
+static int wake_eventfd_set_status(struct guest_fd_object *object, int fd,
+    int host_flags)
+{
+    struct wake_eventfd *data = guest_fd_object_data(object);
+    int write_flags = fcntl(data->write_fd, F_GETFL);
+    if (fcntl(fd, F_SETFL, host_flags) != 0 || write_flags < 0) return -1;
+    write_flags = (write_flags & ~O_NONBLOCK) | (host_flags & O_NONBLOCK);
+    return fcntl(data->write_fd, F_SETFL, write_flags) == 0 ? 0 : -1;
+}
+
+static void wake_eventfd_release(struct guest_fd_object *object)
+{
+    struct wake_eventfd *data = guest_fd_object_data(object);
+    close(data->write_fd);
+}
+
+static const struct guest_fd_ops wake_eventfd_ops = {
+    wake_eventfd_read, wake_eventfd_write, wake_eventfd_poll_fd,
+    wake_eventfd_get_status, wake_eventfd_set_status, wake_eventfd_release, 0
+};
+
 static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
 {
     int descriptors[2];
     int host_status_flags = 0;
+    int saved_errno;
+    struct guest_fd_object *object;
+    struct wake_eventfd *data;
 
     if ((flags & ~(LINUX_EFD_SEMAPHORE | LINUX_O_NONBLOCK |
             LINUX_O_CLOEXEC)) != 0) return -EINVAL;
@@ -797,45 +842,37 @@ static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
             "eventfd-form", args);
     }
     if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
-    if (descriptors[0] < 0 || descriptors[0] >= MAX_TRACKED_FDS) {
-        close(descriptors[0]);
-        close(descriptors[1]);
-        return -EMFILE;
-    }
     if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
     if ((host_status_flags != 0 &&
             (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
             fcntl(descriptors[1], F_SETFL, host_status_flags) != 0)) ||
         ((flags & LINUX_O_CLOEXEC) != 0 &&
-            (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0 ||
-            fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0))) {
-        int saved_errno = errno;
+            fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0))
+        goto fail_both;
+    descriptors[1] = guest_fd_hide(descriptors[1]);
+    if (descriptors[1] < 0) {
+        saved_errno = errno;
         close(descriptors[0]);
-        close(descriptors[1]);
-        errno = saved_errno;
-        return -(int32_t)linux_errno_number(errno);
+        return -(int32_t)linux_errno_number(saved_errno);
     }
-    eventfd_write_peers[descriptors[0]] = descriptors[1] + 1;
-    guest_fd_clear(descriptors[0]);
+    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &wake_eventfd_ops,
+        descriptors[0], sizeof(struct wake_eventfd));
+    if (object == 0) goto fail_both;
+    data = guest_fd_object_data(object);
+    data->write_fd = descriptors[1];
+    if (guest_fd_attach(descriptors[0], object) != 0) {
+        saved_errno = errno;
+        guest_fd_put(object);
+        close(descriptors[0]);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    guest_fd_put(object);
     return descriptors[0];
-}
-
-static int32_t linux_eventfd_read(int fd, void *buffer, size_t length)
-{
-    if (length < sizeof(uint64_t)) return -EINVAL;
-    return linux_result(read(fd, buffer, sizeof(uint64_t)));
-}
-
-static int32_t linux_eventfd_write(int fd, const void *buffer, size_t length)
-{
-    uint64_t value;
-    int peer;
-
-    if (length < sizeof(value)) return -EINVAL;
-    memcpy(&value, buffer, sizeof(value));
-    if (value != 1) return -EINVAL;
-    peer = eventfd_write_peers[fd] - 1;
-    return linux_result(write(peer, &value, sizeof(value)));
+fail_both:
+    saved_errno = errno;
+    close(descriptors[0]);
+    close(descriptors[1]);
+    return -(int32_t)linux_errno_number(saved_errno);
 }
 
 static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
@@ -1237,23 +1274,19 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_fork_process(context, 0);
         break;
     case LINUX_NR_READ:
-        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = linux_eventfd_read(
-                (int)context->uc_mcontext.cpu.gpr[0],
+        if (!guest_fd_dispatch_read((int)context->uc_mcontext.cpu.gpr[0],
                 (void *)context->uc_mcontext.cpu.gpr[1],
-                (size_t)context->uc_mcontext.cpu.gpr[2]);
-        else result = linux_result(read(
+                (size_t)context->uc_mcontext.cpu.gpr[2], &result))
+            result = linux_result(read(
             (int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
         break;
     case LINUX_NR_WRITE:
-        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = linux_eventfd_write(
-                (int)context->uc_mcontext.cpu.gpr[0],
+        if (!guest_fd_dispatch_write((int)context->uc_mcontext.cpu.gpr[0],
                 (const void *)context->uc_mcontext.cpu.gpr[1],
-                (size_t)context->uc_mcontext.cpu.gpr[2]);
-        else result = linux_result(write(
+                (size_t)context->uc_mcontext.cpu.gpr[2], &result))
+            result = linux_result(write(
             (int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
@@ -1429,15 +1462,9 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     }
     case LINUX_NR_DUP:
-        if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
-                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
-        else {
-            result = linux_host_result(dup(
-                (int)context->uc_mcontext.cpu.gpr[0]));
-            if (result >= 0) (void)guest_fd_duplicate(
-                (int)context->uc_mcontext.cpu.gpr[0], result);
-        }
+        result = linux_host_result(dup((int)context->uc_mcontext.cpu.gpr[0]));
+        if (result >= 0) (void)guest_fd_duplicate(
+            (int)context->uc_mcontext.cpu.gpr[0], result);
         break;
     case LINUX_NR_DUP2:
         if ((int)context->uc_mcontext.cpu.gpr[0] ==
@@ -1446,18 +1473,12 @@ void linux_syscall_dispatch(ucontext_t *context)
                 (int)context->uc_mcontext.cpu.gpr[0], F_GETFD, 0)) < 0 ?
                 -(int32_t)linux_errno_number(errno) :
                 (int)context->uc_mcontext.cpu.gpr[0];
-        else if (is_wake_eventfd((int)context->uc_mcontext.cpu.gpr[0]))
-            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
-                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
         else {
             int source = (int)context->uc_mcontext.cpu.gpr[0];
             int destination = (int)context->uc_mcontext.cpu.gpr[1];
             if (fcntl(source, F_GETFD, 0) < 0)
                 result = -(int32_t)linux_errno_number(errno);
-            else {
-                release_wake_eventfd(destination);
-                result = linux_host_result(dup2(source, destination));
-            }
+            else result = linux_host_result(dup2(source, destination));
             if (result >= 0 &&
                 (int)context->uc_mcontext.cpu.gpr[0] != result)
                 (void)guest_fd_duplicate((int)context->uc_mcontext.cpu.gpr[0], result);
@@ -1767,13 +1788,9 @@ void linux_syscall_dispatch(ucontext_t *context)
         uint32_t flags = context->uc_mcontext.cpu.gpr[2];
         if (source == destination || (flags & ~LINUX_O_CLOEXEC) != 0)
             result = -EINVAL;
-        else if (is_wake_eventfd(source))
-            result = linux_unsupported(number, LINUX_EOPNOTSUPP,
-                "wake-eventfd", (const uint32_t *)context->uc_mcontext.cpu.gpr);
         else if (fcntl(source, F_GETFD, 0) < 0)
             result = -(int32_t)linux_errno_number(errno);
         else {
-            release_wake_eventfd(destination);
             result = linux_host_result(dup2(source, destination));
             if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
                 fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)

@@ -69,6 +69,17 @@ int guest_fd_path(int fd, char *host_path, size_t size);
    object; valid while the caller holds that reference.  0 + errno. */
 DIR *guest_fd_object_directory(struct guest_fd_object *object);
 
+/* Dispatch to a typed object's ops.  Return 0 when the fd is native (or
+   the object lacks the op): the caller does the native call.  The read and
+   write forms return 1 with *result holding the Linux result.  The status
+   forms return 1 on success and -1 with errno set on failure. */
+int guest_fd_dispatch_read(int fd, void *buffer, size_t length,
+    int32_t *result);
+int guest_fd_dispatch_write(int fd, const void *buffer, size_t length,
+    int32_t *result);
+int guest_fd_dispatch_get_status(int fd, int *host_flags);
+int guest_fd_dispatch_set_status(int fd, int host_flags);
+
 int guest_fd_initialize(void);
 void guest_fd_after_fork(void);
 
