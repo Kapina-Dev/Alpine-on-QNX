@@ -296,5 +296,6 @@ linuxemu-unsupported exe=build/guest-tests/bionic-probe-armv7 pid=171241710 nr=1
 So before the pid abort, bionic start-up needs nothing else that Linuxemu
 lacks. Its only unsupported call is naming anonymous mappings, which it
 tolerates. The report was written because the self-sent SIGABRT now
-flushes diagnostics first. A signal from another process still can't be
-intercepted.
+flushes diagnostics first. After the final review, kernel and external
+signals (SIGPIPE, SIGALRM, SIGTERM, ...) also write the report before the
+process ends; only SIGKILL doesn't.
