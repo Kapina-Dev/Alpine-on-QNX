@@ -479,3 +479,66 @@ native QNX probes and confirmed in the emulator:
 - **Residual:** a receiver that leaves more than 256 KiB unread can still
   lose an fd frame (Linux would block the sender instead). Not yet
   confirmed on the physical Term49 terminal (tested over an SSH pty).
+
+## 2026-11-17 — Phase 1: virtual file-descriptor layer (approach B)
+
+Guest fd numbers stay native QNX numbers. A new record table
+(`src/guest_fd.c`) attaches an optional shared, reference-counted object
+to a number. Objects are identified by their backing fd's
+`(st_dev, st_ino)`, measured unique per pipe on QNX and stable across
+`dup` and `SCM_RIGHTS`. A record whose number was reused behind the
+table's back is dropped when it's next used. It replaces the fixed
+`fd_paths`, `directory_streams` and `eventfd_write_peers` arrays.
+
+**Defects fixed, each with a guest test that failed first:**
+
+- **Fds ≥ 256 lost their path:** `getdents`, `fchdir` and `*at` returned
+  EBADF (`fd-path-records`, exit 131 → 0).
+- **`dup` family on the wake eventfd** returned EOPNOTSUPP, and its write
+  end used a guest-visible low fd (`wake-eventfd-dup`, 142 → 0). The write
+  end now lives in the hidden range.
+- **Records were lost across exec**, so inherited directory fds and
+  eventfds broke. They're now carried in a hidden `LINUXEMU_FD_RECORDS`
+  variable (`fd-exec-carry`, 2 → 0).
+- **getdents' directory stream kept a guest-visible fd.** QNX has no
+  `fdopendir`, so no stream is kept between calls: the saved position
+  resumes a fresh one (`getdents-chunks`, 164 → 0).
+- **A guest close-all loop could close emulator fds.** The guest's
+  `RLIMIT_NOFILE` is now virtual, at the hidden base: **936** on the
+  Passport, where the host limit is 1000/1000. close, dup2/dup3, F_DUPFD,
+  poll and select refuse hidden numbers (`fd-close-all`, 151 → 0).
+- **SCM_RIGHTS adoption, narrow scope.** A received fd whose pipe-backed
+  object the receiver already holds (for example, inherited across fork)
+  becomes that object again (`fd-rights-adopt`, 3 → 0). Adopting objects
+  created after the fork, passed child → parent, or passed between
+  unrelated processes is left to Phase 2/9.
+
+**Pre-existing QNX behaviours found and fixed on the way:**
+
+- **QNX `fork()` fails with EBADF** while another thread closes a
+  descriptor. A native probe failed 1379 of 2000 forks under pipe/close
+  churn. This was the cause of the intermittent `run-git-smoke` HTTPS
+  failure: 1 in 5 runs on both the Task 3 and Task 4 cores. A failed fork
+  creates no child, so Linuxemu retries (`fork-fd-churn`: about half the
+  forks failed before, none after; git smoke 0/5 failures afterwards).
+- **QNX `fcntl(F_SETFD)` returns the previous flags.** Linux returns 0,
+  and guests clearing close-on-exec got 1 back (`fd-path-records`
+  double-set check, 136 → 0). `F_SETFD` and `F_SETFL` now return 0.
+
+**Gates:** the stress fixture `fd-stress` covers dup/replace (1000
+rounds), fork (200), fork+exec (50) and 4 threads × 2000 racing
+`dup`/`close`. The open-fd count must equal the baseline after each phase.
+- **Final results on the Passport:**
+  - full regression: 0 failures;
+  - every new guest test: exit 0;
+  - corpus: 7/11 compatible, with every app's stages and
+    unsupported-call counts unchanged from the baseline;
+  - `fd-stress`: 0 failures in 5 runs. On the Task 3 core it fails with
+    exit 5, so the gate catches lost exec carry-over.
+- **Known limitations, by design:**
+  - Linuxemu's own fds are hidden by number range and refused by the
+    guards. They are not truly invisible.
+  - Closing an fd while another thread polls it behaves as on QNX, not as
+    on Linux.
+  - `select()` doesn't translate a typed fd's `poll_fd` yet. No object
+    needs it until Phase 3.
