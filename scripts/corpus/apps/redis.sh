@@ -15,14 +15,9 @@ stage_startup()
 stage_basic()
 {
     mkdir -p "$(rootfs_path /tmp/corpus-redis)"
-    guest_bg "$corpus_app_out/server.pid" /usr/bin/redis-server --port 18083 \
-        --bind 127.0.0.1 --save '' --appendonly no --dir /tmp/corpus-redis
-    waited=0
-    until redis_ping; do
-        [ "$waited" -ge 60 ] && { echo "redis did not answer PING"; return 1; }
-        sleep 1
-        waited=$((waited + 1))
-    done
+    start_server "$corpus_app_out/server.pid" redis_ping 60 \
+        /usr/bin/redis-server --port 18083 --bind 127.0.0.1 --save '' \
+        --appendonly no --dir /tmp/corpus-redis || return 1
     guest 10 /usr/bin/redis-cli -p 18083 set corpus value >/dev/null
     out=$(guest 10 /usr/bin/redis-cli -p 18083 get corpus)
     [ "$out" = value ] || { echo "get: $out"; return 1; }

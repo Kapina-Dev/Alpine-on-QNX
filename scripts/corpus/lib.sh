@@ -5,8 +5,9 @@
 # defines stage_startup, stage_basic, stage_concurrent and stage_shutdown,
 # plus optionally stage_install (default: the pinned closure) and
 # app_cleanup. A stage passes when it returns 0. Each stage runs in its own
-# subshell and process group with a timeout, later stages are skipped after
-# a failure, and cleanup always runs.
+# subshell with a timeout; when it times out, the guests it started are
+# killed with it. Later stages are skipped after a failure, and cleanup
+# always runs.
 #
 # Environment:
 #   CORPUS_APPS_DIR       app definitions (default scripts/corpus/apps)
@@ -20,6 +21,8 @@
 #                         packages never change the shared test rootfs
 #   CORPUS_MANIFEST_DIR   pinned manifests (default docs/corpus)
 #   CORPUS_ARCHIVE_DIR    pinned closures (default artifacts/corpus)
+#   CORPUS_LINUXEMU       the Linuxemu binary (default build/linuxemu); the
+#                         host tests use a shim that runs host programs
 
 # Portability: the Passport's /bin/sh is QNX ksh, where an empty "$@" under
 # set -u is an error, so argument lists are passed as ${1+"$@"}.
@@ -30,7 +33,7 @@ corpus_out=${CORPUS_OUT:-"$project_dir/build/corpus"}
 corpus_stage_timeout=${CORPUS_STAGE_TIMEOUT:-300}
 corpus_fake=${CORPUS_FAKE:-0}
 alpine_root=${ALPINE_ROOT:-"$project_dir/test-rootfs"}
-linuxemu="$project_dir/build/linuxemu"
+linuxemu=${CORPUS_LINUXEMU:-"$project_dir/build/linuxemu"}
 corpus_base_root=$alpine_root
 corpus_fresh_rootfs=${CORPUS_FRESH_ROOTFS:-1}
 corpus_manifest_dir=${CORPUS_MANIFEST_DIR:-"$project_dir/docs/corpus"}
@@ -54,7 +57,8 @@ corpus_world=$(corpus_world_path)
 # it after <seconds>; returns its status (>= 128 when killed). The
 # harness's own watchdog: BerryCore's GNU timeout 8.29 never fires on QNX.
 # The watchdog's descriptors are closed so a $( ) capture does not wait
-# for it.
+# for it. Inside an app run, both pids are tracked in guest.pids so a
+# stage timeout or an interrupted run can kill them.
 corpus_timeout()
 {
     ct_seconds=$1
@@ -64,10 +68,45 @@ corpus_timeout()
     ( sleep "$ct_seconds"; kill -KILL "$ct_pid" ) \
         </dev/null >/dev/null 2>&1 &
     ct_watchdog=$!
+    corpus_track start "$ct_pid" "$ct_watchdog"
     wait "$ct_pid"
     ct_status=$?
     kill -KILL "$ct_watchdog" 2>/dev/null
+    corpus_track done "$ct_pid" "$ct_watchdog"
     return "$ct_status"
+}
+
+# corpus_track start|done <pid>...: append-only, so concurrent guests of a
+# stage can record themselves without a lock. QNX ksh does not retry an
+# open interrupted by SIGCHLD (EINTR), so the append is retried, and the
+# failed redirection's message never reaches the guest's captured output.
+corpus_track()
+{
+    [ -n "${corpus_app_out:-}" ] || return 0
+    track_what=$1
+    shift
+    for track_pid in "$@"; do
+        track_try=0
+        until { echo "$track_what $track_pid" \
+                >> "$corpus_app_out/guest.pids"; } 2>/dev/null; do
+            track_try=$((track_try + 1))
+            [ "$track_try" -lt 10 ] || break
+        done
+    done
+}
+
+# corpus_kill_guests: SIGKILL every tracked guest and watchdog that has not
+# finished.
+corpus_kill_guests()
+{
+    pids_file="$corpus_app_out/guest.pids"
+    [ -f "$pids_file" ] || return 0
+    awk '$1 == "start" { live[$2] = 1 } $1 == "done" { delete live[$2] }
+        END { for (p in live) print p }' "$pids_file" |
+        while read -r pid; do
+            kill -KILL "$pid" 2>/dev/null
+        done
+    rm -f "$pids_file"
 }
 
 rootfs_path()
@@ -132,17 +171,46 @@ wait_gone()
     return 0
 }
 
-# wait_http <port> <seconds>: 0 once http://127.0.0.1:<port>/ answers.
-# Counts wall-clock seconds, because each attempt itself takes time.
-wait_http()
+# start_server <pidfile> <ready-command> <seconds> <guest-path> [args...]:
+# start a background server guest (see guest_bg) and wait, by wall clock,
+# until <ready-command> succeeds. Fails when something already answers
+# before the start (a server left by an earlier run would otherwise be
+# scored in place of this one), and when the server exits first.
+start_server()
 {
-    deadline=$(( $(corpus_now) + $2 ))
-    until guest 10 /bin/busybox wget -q -T 2 -O /dev/null \
-            "http://127.0.0.1:$1/" 2>/dev/null; do
-        [ "$(corpus_now)" -ge "$deadline" ] && return 1
+    ss_pidfile=$1
+    ss_ready=$2
+    ss_seconds=$3
+    shift 3
+    if eval "$ss_ready"; then
+        echo "port in use before start"
+        return 1
+    fi
+    guest_bg "$ss_pidfile" ${1+"$@"}
+    ss_deadline=$(( $(corpus_now) + ss_seconds ))
+    until eval "$ss_ready"; do
+        if [ -f "$ss_pidfile.status" ]; then
+            echo "server exited (status $(cat "$ss_pidfile.status")) before answering"
+            return 1
+        fi
+        if [ "$(corpus_now)" -ge "$ss_deadline" ]; then
+            echo "server did not answer within ${ss_seconds}s"
+            return 1
+        fi
         sleep 1
     done
+    if [ -f "$ss_pidfile.status" ]; then
+        echo "server exited (status $(cat "$ss_pidfile.status")) after answering"
+        return 1
+    fi
     return 0
+}
+
+# http_answers <port>: 0 when http://127.0.0.1:<port>/ answers.
+http_answers()
+{
+    guest 10 /bin/busybox wget -q -T 3 -O /dev/null \
+        "http://127.0.0.1:$1/" 2>/dev/null
 }
 
 # first_line: the first non-blank line of standard input.
@@ -154,8 +222,7 @@ first_line()
 # http_refused <port>: 0 when nothing answers on 127.0.0.1:<port>.
 http_refused()
 {
-    ! guest 10 /bin/busybox wget -q -T 3 -O /dev/null \
-        "http://127.0.0.1:$1/" 2>/dev/null
+    ! http_answers "$1"
 }
 
 corpus_kill_bg()
@@ -272,16 +339,18 @@ corpus_run_stage()
     timed_out=0
     ( "$function_name" ) > "$log" 2>&1 &
     stage_pid=$!
+    corpus_stage_pid=$stage_pid
     waited=0
     while kill -0 "$stage_pid" 2>/dev/null; do
         if [ "$waited" -ge "$corpus_stage_timeout" ]; then
             timed_out=1
-            # Killing the stage subshell unblocks the runner. Guests the
-            # stage started still end at their own guest timeout, and
-            # background guests are killed at cleanup.
+            # No job control, so no process group to kill: kill the stage
+            # subshell and the guests it tracked. Background guests are
+            # killed at cleanup.
             kill -TERM "$stage_pid" 2>/dev/null
             sleep 1
             kill -KILL "$stage_pid" 2>/dev/null
+            corpus_kill_guests
             break
         fi
         sleep 1
@@ -289,6 +358,7 @@ corpus_run_stage()
     done
     wait "$stage_pid"
     status=$?
+    corpus_stage_pid=
     seconds=$(( $(corpus_now) - started ))
     if [ "$timed_out" -eq 1 ]; then
         corpus_record "$stage" fail "$seconds" \
@@ -324,6 +394,8 @@ corpus_run_app()
     fi
     corpus_world=$(corpus_world_path)
     cp "$corpus_world" "$corpus_app_out/world.before"
+    corpus_stage_pid=
+    trap 'corpus_abort_app' TERM
 
     failed=
     if corpus_virtual_installed; then
@@ -345,6 +417,7 @@ corpus_run_app()
     done
 
     corpus_kill_bg
+    corpus_kill_guests
     if corpus_has_function app_cleanup; then
         app_cleanup > "$corpus_app_out/cleanup.log" 2>&1
     fi
@@ -356,6 +429,23 @@ corpus_run_app()
         rm -rf "$alpine_root"
     fi
     return 0
+}
+
+# corpus_abort_app: the runner was stopped (it forwards INT and TERM as
+# TERM). Kill what the app started and undo its install, then exit.
+corpus_abort_app()
+{
+    trap - TERM
+    if [ -n "$corpus_stage_pid" ]; then
+        kill -KILL "$corpus_stage_pid" 2>/dev/null
+    fi
+    corpus_kill_guests
+    corpus_kill_bg
+    corpus_remove_virtual >> "$corpus_app_out/cleanup.log" 2>&1
+    if [ "$alpine_root" != "$corpus_base_root" ]; then
+        rm -rf "$alpine_root"
+    fi
+    exit 143
 }
 
 # corpus_summary: write summary.txt from results.tsv for the apps in

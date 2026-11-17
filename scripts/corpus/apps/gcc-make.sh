@@ -28,7 +28,8 @@ stage_concurrent()
         > "$dir/main.c"
     printf 'prog: main.o a.o b.o c.o d.o\n\tgcc -o $@ $^\n%%.o: %%.c\n\tgcc -c -o $@ $<\n' \
         > "$dir/Makefile"
-    out=$(guest_sh 600 'cd /tmp/corpus-cc && make -j4 -s && ./prog')
+    # Below the 300 s stage timeout, so the guest's own limit fires first.
+    out=$(guest_sh 280 'cd /tmp/corpus-cc && make -j4 -s && ./prog')
     [ "$out" = 4 ] || { echo "make -j4 result: $out"; return 1; }
 }
 

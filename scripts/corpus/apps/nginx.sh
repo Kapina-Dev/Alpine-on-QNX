@@ -36,8 +36,8 @@ stage_basic()
     dir=$(rootfs_path $nginx_dir)
     head -c 65536 /dev/urandom > "$dir/www/big"
     echo ok > "$dir/www/index.html"
-    guest_bg "$corpus_app_out/server.pid" /usr/sbin/nginx $(nginx_args)
-    wait_http 18081 60 || { echo "nginx did not answer"; return 1; }
+    start_server "$corpus_app_out/server.pid" "http_answers 18081" 60 \
+        /usr/sbin/nginx $(nginx_args) || return 1
     out=$(guest_sh 60 "cd $nginx_dir && wget -q -O got http://127.0.0.1:18081/big &&
         md5sum www/big got | awk '{ print \$1 }' | uniq | wc -l")
     [ "$out" = 1 ] || { echo "64 KiB GET did not match"; return 1; }

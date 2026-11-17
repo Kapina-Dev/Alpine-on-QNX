@@ -24,8 +24,8 @@ const server = http.createServer((request, response) => response.end('ok'));
 server.listen(18082, '127.0.0.1');
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 JS
-    guest_bg "$corpus_app_out/server.pid" /usr/bin/node /tmp/corpus-node/server.js
-    wait_http 18082 60 || { echo "node server did not answer"; return 1; }
+    start_server "$corpus_app_out/server.pid" "http_answers 18082" 60 \
+        /usr/bin/node /tmp/corpus-node/server.js || return 1
     out=$(guest_sh 120 'rm -f /tmp/corpus-node-ok*; for i in 1 2 3 4 5 6 7 8 9 10; do
             (wget -q -O /dev/null http://127.0.0.1:18082/ &&
                 echo ok > /tmp/corpus-node-ok$i) &

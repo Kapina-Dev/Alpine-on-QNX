@@ -18,13 +18,28 @@ stage_basic()
     guest 300 /usr/bin/python3 /tmp/python-runtime-smoke.py
 }
 
+# A background job of a non-interactive shell starts with SIGINT ignored,
+# and on Linux that survives exec, so python3 -m http.server would never see
+# the shutdown stage's SIGINT. Restore Python's default handler first, as an
+# interactive server has it, so the stage holds under Linux semantics and
+# not only because Linuxemu drops the inherited disposition.
+python_server='import runpy, signal, sys
+signal.signal(signal.SIGINT, signal.default_int_handler)
+sys.argv = ["http.server", "18080", "--bind", "127.0.0.1",
+            "--directory", "/tmp/corpus-py"]
+runpy.run_module("http.server", run_name="__main__", alter_sys=True)'
+
+python_server_start()
+{
+    start_server "$corpus_app_out/server.pid" "http_answers 18080" 60 \
+        /usr/bin/python3 -c "$python_server"
+}
+
 stage_concurrent()
 {
     mkdir -p "$(rootfs_path /tmp/corpus-py)"
     echo hello > "$(rootfs_path /tmp/corpus-py/index.html)"
-    guest_bg "$corpus_app_out/server.pid" /usr/bin/python3 -m http.server \
-        18080 --bind 127.0.0.1 --directory /tmp/corpus-py
-    wait_http 18080 60 || { echo "http.server did not answer"; return 1; }
+    python_server_start || return 1
     out=$(guest_sh 120 'rm -f /tmp/corpus-py-ok*; for i in 1 2 3 4 5 6 7 8 9 10; do
             (wget -q -O /tmp/corpus-py-get$i http://127.0.0.1:18080/index.html &&
                 echo ok > /tmp/corpus-py-ok$i) &
