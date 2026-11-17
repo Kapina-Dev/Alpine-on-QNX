@@ -5,7 +5,7 @@ stage_startup()
 {
     out=$(guest 30 /bin/busybox --help 2>&1)
     echo "$out" | grep -q 'BusyBox v1\.' ||
-        { echo "unexpected: $(echo "$out" | head -n 1)"; return 1; }
+        { echo "unexpected: $(echo "$out" | first_line)"; return 1; }
 }
 
 stage_basic()

@@ -5,7 +5,7 @@ stage_startup()
 {
     out=$(guest 30 /sbin/apk --version 2>&1)
     echo "$out" | grep -q 'apk-tools 3\.' ||
-        { echo "unexpected: $(echo "$out" | head -n 1)"; return 1; }
+        { echo "unexpected: $(echo "$out" | first_line)"; return 1; }
 }
 
 stage_basic()

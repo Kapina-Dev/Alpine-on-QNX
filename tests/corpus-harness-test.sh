@@ -260,5 +260,29 @@ check $? "tampered-archive: install fails before apk runs"
 [ ! -e "$work/tampered-archive/installed/.linuxemu-corpus-demo" ]
 check $? "tampered-archive: apk was never called"
 
+# corpus_timeout: the harness's own watchdog. GNU timeout 8.29 from
+# BerryCore never fires on QNX, so the harness cannot rely on it.
+(
+    CORPUS_FAKE=1
+    . "$project_dir/scripts/corpus/lib.sh"
+    started=$(now)
+    out=$(corpus_timeout 2 sleep 20; echo "status=$?")
+    elapsed=$(( $(now) - started ))
+    status=${out#status=}
+    [ "$status" -ge 128 ] 2>/dev/null && [ "$elapsed" -ge 2 ] &&
+        [ "$elapsed" -lt 10 ]
+)
+check $? "corpus_timeout: kills a command that overruns, even inside \$( )"
+(
+    CORPUS_FAKE=1
+    . "$project_dir/scripts/corpus/lib.sh"
+    started=$(now)
+    out=$(corpus_timeout 10 sh -c 'echo done; exit 3'; echo "status=$?")
+    elapsed=$(( $(now) - started ))
+    [ "$out" = "done
+status=3" ] && [ "$elapsed" -lt 5 ]
+)
+check $? "corpus_timeout: passes output and status through, returns promptly"
+
 echo "corpus_harness_test_failures=$failures"
 test "$failures" -eq 0

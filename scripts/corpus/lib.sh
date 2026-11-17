@@ -31,7 +31,6 @@ corpus_stage_timeout=${CORPUS_STAGE_TIMEOUT:-300}
 corpus_fake=${CORPUS_FAKE:-0}
 alpine_root=${ALPINE_ROOT:-"$project_dir/test-rootfs"}
 linuxemu="$project_dir/build/linuxemu"
-timeout_command=${TIMEOUT_COMMAND:-timeout}
 corpus_base_root=$alpine_root
 corpus_fresh_rootfs=${CORPUS_FRESH_ROOTFS:-1}
 corpus_manifest_dir=${CORPUS_MANIFEST_DIR:-"$project_dir/docs/corpus"}
@@ -51,6 +50,26 @@ corpus_world=$(corpus_world_path)
 
 # ---- helpers for app definitions -------------------------------------
 
+# corpus_timeout <seconds> <command> [args...]: run the command and SIGKILL
+# it after <seconds>; returns its status (>= 128 when killed). The
+# harness's own watchdog: BerryCore's GNU timeout 8.29 never fires on QNX.
+# The watchdog's descriptors are closed so a $( ) capture does not wait
+# for it.
+corpus_timeout()
+{
+    ct_seconds=$1
+    shift
+    "$@" &
+    ct_pid=$!
+    ( sleep "$ct_seconds"; kill -KILL "$ct_pid" ) \
+        </dev/null >/dev/null 2>&1 &
+    ct_watchdog=$!
+    wait "$ct_pid"
+    ct_status=$?
+    kill -KILL "$ct_watchdog" 2>/dev/null
+    return "$ct_status"
+}
+
 rootfs_path()
 {
     printf '%s%s\n' "$alpine_root" "$1"
@@ -62,9 +81,10 @@ guest()
     guest_timeout=$1
     guest_program=$2
     shift 2
-    LINUXEMU_ROOT="$alpine_root" \
+    # env, not prefix assignments: those don't portably reach the command
+    # a shell function starts.
+    corpus_timeout "$guest_timeout" env LINUXEMU_ROOT="$alpine_root" \
         LINUXEMU_DIAGNOSTICS="$corpus_app_out/diagnostics.txt" \
-        "$timeout_command" -s 9 "$guest_timeout" \
         "$linuxemu" "$alpine_root$guest_program" ${1+"$@"}
 }
 
@@ -113,16 +133,22 @@ wait_gone()
 }
 
 # wait_http <port> <seconds>: 0 once http://127.0.0.1:<port>/ answers.
+# Counts wall-clock seconds, because each attempt itself takes time.
 wait_http()
 {
-    waited=0
+    deadline=$(( $(corpus_now) + $2 ))
     until guest 10 /bin/busybox wget -q -T 2 -O /dev/null \
             "http://127.0.0.1:$1/" 2>/dev/null; do
-        [ "$waited" -ge "$2" ] && return 1
+        [ "$(corpus_now)" -ge "$deadline" ] && return 1
         sleep 1
-        waited=$((waited + 1))
     done
     return 0
+}
+
+# first_line: the first non-blank line of standard input.
+first_line()
+{
+    awk 'NF { print; exit }'
 }
 
 # http_refused <port>: 0 when nothing answers on 127.0.0.1:<port>.
@@ -150,7 +176,7 @@ corpus_kill_bg()
 
 corpus_apk()
 {
-    LINUXEMU_ROOT="$alpine_root" "$timeout_command" -s 9 300 \
+    corpus_timeout 300 env LINUXEMU_ROOT="$alpine_root" \
         "$linuxemu" "$alpine_root/sbin/apk" ${1+"$@"}
 }
 
@@ -273,7 +299,7 @@ corpus_run_stage()
         corpus_record "$stage" pass "$seconds" ""
         return 0
     fi
-    note=$(head -n 1 "$log" | tr '\t\r' '  ' | cut -c1-120)
+    note=$(first_line < "$log" | tr '\t\r' '  ' | cut -c1-120)
     [ -n "$note" ] || note="exit $status"
     corpus_record "$stage" fail "$seconds" "$note"
     return 1
