@@ -222,5 +222,43 @@ grep -q '^demo install=pass startup=fail .* compatible=no ' \
     "$work/install-alone/out/summary.txt" 2>/dev/null
 check $? "install-alone: installation alone is not compatibility"
 
+# Default install: the pinned closure is checked against its manifest
+# before apk runs. CORPUS_MANIFEST_DIR / CORPUS_ARCHIVE_DIR point at a
+# temporary closure here.
+pinned_case()
+{
+    case_name=$1
+    mkdir -p "$work/$case_name/archive/demo" "$work/$case_name/manifests"
+    printf 'pinned package bytes\n' > "$work/$case_name/archive/demo/demo-1.0-r0.apk"
+    ( cd "$work/$case_name" &&
+        sha256sum archive/demo/demo-1.0-r0.apk ) \
+        > "$work/$case_name/manifests/demo-apks.sha256"
+    new_app "$case_name" demo <<'APP'
+corpus_packages=demo
+stage_startup() { return 0; }
+APP
+}
+
+pinned_case pinned-install
+( CORPUS_MANIFEST_DIR="$work/pinned-install/manifests"
+  CORPUS_ARCHIVE_DIR="$work/pinned-install/archive"
+  CORPUS_PROJECT_RELATIVE="$work/pinned-install"
+  export CORPUS_MANIFEST_DIR CORPUS_ARCHIVE_DIR CORPUS_PROJECT_RELATIVE
+  run_corpus pinned-install demo )
+[ "$(result pinned-install demo install | cut -f1)" = pass ]
+check $? "pinned-install: verified closure installs"
+
+pinned_case tampered-archive
+printf 'tampered\n' >> "$work/tampered-archive/archive/demo/demo-1.0-r0.apk"
+( CORPUS_MANIFEST_DIR="$work/tampered-archive/manifests"
+  CORPUS_ARCHIVE_DIR="$work/tampered-archive/archive"
+  CORPUS_PROJECT_RELATIVE="$work/tampered-archive"
+  export CORPUS_MANIFEST_DIR CORPUS_ARCHIVE_DIR CORPUS_PROJECT_RELATIVE
+  run_corpus tampered-archive demo )
+[ "$(result tampered-archive demo install)" = "fail${tab}pinned archive check failed" ]
+check $? "tampered-archive: install fails before apk runs"
+[ ! -e "$work/tampered-archive/installed/.linuxemu-corpus-demo" ]
+check $? "tampered-archive: apk was never called"
+
 echo "corpus_harness_test_failures=$failures"
 test "$failures" -eq 0

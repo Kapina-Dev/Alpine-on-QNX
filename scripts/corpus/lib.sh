@@ -15,6 +15,11 @@
 #   CORPUS_FAKE=1         host test mode: no Linuxemu or rootfs; the world
 #                         file is CORPUS_FAKE_WORLD and installed virtual
 #                         packages are marker files in CORPUS_FAKE_INSTALLED
+#   CORPUS_FRESH_ROOTFS   1 (default): each app runs in a fresh copy of the
+#                         base rootfs, so pinned closures that upgrade base
+#                         packages never change the shared test rootfs
+#   CORPUS_MANIFEST_DIR   pinned manifests (default docs/corpus)
+#   CORPUS_ARCHIVE_DIR    pinned closures (default artifacts/corpus)
 
 # Portability: the Passport's /bin/sh is QNX ksh, where an empty "$@" under
 # set -u is an error, so argument lists are passed as ${1+"$@"}.
@@ -27,11 +32,22 @@ corpus_fake=${CORPUS_FAKE:-0}
 alpine_root=${ALPINE_ROOT:-"$project_dir/test-rootfs"}
 linuxemu="$project_dir/build/linuxemu"
 timeout_command=${TIMEOUT_COMMAND:-timeout}
-if [ "$corpus_fake" = 1 ]; then
-    corpus_world=$CORPUS_FAKE_WORLD
-else
-    corpus_world="$alpine_root/etc/apk/world"
-fi
+corpus_base_root=$alpine_root
+corpus_fresh_rootfs=${CORPUS_FRESH_ROOTFS:-1}
+corpus_manifest_dir=${CORPUS_MANIFEST_DIR:-"$project_dir/docs/corpus"}
+corpus_archive_dir=${CORPUS_ARCHIVE_DIR:-"$project_dir/artifacts/corpus"}
+# Manifest paths are relative to this directory (the project, normally).
+corpus_manifest_base=${CORPUS_PROJECT_RELATIVE:-"$project_dir"}
+
+corpus_world_path()
+{
+    if [ "$corpus_fake" = 1 ]; then
+        echo "$CORPUS_FAKE_WORLD"
+    else
+        echo "$alpine_root/etc/apk/world"
+    fi
+}
+corpus_world=$(corpus_world_path)
 
 # ---- helpers for app definitions -------------------------------------
 
@@ -113,11 +129,37 @@ corpus_remove_virtual()
     fi
 }
 
-# Default install: the pinned offline closure (Task 2 of the plan).
+# Default install: verify the pinned offline closure against its manifest,
+# then install exactly the listed files under the app's virtual package.
 corpus_default_install()
 {
-    echo "pinned install not implemented"
-    return 1
+    manifest="$corpus_manifest_dir/$corpus_app-apks.sha256"
+    if [ ! -s "$manifest" ] || ! ( cd "$corpus_manifest_base" &&
+            sha256sum -c "$manifest" ) >/dev/null 2>&1; then
+        echo "pinned archive check failed"
+        return 1
+    fi
+    if [ "$corpus_fake" = 1 ]; then
+        touch "$CORPUS_FAKE_INSTALLED/$corpus_virtual"
+        return 0
+    fi
+    staging="$alpine_root/tmp/linuxemu-corpus-apks"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    awk '{ print $2 }' "$manifest" | while read -r file; do
+        cp "$corpus_manifest_base/$file" "$staging/" || exit 1
+    done || { echo "copying the pinned closure failed"; return 1; }
+    ( cd "$alpine_root" && corpus_apk add --no-network --no-chown \
+        --allow-untrusted --virtual "$corpus_virtual" \
+        tmp/linuxemu-corpus-apks/*.apk )
+    status=$?
+    rm -rf "$staging"
+    [ "$status" -eq 0 ] || { echo "apk add failed: exit $status"; return 1; }
+    for package in $corpus_packages; do
+        corpus_apk info -e "$package" >/dev/null 2>&1 ||
+            { echo "not installed after apk add: $package"; return 1; }
+    done
+    return 0
 }
 
 # ---- stage runner ------------------------------------------------------
@@ -204,6 +246,14 @@ corpus_run_app()
     corpus_packages=
     corpus_virtual=".linuxemu-corpus-$corpus_app"
     . "$1"
+    if [ "$corpus_fake" != 1 ] && [ "$corpus_fresh_rootfs" = 1 ]; then
+        alpine_root="$corpus_app_out/rootfs"
+        mkdir -p "$alpine_root"
+        ( cd "$corpus_base_root" && tar cf - . ) |
+            ( cd "$alpine_root" && tar xf - ) ||
+            { echo "copying the base rootfs failed" >&2; return 1; }
+    fi
+    corpus_world=$(corpus_world_path)
     cp "$corpus_world" "$corpus_app_out/world.before"
 
     failed=
@@ -214,6 +264,7 @@ corpus_run_app()
             [ "$stage" = install ] && continue
             corpus_record "$stage" skip 0 "after install failed"
         done
+        [ "$alpine_root" = "$corpus_base_root" ] || rm -rf "$alpine_root"
         return 0
     fi
     for stage in $corpus_stages; do
@@ -231,6 +282,9 @@ corpus_run_app()
     corpus_remove_virtual >> "$corpus_app_out/cleanup.log" 2>&1
     if ! cmp -s "$corpus_world" "$corpus_app_out/world.before"; then
         echo "world_restore $corpus_app failed" >> "$corpus_out/world-failures"
+    fi
+    if [ "$alpine_root" != "$corpus_base_root" ]; then
+        rm -rf "$alpine_root"
     fi
     return 0
 }

@@ -1,0 +1,9 @@
+457ed4f4af89c85ce86ad47f7c534e828f47e3a1ad0f8007e8bb18476df3701e  artifacts/corpus/nginx/busybox-1.37.0-r31.apk
+45005253b1461275f5f1a9341670bf2fa6227aac1da305d6249ad38ac0baaf4f  artifacts/corpus/nginx/busybox-binsh-1.37.0-r31.apk
+ca2f99fd08bebf49f3ca34ed8768cf78f90f5e714040cb36d47e8f3f8b33d1eb  artifacts/corpus/nginx/libcrypto3-3.5.9-r0.apk
+6a7e563fcc008a86d539831d1b815337090a45712bb7c5cb5ec407a98bc49847  artifacts/corpus/nginx/libssl3-3.5.9-r0.apk
+92bfd0a1f6dafd001304a865077577c46634c16863f1f969c2e436024cb6fe13  artifacts/corpus/nginx/musl-1.2.6-r3.apk
+29f831b07b85b08e181c8643a534ece464512c4b05dde20f6f54c8c188479c88  artifacts/corpus/nginx/nginx-1.30.6-r0.apk
+b85e663e850030828b4a37aa6d9acf0da6e699c1cbb2683fab109e1045540c7d  artifacts/corpus/nginx/pcre2-10.49-r0.apk
+479968141d81edcacae8d8f0253e037403a4ad0494fcb23877a87421e5180043  artifacts/corpus/nginx/ssl_client-1.37.0-r31.apk
+baaa6958647fb0e67844020cbfc3643efa4550d542313a394c680dde904317a5  artifacts/corpus/nginx/zlib-1.4-r0.apk

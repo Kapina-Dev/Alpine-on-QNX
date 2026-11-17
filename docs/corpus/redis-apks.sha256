@@ -1,0 +1,8 @@
+457ed4f4af89c85ce86ad47f7c534e828f47e3a1ad0f8007e8bb18476df3701e  artifacts/corpus/redis/busybox-1.37.0-r31.apk
+45005253b1461275f5f1a9341670bf2fa6227aac1da305d6249ad38ac0baaf4f  artifacts/corpus/redis/busybox-binsh-1.37.0-r31.apk
+ca2f99fd08bebf49f3ca34ed8768cf78f90f5e714040cb36d47e8f3f8b33d1eb  artifacts/corpus/redis/libcrypto3-3.5.9-r0.apk
+bec8d209054b2431407d0893c7af4f2bea89af4045a7d55cd394c3e36d021df8  artifacts/corpus/redis/libgcc-15.2.0-r5.apk
+6a7e563fcc008a86d539831d1b815337090a45712bb7c5cb5ec407a98bc49847  artifacts/corpus/redis/libssl3-3.5.9-r0.apk
+92bfd0a1f6dafd001304a865077577c46634c16863f1f969c2e436024cb6fe13  artifacts/corpus/redis/musl-1.2.6-r3.apk
+ea0cdda5575e7d776ed83675462d26ba5572ce1a812b98c9cbd7aeee83d03429  artifacts/corpus/redis/redis-8.8.0-r0.apk
+479968141d81edcacae8d8f0253e037403a4ad0494fcb23877a87421e5180043  artifacts/corpus/redis/ssl_client-1.37.0-r31.apk
