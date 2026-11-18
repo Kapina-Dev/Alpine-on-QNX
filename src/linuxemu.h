@@ -123,6 +123,8 @@ int32_t linux_pwritev(int fd, const struct iovec *iov, int32_t count,
     int64_t offset, uint32_t flags, int vectored_kind);
 int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset,
     uint32_t count);
+int32_t linux_fallocate(int fd, uint32_t mode, int64_t offset,
+    int64_t length);
 int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
     const char *detail, const uint32_t *args);
 int32_t guest_signal_send(pid_t process, int linux_signal, uint32_t number,

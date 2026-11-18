@@ -757,9 +757,20 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     }
     case 12:
     case 13:
-    case 14: {
+    case 14:
+    case 36:
+    case 37:
+    case 38: {
+        /* 36/37/38 are the open-file-description locks.  QNX has only
+           per-process record locks, so they reuse the 12/13/14 path:
+           an approximation (locks belong to the process, not the open
+           file description; closing any descriptor of the file drops
+           them).  The request pid must be 0, as on Linux. */
+        int ofd = command >= 36;
+        int base = ofd ? command - 24 : command;
         struct linux_flock64 guest_lock;
         struct flock host_lock;
+        if (argument == 0) return -EFAULT;
         memcpy(&guest_lock, (const void *)argument, sizeof(guest_lock));
         memset(&host_lock, 0, sizeof(host_lock));
         if (guest_lock.type == 0) host_lock.l_type = F_RDLCK;
@@ -768,21 +779,56 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
         else return -EINVAL;
         if (guest_lock.whence < SEEK_SET || guest_lock.whence > SEEK_END)
             return -EINVAL;
+        if (ofd && guest_lock.pid != 0) return -EINVAL;
         host_lock.l_whence = guest_lock.whence;
         host_lock.l_start = (off_t)guest_lock.start;
         host_lock.l_len = (off_t)guest_lock.length;
-        result = fcntl(fd, command == 12 ? F_GETLK :
-            command == 13 ? F_SETLK : F_SETLKW, &host_lock);
-        if (result == 0 && command == 12) {
+        result = fcntl(fd, base == 12 ? F_GETLK :
+            base == 13 ? F_SETLK : F_SETLKW, &host_lock);
+        if (result == 0 && base == 12) {
             guest_lock.type = host_lock.l_type == F_RDLCK ? 0 :
                 host_lock.l_type == F_WRLCK ? 1 : 2;
             guest_lock.whence = host_lock.l_whence;
             guest_lock.start = host_lock.l_start;
             guest_lock.length = host_lock.l_len;
-            guest_lock.pid = host_lock.l_pid;
+            guest_lock.pid = ofd ? -1 : host_lock.l_pid;
             memcpy((void *)argument, &guest_lock, sizeof(guest_lock));
         }
         break;
+    }
+    case 8:
+    case 9: {
+        /* F_SETOWN/F_GETOWN: QNX answers ENOSYS (measured on the device),
+           so there is nothing to forward; Linux EINVAL, reported. */
+        uint32_t arguments[3];
+        arguments[0] = (uint32_t)fd;
+        arguments[1] = (uint32_t)command;
+        arguments[2] = argument;
+        return linux_report_unsupported(221, EINVAL, "fcntl-owner",
+            arguments);
+    }
+    case 1032:
+    case 1031: {
+        /* F_GETPIPE_SZ / F_SETPIPE_SZ: the QNX pipe buffer is fixed, so
+           report it and accept a request that fits in it. */
+        struct stat status;
+        long size;
+        if (fstat(fd, &status) != 0) return linux_host_result(-1);
+        if (!S_ISFIFO(status.st_mode)) return -EBADF;
+        size = fpathconf(fd, _PC_PIPE_BUF);
+        if (size <= 0) size = 5120;
+        if (command == 1031 && argument > (uint32_t)size) return -EPERM;
+        return (int32_t)size;
+    }
+    case 1033:
+    case 1034: {
+        /* F_ADD_SEALS / F_GET_SEALS: no memfd, so no sealable file. */
+        uint32_t arguments[3];
+        arguments[0] = (uint32_t)fd;
+        arguments[1] = (uint32_t)command;
+        arguments[2] = argument;
+        return linux_report_unsupported(221, EINVAL, "fcntl-seals",
+            arguments);
     }
     default: return -EINVAL;
     }
@@ -1444,6 +1490,14 @@ void linux_syscall_dispatch(ucontext_t *context)
                 flags, kind);
         break;
     }
+    case 352:
+        result = linux_fallocate((int)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1],
+            (int64_t)(((uint64_t)context->uc_mcontext.cpu.gpr[3] << 32) |
+                context->uc_mcontext.cpu.gpr[2]),
+            (int64_t)(((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32) |
+                context->uc_mcontext.cpu.gpr[4]));
+        break;
     case 239:
         result = linux_sendfile64((int)context->uc_mcontext.cpu.gpr[0],
             (int)context->uc_mcontext.cpu.gpr[1],

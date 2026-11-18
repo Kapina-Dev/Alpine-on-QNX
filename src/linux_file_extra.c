@@ -1,9 +1,11 @@
 /* File calls QNX lacks: vector positional I/O and sendfile64, emulated with
    loops.  These run inside the SIGILL handler: no malloc, no stdio. */
+#define _LARGEFILE64_SOURCE 1
 #include "linuxemu.h"
 #include "guest_fd.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <string.h>
 #include <sys/uio.h>
@@ -16,6 +18,8 @@
 #define LINUX_EBADF 9
 #define LINUX_EFAULT 14
 #define LINUX_EINVAL 22
+#define LINUX_EFBIG 27
+#define LINUX_NR_FALLOCATE 352
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_RWF_DSYNC 2u
 #define LINUX_RWF_SYNC 4u
@@ -172,4 +176,30 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
     }
     if (total > 0) return (int32_t)total;
     return error;
+}
+
+int32_t linux_fallocate(int fd, uint32_t mode, int64_t offset, int64_t length)
+{
+    int error;
+    if (guest_fd_is_hidden(fd)) return -LINUX_EBADF;
+    if (offset < 0 || length <= 0) return -LINUX_EINVAL;
+    if (offset > INT64_MAX - length) return -LINUX_EFBIG;
+    if (mode != 0) {
+        /* KEEP_SIZE, punch hole, collapse and zero range have no QNX
+           equivalent; posix_fallocate only extends. */
+        uint32_t arguments[6];
+        arguments[0] = (uint32_t)fd;
+        arguments[1] = mode;
+        arguments[2] = (uint32_t)offset;
+        arguments[3] = (uint32_t)((uint64_t)offset >> 32);
+        arguments[4] = (uint32_t)length;
+        arguments[5] = (uint32_t)((uint64_t)length >> 32);
+        return linux_report_unsupported(LINUX_NR_FALLOCATE,
+            LINUX_EOPNOTSUPP, "fallocate-mode", arguments);
+    }
+    /* posix_fallocate returns the error number and leaves errno alone.
+       The core is built with a 32-bit off_t, so call the 64-bit variant
+       to keep offsets above 4 GiB intact. */
+    error = posix_fallocate64(fd, (off64_t)offset, (off64_t)length);
+    return error == 0 ? 0 : -(int32_t)linux_errno_number(error);
 }
