@@ -14,12 +14,13 @@
 #define LINUX_NR_PREADV2 392
 #define LINUX_NR_PWRITEV2 393
 #define LINUX_EBADF 9
+#define LINUX_EFAULT 14
 #define LINUX_EINVAL 22
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_RWF_DSYNC 2u
 #define LINUX_RWF_SYNC 4u
 #define LINUX_IOV_MAX 1024
-#define SENDFILE_CHUNK (16 * 1024)
+#define SENDFILE_CHUNK (4 * 1024)
 #define SENDFILE_MAX 0x7ffff000u
 
 static int32_t host_errno_result(void)
@@ -41,6 +42,7 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
 
     if (guest_fd_is_hidden(fd)) return -LINUX_EBADF;
     if (count < 0 || count > LINUX_IOV_MAX) return -LINUX_EINVAL;
+    if (count > 0 && vector == 0) return -LINUX_EFAULT;
     if (!vectored_kind) flags = 0;
     if ((flags & ~allowed) != 0) {
         arguments[0] = (uint32_t)fd;
@@ -116,6 +118,17 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
 
     if (guest_fd_is_hidden(out_fd) || guest_fd_is_hidden(in_fd))
         return -LINUX_EBADF;
+    if (lseek(in_fd, 0, SEEK_CUR) < 0) {
+        /* pipe, socket or tty input: Linux needs an mmappable file */
+        uint32_t arguments[6];
+        arguments[0] = (uint32_t)out_fd;
+        arguments[1] = (uint32_t)in_fd;
+        arguments[2] = (uint32_t)(uintptr_t)offset_pointer;
+        arguments[3] = count;
+        arguments[4] = arguments[5] = 0;
+        return linux_report_unsupported(239, LINUX_EINVAL,
+            "sendfile-input", arguments);
+    }
     if (offset_pointer != 0) {
         memcpy(&offset, offset_pointer, sizeof(offset));
         if (offset < 0) return -LINUX_EINVAL;
@@ -145,8 +158,9 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
         if (written < (size_t)got) {
             /* the input position moved past what was delivered: put it back
                so a restart or the caller's next call sees the true state */
-            if (offset_pointer == 0)
-                lseek(in_fd, -(off_t)((size_t)got - written), SEEK_CUR);
+            if (offset_pointer == 0 && lseek(in_fd,
+                    -(off_t)((size_t)got - written), SEEK_CUR) < 0)
+                error = host_errno_result();
             break;
         }
     }

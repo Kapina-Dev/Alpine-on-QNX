@@ -6,7 +6,7 @@
 
 /*
  * preadv, pwritev, preadv2, pwritev2 and sendfile64.  Each failing check
- * exits with its own number (10..21); 9 is a setup failure.  The file is
+ * exits with its own number (10..23); 9 is a setup failure.  The file is
  * /tmp/linuxemu-vec: 64 bytes of pattern, later 124 bytes.
  */
     .macro sys nr
@@ -245,6 +245,50 @@ _start:
     sys 239
     wanterr 9, f21
 
+    /* 22: a NULL iov with count 1 = -EFAULT, all four calls */
+    mov r0, r8
+    mov r1, #0
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    sys 361
+    wanterr 14, f22
+    mov r0, r8
+    mov r1, #0
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    sys 362
+    wanterr 14, f22
+    mov r0, r8
+    mov r1, #0
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    mov r5, #0
+    sys 392
+    wanterr 14, f22
+    mov r0, r8
+    mov r1, #0
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    mov r5, #0
+    sys 393
+    wanterr 14, f22
+
+    /* 23: sendfile64 from a pipe input = -EINVAL */
+    ldr r0, =pipefds
+    sys 42
+    want 0, f23
+    ldr r3, =pipefds
+    ldr r1, [r3]
+    mov r0, r9
+    mov r2, #0
+    mov r3, #20
+    sys 239
+    wanterr 22, f23
+
     ldr r0, =path
     sys 10
     ldr r0, =path_out
@@ -264,7 +308,9 @@ f17: mov r0, #17; b exit_guest
 f18: mov r0, #18; b exit_guest
 f19: mov r0, #19; b exit_guest
 f20: mov r0, #20; b exit_guest
-f21: mov r0, #21
+f21: mov r0, #21; b exit_guest
+f22: mov r0, #22; b exit_guest
+f23: mov r0, #23
 exit_guest:
     mov r7, #1
     svc #0
@@ -302,4 +348,5 @@ riov1: .word rbuf2, 8
 rbuf: .space 24
 rbuf2: .space 8
 offset: .space 8
+pipefds: .space 8
 old_limit: .space 16

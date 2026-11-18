@@ -6,6 +6,8 @@
  *   11 sendfile into a full pipe with an SA_RESTART handler and a signal from a forked child
  *      did not return a positive partial count after the signal fired
  *   12 the offset or the pipe contents do not match the partial count
+ *   14 NULL-offset sendfile left the input position out of step with the
+ *      returned count after a short or refused write
  *   13 preadv2 (offset -1) on an empty pipe without SA_RESTART did not
  *      fail with EINTR
  */
@@ -93,7 +95,9 @@ int main(void)
     install(SA_RESTART);
     child = arm_signal();
     result = sendfile(pipefd[1], file, &offset, TOTAL);
-    if (result <= 0 || fired == 0 || result >= TOTAL)
+    /* 4 KiB buffer, 4 KiB pipe: at least one whole chunk moved and the next
+       one was interrupted */
+    if (result < 4096 || fired == 0 || result >= TOTAL)
         return fail(11, "no partial count after the signal");
 
     /* 12: offset and pipe contents agree with the count */
@@ -106,6 +110,29 @@ int main(void)
     }
     if (drained != (size_t)result || memcmp(sink, source, drained) != 0)
         return fail(12, "pipe contents differ from the source");
+
+    /* 14: NULL offset, nonblocking full pipe: the input position must equal
+       the start plus what was returned, never past it */
+    {
+        int full[2];
+        char fill[4096], sink2[200];
+        off_t start, position;
+        memset(fill, 'x', sizeof(fill));
+        if (pipe(full) != 0) return fail(10, "pipe");
+        fcntl(full[1], F_SETFL, O_NONBLOCK);
+        while (write(full[1], fill, sizeof(fill)) > 0) {}
+        start = lseek(file, 1000, SEEK_SET);
+        result = sendfile(full[1], file, 0, 3000);
+        position = lseek(file, 0, SEEK_CUR);
+        if (result > 0 ? position != start + result : position != start)
+            return fail(14, "rewind after a refused write");
+        if (read(full[0], sink2, 100) != 100) return fail(10, "drain");
+        start = position;
+        result = sendfile(full[1], file, 0, 3000);
+        position = lseek(file, 0, SEEK_CUR);
+        if (result > 0 ? position != start + result : position != start)
+            return fail(14, "rewind after a short write");
+    }
 
     /* 13: preadv2 offset -1 on an empty pipe, no SA_RESTART -> EINTR */
     vector.iov_base = &byte;
