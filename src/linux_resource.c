@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/neutrino.h>
+#include <signal.h>
 
 #define LINUX_NR_SETRLIMIT 75
 #define LINUX_NR_GETRUSAGE 77
@@ -20,9 +22,63 @@
 #define LINUX_NR_UGETRLIMIT 191
 #define LINUX_NR_PRLIMIT64 369
 
+#define LINUX_NR_GETPRIORITY 96
+#define LINUX_NR_SETPRIORITY 97
+#define LINUX_NR_SCHED_SETPARAM 154
+#define LINUX_NR_SCHED_GETPARAM 155
+#define LINUX_NR_SCHED_SETSCHEDULER 156
+#define LINUX_NR_SCHED_GETSCHEDULER 157
+#define LINUX_NR_PRCTL 172
+#define LINUX_NR_CAPGET 184
+#define LINUX_NR_CAPSET 185
+#define LINUX_NR_SCHED_SETAFFINITY 241
+#define LINUX_NR_SCHED_GETAFFINITY 242
+#define LINUX_NR_MEMBARRIER 389
+
 #define LINUX_EPERM 1
+#define LINUX_ESRCH 3
+#define LINUX_EACCES 13
 #define LINUX_EINVAL 22
 #define LINUX_ENOSYS 38
+
+#define LINUX_PRIO_PROCESS 0
+#define LINUX_PRIO_PGRP 1
+#define LINUX_PRIO_USER 2
+#define LINUX_NICE_MIN (-20)
+#define LINUX_NICE_MAX 19
+#define LINUX_NICE_BIAS 20
+
+#define LINUX_SCHED_OTHER 0
+#define LINUX_SCHED_FIFO 1
+#define LINUX_SCHED_RR 2
+#define LINUX_SCHED_BATCH 3
+#define LINUX_SCHED_UNUSED 4
+#define LINUX_SCHED_IDLE 5
+#define LINUX_SCHED_DEADLINE 6
+#define LINUX_SCHED_RESET_ON_FORK 0x40000000u
+#define LINUX_SCHED_RT_MIN 1
+#define LINUX_SCHED_RT_MAX 99
+
+#define LINUX_CAP_VERSION_1 0x19980330u
+#define LINUX_CAP_VERSION_2 0x20071026u
+#define LINUX_CAP_VERSION_3 0x20080522u
+
+#define LINUX_PR_SET_PDEATHSIG 1
+#define LINUX_PR_GET_PDEATHSIG 2
+#define LINUX_PR_GET_DUMPABLE 3
+#define LINUX_PR_SET_DUMPABLE 4
+#define LINUX_PR_SET_NAME 15
+#define LINUX_PR_GET_NAME 16
+#define LINUX_PR_SET_NO_NEW_PRIVS 38
+#define LINUX_PR_GET_NO_NEW_PRIVS 39
+#define LINUX_PR_SET_VMA 0x53564d41u
+#define LINUX_NSIG 64
+
+#define LINUX_MEMBARRIER_CMD_QUERY 0
+
+#define AFFINITY_WORDS_MAX 4
+#define AFFINITY_BITS_PER_WORD 32
+#define QNX_TCTL_RUNMASK_GET_AND_SET_INHERIT 10
 
 struct linux_rlimit64 {
     uint64_t current;
@@ -319,6 +375,353 @@ static int32_t linux_setitimer(uint32_t number, uint32_t which,
     return 0;
 }
 
+/* ---- priority, scheduler, affinity ---- */
+
+/* Whether pid names a task: 0 (the caller), a guest thread, or a process. */
+static int task_exists(int32_t pid)
+{
+    if (pid == 0 || guest_thread_kill(pid, 0) == 0) return 1;
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+}
+
+static int task_is_caller(int32_t pid)
+{
+    return pid == 0 || pid == (int32_t)getpid() ||
+        pid == guest_thread_tid();
+}
+
+/* Resolve a getpriority/setpriority target.  0 means the caller's own nice
+   value applies; anything else is the error to return. */
+static int32_t priority_target(uint32_t number, uint32_t which, int32_t who,
+    const uint32_t *args)
+{
+    switch (which) {
+    case LINUX_PRIO_PROCESS:
+        if (task_is_caller(who)) return 0;
+        if (!task_exists(who)) return -LINUX_ESRCH;
+        break;
+    case LINUX_PRIO_PGRP:
+        if (who == 0 || who == (int32_t)getpgrp()) return 0;
+        break;
+    case LINUX_PRIO_USER:
+        if (who == 0 || who == (int32_t)geteuid()) return 0;
+        break;
+    default:
+        return -LINUX_EINVAL;
+    }
+    return linux_report_unsupported(number, LINUX_EPERM,
+        "priority-other", args);
+}
+
+/* QNX's getpriority/setpriority are stubs (always 0, no state), so the nice
+   value is kept here and carried across exec.  It is recorded only: nothing
+   maps it onto a QNX scheduling priority. */
+static int32_t linux_getpriority(uint32_t number, uint32_t which,
+    int32_t who, const uint32_t *args)
+{
+    int32_t target = priority_target(number, which, who, args);
+    if (target != 0) return target;
+    return LINUX_NICE_BIAS - guest_process_nice();
+}
+
+static int32_t linux_setpriority(uint32_t number, uint32_t which,
+    int32_t who, int32_t value, const uint32_t *args)
+{
+    int32_t target = priority_target(number, which, who, args);
+    if (target != 0) return target;
+    if (value < LINUX_NICE_MIN) value = LINUX_NICE_MIN;
+    if (value > LINUX_NICE_MAX) value = LINUX_NICE_MAX;
+    /* Linux: without privilege a nice value cannot be lowered. */
+    if (value < guest_process_nice() && geteuid() != 0)
+        return -LINUX_EACCES;
+    guest_process_set_nice(value);
+    if (value != 0)
+        linux_report_unsupported(number, 0, "priority-no-effect", args);
+    return 0;
+}
+
+/* Every guest task runs SCHED_OTHER at priority 0 on QNX's default
+   scheduling; Linux's other policies cannot be honoured. */
+static int32_t linux_sched_getscheduler(int32_t pid)
+{
+    if (pid < 0) return -LINUX_EINVAL;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    return LINUX_SCHED_OTHER;
+}
+
+static int32_t linux_sched_getparam(int32_t pid, int32_t *guest)
+{
+    if (guest == 0 || pid < 0) return -LINUX_EINVAL;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    guest[0] = 0;
+    return 0;
+}
+
+static int32_t linux_sched_setparam(int32_t pid, const int32_t *guest)
+{
+    if (guest == 0 || pid < 0) return -LINUX_EINVAL;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    /* The policy is always SCHED_OTHER, whose only priority is 0. */
+    return guest[0] == 0 ? 0 : -LINUX_EINVAL;
+}
+
+static int32_t linux_sched_setscheduler(uint32_t number, int32_t pid,
+    uint32_t policy, const int32_t *guest, const uint32_t *args)
+{
+    uint32_t base = policy & ~LINUX_SCHED_RESET_ON_FORK;
+    if (guest == 0 || pid < 0) return -LINUX_EINVAL;
+    if (base > LINUX_SCHED_DEADLINE || base == LINUX_SCHED_UNUSED)
+        return -LINUX_EINVAL;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    if (base == LINUX_SCHED_FIFO || base == LINUX_SCHED_RR) {
+        if (guest[0] < LINUX_SCHED_RT_MIN || guest[0] > LINUX_SCHED_RT_MAX)
+            return -LINUX_EINVAL;
+        return linux_report_unsupported(number, LINUX_EPERM,
+            "sched-realtime", args);
+    }
+    if (guest[0] != 0) return -LINUX_EINVAL;
+    if (base != LINUX_SCHED_OTHER)
+        return linux_report_unsupported(number, LINUX_EPERM,
+            "sched-policy", args);
+    if ((policy & LINUX_SCHED_RESET_ON_FORK) != 0)
+        return linux_report_unsupported(number, LINUX_EINVAL,
+            "sched-reset-on-fork", args);
+    return 0;
+}
+
+static unsigned affinity_words(void)
+{
+    unsigned cpus = _syspage_ptr->num_cpu;
+    unsigned words = (cpus + AFFINITY_BITS_PER_WORD - 1) /
+        AFFINITY_BITS_PER_WORD;
+    if (words == 0) words = 1;
+    return words > AFFINITY_WORDS_MAX ? AFFINITY_WORDS_MAX : words;
+}
+
+/* ThreadCtl(_NTO_TCTL_RUNMASK_GET_AND_SET_INHERIT) sets the calling
+   thread's run mask and the mask its children inherit, and returns the old
+   ones in place.  (The plain _NTO_TCTL_RUNMASK_GET_AND_SET does not write
+   the old values back on this system.)  An all-zero run mask means no
+   restriction. */
+static int affinity_swap(unsigned words, const uint32_t *run,
+    const uint32_t *inherit, uint32_t *old_run, uint32_t *old_inherit)
+{
+    uint32_t buffer[1 + 2 * AFFINITY_WORDS_MAX];
+    unsigned i;
+    buffer[0] = words;
+    for (i = 0; i != words; ++i) {
+        buffer[1 + i] = run[i];
+        buffer[1 + words + i] = inherit[i];
+    }
+    if (ThreadCtl(QNX_TCTL_RUNMASK_GET_AND_SET_INHERIT, buffer) != EOK)
+        return -1;
+    for (i = 0; i != words; ++i) {
+        old_run[i] = buffer[1 + i];
+        old_inherit[i] = buffer[1 + words + i];
+    }
+    return 0;
+}
+
+/* Bits for the CPUs that exist, in the words QNX uses. */
+static void affinity_valid(unsigned words, uint32_t *valid)
+{
+    unsigned cpus = _syspage_ptr->num_cpu;
+    unsigned i;
+    for (i = 0; i != words; ++i) {
+        unsigned low = i * AFFINITY_BITS_PER_WORD;
+        if (cpus >= low + AFFINITY_BITS_PER_WORD) valid[i] = 0xffffffffu;
+        else if (cpus > low) valid[i] = (1u << (cpus - low)) - 1u;
+        else valid[i] = 0;
+    }
+}
+
+static int32_t linux_sched_getaffinity(int32_t pid, uint32_t size,
+    uint32_t *guest, const uint32_t *args)
+{
+    unsigned words = affinity_words(), i, any = 0;
+    uint32_t run[AFFINITY_WORDS_MAX], inherit[AFFINITY_WORDS_MAX];
+    uint32_t zero[AFFINITY_WORDS_MAX] = { 0 }, valid[AFFINITY_WORDS_MAX];
+    if (pid < 0) return -LINUX_EINVAL;
+    if (size < words * 4 || (size & 3) != 0) return -LINUX_EINVAL;
+    if (guest == 0) return -EFAULT;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    if (!task_is_caller(pid))
+        return linux_report_unsupported(LINUX_NR_SCHED_GETAFFINITY,
+            LINUX_EPERM, "affinity-other", args);
+    if (affinity_swap(words, zero, zero, run, inherit) != 0 ||
+            affinity_swap(words, run, inherit, zero, zero) != 0)
+        return -LINUX_EINVAL;
+    affinity_valid(words, valid);
+    for (i = 0; i != words; ++i) any |= run[i] & valid[i];
+    for (i = 0; i != words; ++i)
+        guest[i] = any == 0 ? valid[i] : run[i] & valid[i];
+    return (int32_t)(words * 4);
+}
+
+static int32_t linux_sched_setaffinity(int32_t pid, uint32_t size,
+    const uint32_t *guest, const uint32_t *args)
+{
+    unsigned words = affinity_words(), i, any = 0;
+    uint32_t mask[AFFINITY_WORDS_MAX] = { 0 }, valid[AFFINITY_WORDS_MAX];
+    uint32_t old_run[AFFINITY_WORDS_MAX], old_inherit[AFFINITY_WORDS_MAX];
+    if (pid < 0) return -LINUX_EINVAL;
+    if (guest == 0) return -EFAULT;
+    if (!task_exists(pid)) return -LINUX_ESRCH;
+    if (!task_is_caller(pid))
+        return linux_report_unsupported(LINUX_NR_SCHED_SETAFFINITY,
+            LINUX_EPERM, "affinity-other", args);
+    /* Linux reads as much of the mask as it has CPUs for, and zero-fills a
+       short one. */
+    if (size > words * 4) size = words * 4;
+    memcpy(mask, guest, size & ~3u);
+    affinity_valid(words, valid);
+    for (i = 0; i != words; ++i) {
+        mask[i] &= valid[i];
+        any |= mask[i];
+    }
+    if (any == 0) return -LINUX_EINVAL;
+    if (affinity_swap(words, mask, mask, old_run, old_inherit) != 0)
+        return -LINUX_EINVAL;
+    return 0;
+}
+
+/* ---- capabilities ---- */
+
+struct linux_cap_header {
+    uint32_t version;
+    int32_t pid;
+};
+
+/* Number of 32-bit capability words per set, or 0 for an unknown version. */
+static unsigned cap_elements(uint32_t version)
+{
+    switch (version) {
+    case LINUX_CAP_VERSION_1: return 1;
+    case LINUX_CAP_VERSION_2:
+    case LINUX_CAP_VERSION_3: return 2;
+    default: return 0;
+    }
+}
+
+/* QNX processes have no Linux capability sets: every set reads as empty and
+   only an empty set can be installed. */
+static int32_t cap_header_check(struct linux_cap_header *header,
+    unsigned *elements)
+{
+    if (header == 0) return -EFAULT;
+    *elements = cap_elements(header->version);
+    if (*elements == 0) {
+        header->version = LINUX_CAP_VERSION_3;
+        return -LINUX_EINVAL;
+    }
+    if (header->pid < 0) return -LINUX_EINVAL;
+    return 0;
+}
+
+static int32_t linux_capget(struct linux_cap_header *header, uint32_t *data)
+{
+    unsigned elements;
+    int32_t result = cap_header_check(header, &elements);
+    if (result != 0) return result;
+    if (data == 0) return 0;
+    if (!task_exists(header->pid)) return -LINUX_ESRCH;
+    /* Each element is {effective, permitted, inheritable}. */
+    memset(data, 0, elements * 3 * sizeof(uint32_t));
+    return 0;
+}
+
+static int32_t linux_capset(struct linux_cap_header *header,
+    const uint32_t *data, const uint32_t *args)
+{
+    unsigned elements, i;
+    int32_t result = cap_header_check(header, &elements);
+    if (result != 0) return result;
+    if (data == 0) return -EFAULT;
+    if (header->pid != 0 && header->pid != (int32_t)getpid())
+        return -LINUX_EPERM;
+    for (i = 0; i != elements * 3; ++i)
+        if (data[i] != 0)
+            return linux_report_unsupported(LINUX_NR_CAPSET, LINUX_EPERM,
+                "capset-nonzero", args);
+    return 0;
+}
+
+/* ---- prctl ---- */
+
+static int linux_dumpable = 1;
+static int linux_pdeathsig;
+
+/* Linux clears the parent-death signal in a fork child. */
+void linux_resource_after_fork(void)
+{
+    linux_pdeathsig = 0;
+}
+
+/* prctl options bionic and glibc/musl use.  PR_SET_VMA (anonymous mapping
+   names) is not available here: EINVAL, as on a Linux kernel without
+   CONFIG_ANON_VMA_NAME.  Unknown options are EINVAL, as on Linux.
+   PR_SET_PDEATHSIG is stored but QNX has no parent-death notification
+   (procmgr events cover daemon death only), so the signal is never sent. */
+static int32_t linux_prctl(const uint32_t *args)
+{
+    char name[16];
+    switch (args[0]) {
+    case LINUX_PR_SET_NAME:
+        if (args[1] == 0) return -EFAULT;
+        memset(name, 0, sizeof(name));
+        strncpy(name, (const char *)(uintptr_t)args[1], sizeof(name) - 1);
+        guest_thread_name_set(name);
+        return 0;
+    case LINUX_PR_GET_NAME:
+        if (args[1] == 0) return -EFAULT;
+        guest_thread_name_get(name);
+        memcpy((void *)(uintptr_t)args[1], name, sizeof(name));
+        return 0;
+    case LINUX_PR_SET_PDEATHSIG:
+        if (args[1] > LINUX_NSIG) return -LINUX_EINVAL;
+        linux_pdeathsig = (int)args[1];
+        if (args[1] != 0)
+            linux_report_unsupported(LINUX_NR_PRCTL, 0,
+                "pdeathsig-delivery", args);
+        return 0;
+    case LINUX_PR_GET_PDEATHSIG:
+        if (args[1] == 0) return -EFAULT;
+        *(int32_t *)(uintptr_t)args[1] = linux_pdeathsig;
+        return 0;
+    case LINUX_PR_GET_DUMPABLE:
+        return linux_dumpable;
+    case LINUX_PR_SET_DUMPABLE:
+        if (args[1] > 1) return -LINUX_EINVAL;
+        linux_dumpable = (int)args[1];
+        return 0;
+    case LINUX_PR_SET_NO_NEW_PRIVS:
+        /* Only ever set, never cleared; the other arguments must be 0. */
+        if (args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0)
+            return -LINUX_EINVAL;
+        guest_process_set_no_new_privs();
+        return 0;
+    case LINUX_PR_GET_NO_NEW_PRIVS:
+        if (args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0)
+            return -LINUX_EINVAL;
+        return guest_process_no_new_privs();
+    case LINUX_PR_SET_VMA:
+        return linux_report_unsupported(LINUX_NR_PRCTL, LINUX_EINVAL,
+            "prctl-set-vma", args);
+    default:
+        return linux_report_unsupported(LINUX_NR_PRCTL, LINUX_EINVAL,
+            "prctl-option", args);
+    }
+}
+
+/* No memory barrier is faked: QUERY reports that no command is supported. */
+static int32_t linux_membarrier(uint32_t number, uint32_t command,
+    const uint32_t *args)
+{
+    if (command == LINUX_MEMBARRIER_CMD_QUERY) return 0;
+    return linux_report_unsupported(number, LINUX_EINVAL,
+        "membarrier-cmd", args);
+}
+
 int32_t linux_resource_syscall(uint32_t number, uint32_t args[6])
 {
     switch (number) {
@@ -348,6 +751,37 @@ int32_t linux_resource_syscall(uint32_t number, uint32_t args[6])
             (uint32_t *)args[2], args);
     case LINUX_NR_GETITIMER:
         return linux_getitimer(number, args[0], (uint32_t *)args[1], args);
+    case LINUX_NR_GETPRIORITY:
+        return linux_getpriority(number, args[0], (int32_t)args[1], args);
+    case LINUX_NR_SETPRIORITY:
+        return linux_setpriority(number, args[0], (int32_t)args[1],
+            (int32_t)args[2], args);
+    case LINUX_NR_SCHED_SETPARAM:
+        return linux_sched_setparam((int32_t)args[0],
+            (const int32_t *)args[1]);
+    case LINUX_NR_SCHED_GETPARAM:
+        return linux_sched_getparam((int32_t)args[0], (int32_t *)args[1]);
+    case LINUX_NR_SCHED_SETSCHEDULER:
+        return linux_sched_setscheduler(number, (int32_t)args[0], args[1],
+            (const int32_t *)args[2], args);
+    case LINUX_NR_SCHED_GETSCHEDULER:
+        return linux_sched_getscheduler((int32_t)args[0]);
+    case LINUX_NR_SCHED_SETAFFINITY:
+        return linux_sched_setaffinity((int32_t)args[0], args[1],
+            (const uint32_t *)args[2], args);
+    case LINUX_NR_SCHED_GETAFFINITY:
+        return linux_sched_getaffinity((int32_t)args[0], args[1],
+            (uint32_t *)args[2], args);
+    case LINUX_NR_CAPGET:
+        return linux_capget((struct linux_cap_header *)args[0],
+            (uint32_t *)args[1]);
+    case LINUX_NR_CAPSET:
+        return linux_capset((struct linux_cap_header *)args[0],
+            (const uint32_t *)args[1], args);
+    case LINUX_NR_PRCTL:
+        return linux_prctl(args);
+    case LINUX_NR_MEMBARRIER:
+        return linux_membarrier(number, args[0], args);
     default:
         return linux_report_unsupported(number, LINUX_ENOSYS,
             "resource-syscall", args);

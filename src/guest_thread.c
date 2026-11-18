@@ -333,6 +333,7 @@ void guest_thread_after_fork(void)
     linux_futex_after_fork();
     guest_memory_after_fork();
     guest_fd_after_fork();
+    linux_resource_after_fork();
 }
 
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)

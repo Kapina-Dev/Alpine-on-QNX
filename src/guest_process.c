@@ -14,18 +14,23 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 7];
+static char *host_environment[MAX_EXEC_VECTOR + 9];
 /* Fd records carried into the new image (guest_fd_exec_records). */
 static char fd_records_variable[32768];
 static char personality_variable[48];
 static char comm_variable[48];
+static char nice_variable[48];
 static char diagnostics_variable[PATH_MAX + 32];
 static char executable_variable[PATH_MAX + 32];
 static char guest_executable_path[PATH_MAX];
 static uint32_t guest_personality;
+static int guest_no_new_privs;
+static int guest_nice;
 
 #define PERSONALITY_VARIABLE "LINUXEMU_GUEST_PERSONALITY="
 #define COMM_VARIABLE "LINUXEMU_GUEST_COMM="
+#define NO_NEW_PRIVS_VARIABLE "LINUXEMU_GUEST_NO_NEW_PRIVS=1"
+#define NICE_VARIABLE "LINUXEMU_GUEST_NICE="
 static char shebang_interpreter[PATH_MAX];
 static char shebang_option[256];
 static char shebang_host_path[PATH_MAX];
@@ -45,7 +50,31 @@ int guest_process_initialize(const char *emulator)
     if (emulator == 0 || realpath(emulator, emulator_path) == 0) return -1;
     /* Linux keeps the personality across execve. */
     guest_personality = value == 0 ? 0 : (uint32_t)strtoul(value, 0, 0);
+    /* PR_SET_NO_NEW_PRIVS and the nice value also survive execve. */
+    guest_no_new_privs = getenv("LINUXEMU_GUEST_NO_NEW_PRIVS") != 0;
+    value = getenv("LINUXEMU_GUEST_NICE");
+    guest_nice = value == 0 ? 0 : (int)strtol(value, 0, 10);
     return 0;
+}
+
+int guest_process_no_new_privs(void)
+{
+    return guest_no_new_privs;
+}
+
+void guest_process_set_no_new_privs(void)
+{
+    guest_no_new_privs = 1;
+}
+
+int guest_process_nice(void)
+{
+    return guest_nice;
+}
+
+void guest_process_set_nice(int nice)
+{
+    guest_nice = nice;
 }
 
 uint32_t guest_process_personality(uint32_t persona)
@@ -190,6 +219,13 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
         snprintf(personality_variable, sizeof(personality_variable),
             PERSONALITY_VARIABLE "0x%08x", (unsigned)guest_personality);
         host_environment[environment_count++] = personality_variable;
+    }
+    if (guest_no_new_privs)
+        host_environment[environment_count++] = (char *)NO_NEW_PRIVS_VARIABLE;
+    if (guest_nice != 0) {
+        snprintf(nice_variable, sizeof(nice_variable), NICE_VARIABLE "%d",
+            guest_nice);
+        host_environment[environment_count++] = nice_variable;
     }
     {
         const char *slash = strrchr(guest_executable, '/');

@@ -102,6 +102,10 @@ const char *guest_path_cwd(void);
 
 int guest_process_initialize(const char *emulator);
 uint32_t guest_process_personality(uint32_t persona);
+int guest_process_no_new_privs(void);
+void guest_process_set_no_new_privs(void);
+int guest_process_nice(void);
+void guest_process_set_nice(int nice);
 const char *guest_process_initial_name(const char *loaded_path);
 void guest_process_record_executable(const char *loaded_path);
 const char *guest_process_executable(void);
@@ -167,6 +171,7 @@ int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_resource_syscall(uint32_t number, uint32_t args[6]);
 void linux_resource_note_exec(const uint32_t args[6]);
+void linux_resource_after_fork(void);
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
 int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_futex(uint32_t *address, uint32_t operation, uint32_t value,

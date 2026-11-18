@@ -94,6 +94,7 @@ run_rootfs_fixture fork-fd-churn
 run_rootfs_fixture fd-exec-carry
 run_rootfs_fixture fd-stress
 run_rootfs_fixture dup3-race
+run_rootfs_fixture prctl-exec
 
 # pipe2, dup3 and accept4 flag cases.  pipe2(O_DIRECT) must also leave a
 # pipe2-packet line in the diagnostics report.

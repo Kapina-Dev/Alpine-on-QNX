@@ -73,6 +73,23 @@ for detail in itimer-virtual rlimit-resource; do
     fi
 done
 
+# process-resource-syscalls must leave the refused and unsupported cases in
+# the diagnostics report.
+echo "=== guest: process-resource-syscalls ==="
+process_resource_report="$diag_dir/process-resource.txt"
+LINUXEMU_DIAGNOSTICS="$process_resource_report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/process-resource-syscalls"
+status=$?
+echo "process-resource-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+for detail in sched-realtime capset-nonzero pdeathsig-delivery \
+        membarrier-cmd priority-no-effect; do
+    if ! grep -q "detail=$detail" "$process_resource_report" 2>/dev/null; then
+        echo "process-resource-syscalls: diagnostics report lacks detail=$detail" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 diag_fail()
 {
     echo "$1: FAIL $2"
