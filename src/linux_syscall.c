@@ -152,6 +152,7 @@
 #define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
 #define LINUX_NR_PSELECT6_TIME64 413
 #define LINUX_NR_PPOLL_TIME64 414
+#define LINUX_ARM_NR_CACHEFLUSH 0x000f0002u
 #define LINUX_ARM_NR_SET_TLS 0x000f0005u
 #define LINUX_MAP_SHARED 0x00000001u
 #define LINUX_MAP_PRIVATE 0x00000002u
@@ -1252,6 +1253,21 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
     return 0;
 }
 
+static int32_t linux_cacheflush(uint32_t start, uint32_t end, uint32_t flags)
+{
+    uintptr_t page = (uintptr_t)runtime_page_size();
+    uintptr_t first, last;
+    if (flags != 0 || start >= end) return -EINVAL;
+    first = (uintptr_t)start & ~(page - 1u);
+    last = ((uintptr_t)end + page - 1u) & ~(page - 1u);
+    if (last <= first) return -EINVAL;
+    if (!guest_memory_runtime_owned(first, last - first) &&
+        !guest_memory_range_owned(first, last - first)) return -EINVAL;
+    if (msync((void *)first, last - first, MS_INVALIDATE_ICACHE) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return 0;
+}
+
 static int32_t linux_munmap_runtime(uintptr_t address, size_t length)
 {
     uintptr_t host_page_size = (uintptr_t)runtime_page_size();
@@ -1906,6 +1922,10 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_EXIT:
         guest_thread_exit((int)(context->uc_mcontext.cpu.gpr[0] & 0xffu));
         return;
+    case LINUX_ARM_NR_CACHEFLUSH:
+        result = linux_cacheflush(context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1], context->uc_mcontext.cpu.gpr[2]);
+        break;
     case LINUX_ARM_NR_SET_TLS:
         runtime_set_guest_tls(context->uc_mcontext.cpu.gpr[0]);
         result = 0;

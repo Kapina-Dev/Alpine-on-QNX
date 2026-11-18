@@ -93,3 +93,26 @@ terminate handler also replaces the inherited SIG_IGN. The Python shutdown
 stage used to pass only because of this. It now installs Python's SIGINT handler itself,
 which makes the stage hold under Linux semantics too. The divergence itself
 is still open (signal ABI work, Phase 2/6).
+
+## Phase 2
+
+Progress note after Task 2 (ARM `cacheflush` and the `rt_sigaction` fix).
+The full Phase 2 baseline comes at the end of the phase.
+
+### Node.js
+
+| Stage | Result |
+| --- | --- |
+| install | pass |
+| startup | fail |
+| basic, concurrent, shutdown | skipped after startup failed |
+
+The `ResetSignalHandlers` abort is gone. Node now starts, then dies on an
+assertion in `node::tracing::LegacyTracingAgent::LegacyTracingAgent()`
+(`../../src/tracing/agent_legacy.cc:88`). The diagnostics report shows the
+last unsupported call before that abort is `epoll_create1` (357, flags
+`0x80000` = `EPOLL_CLOEXEC`, ENOSYS, once). Node's libuv loop can't be
+created without it, which fits the assertion. The same run also reports
+`statx` (27 calls) and `capget` (11 calls) as ENOSYS. `cacheflush` doesn't
+appear in the report, so V8's JIT was not reached. No fix was attempted;
+`epoll` is Phase 3 work.

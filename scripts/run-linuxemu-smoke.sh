@@ -35,6 +35,7 @@ run_guest initial-stack 0 alpha beta
 run_guest memory-syscalls 0
 run_guest runtime-exec-syscalls 0
 run_guest entropy-syscalls 0
+run_guest cacheflush-syscalls 0
 run_guest thread-futex-syscalls 0
 
 echo "=== guest: file-syscalls ==="

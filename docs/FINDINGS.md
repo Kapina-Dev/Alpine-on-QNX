@@ -542,3 +542,31 @@ rounds), fork (200), fork+exec (50) and 4 threads × 2000 racing
     on Linux.
   - `select()` doesn't translate a typed fd's `poll_fd` yet. No object
     needs it until Phase 3.
+
+## 2026-11-18 — Phase 2: runtime-mapping patch hazard
+
+`linux_mprotect_runtime` runs `arm_patch_range` over the whole range each
+time an anonymous runtime mapping becomes executable. It can't tell code
+from data, so it may rewrite data words. `guest-tests/jit-patch-hazard.S`
+measures this on the Passport (not part of any regression runner):
+
+- **Data corruption: present.** A RW anonymous page holding the words
+  `0xef000000` (`svc #0`) and `0xee1d0f70` (a TPIDRURO read) was flipped RX
+  with `mprotect`. At least one word no longer read back intact (the test
+  prints `data-changed`). A JIT literal pool with such values would be
+  silently turned into traps.
+- **Patch-table exhaustion: present.** A loop of RW→RX `mprotect` flips over
+  one page containing a single `svc` word fails at iteration 4087 of 5000
+  (the same on two runs). The patch table fills (presumably because every flip records
+  a new patch and none are released; not confirmed in the source). A JIT that recycles code pages would
+  hit `mprotect` failures after about 4000 flips.
+
+The test exits 21 (the loop failure takes precedence over exit 20 when both
+occur). Both results were measured on the new core, with `cacheflush`
+implemented, so `cacheflush` doesn't change them: it never patches.
+
+**Hand-off to Phase 4:** the fix is to patch only real instructions, which
+needs code/data knowledge Linuxemu doesn't have for JIT memory. It belongs
+with Phase 4's "Thumb and stripped-binary support" patcher work. Until then,
+measure Node with `--jitless` if it reaches its JIT and fails because of
+this.
