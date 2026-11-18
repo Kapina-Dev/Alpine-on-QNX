@@ -24,6 +24,7 @@
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_RWF_DSYNC 2u
 #define LINUX_RWF_SYNC 4u
+#define LINUX_RWF_NOAPPEND 0x20u
 #define LINUX_IOV_MAX 1024
 #define SENDFILE_CHUNK (4 * 1024)
 #define SENDFILE_MAX 0x7ffff000u
@@ -33,6 +34,12 @@ static int32_t host_errno_result(void)
     return -(int32_t)linux_errno_number(errno);
 }
 
+static int descriptor_appends(int fd)
+{
+    int status = fcntl(fd, F_GETFL);
+    return status >= 0 && (status & O_APPEND) != 0;
+}
+
 static int32_t vector_transfer(int fd, const struct iovec *vector,
     int32_t count, int64_t offset, uint32_t flags, int vectored_kind,
     int writing)
@@ -40,7 +47,13 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
     uint32_t number = writing ?
         (vectored_kind ? LINUX_NR_PWRITEV2 : LINUX_NR_PWRITEV) :
         (vectored_kind ? LINUX_NR_PREADV2 : LINUX_NR_PREADV);
-    uint32_t allowed = writing ? (LINUX_RWF_DSYNC | LINUX_RWF_SYNC) : 0;
+    /* RWF_NOAPPEND (musl's pwrite tries it first) means "ignore O_APPEND":
+       QNX pwrite already writes at the given offset on an O_APPEND
+       descriptor (measured on the device), so a positioned write needs
+       nothing more. */
+    uint32_t allowed = writing ?
+        (LINUX_RWF_DSYNC | LINUX_RWF_SYNC | LINUX_RWF_NOAPPEND) : 0;
+    uint32_t sync_flags;
     uint32_t arguments[6];
     int64_t total = 0;
     int32_t index;
@@ -49,7 +62,12 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
     if (count < 0 || count > LINUX_IOV_MAX) return -LINUX_EINVAL;
     if (count > 0 && vector == 0) return -LINUX_EFAULT;
     if (!vectored_kind) flags = 0;
-    if ((flags & ~allowed) != 0) {
+    sync_flags = flags & (LINUX_RWF_DSYNC | LINUX_RWF_SYNC);
+    if ((flags & ~allowed) != 0 ||
+            ((flags & LINUX_RWF_NOAPPEND) != 0 && offset == -1 &&
+                descriptor_appends(fd))) {
+        /* Also refused: RWF_NOAPPEND at the current position of an
+           O_APPEND descriptor, which QNX cannot write without appending. */
         arguments[0] = (uint32_t)fd;
         arguments[1] = (uint32_t)(uintptr_t)vector;
         arguments[2] = (uint32_t)count;
@@ -57,7 +75,8 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
         arguments[4] = (uint32_t)((uint64_t)offset >> 32);
         arguments[5] = flags;
         return linux_report_unsupported(number, LINUX_EOPNOTSUPP,
-            "rwf-flags", arguments);
+            (flags & ~allowed) != 0 ? "rwf-flags" : "rwf-noappend-position",
+            arguments);
     }
     if (vectored_kind && offset == -1) {
         /* the current file position, updated: the plain vector calls */
@@ -67,7 +86,7 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
             ssize_t got = readv(fd, vector, count);
             result = got < 0 ? host_errno_result() : (int32_t)got;
         }
-        if (writing && result > 0 && flags != 0 && fsync(fd) != 0)
+        if (writing && result > 0 && sync_flags != 0 && fsync(fd) != 0)
             return host_errno_result();
         return result;
     }
@@ -96,7 +115,7 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
         total += moved;
         if ((size_t)moved < length) break;
     }
-    if (writing && total > 0 && flags != 0 && fsync(fd) != 0)
+    if (writing && total > 0 && sync_flags != 0 && fsync(fd) != 0)
         return host_errno_result();
     return (int32_t)total;
 }

@@ -6,7 +6,7 @@
 
 /*
  * preadv, pwritev, preadv2, pwritev2 and sendfile64.  Each failing check
- * exits with its own number (10..24); 9 is a setup failure.  The file is
+ * exits with its own number (10..26); 9 is a setup failure.  The file is
  * /tmp/linuxemu-vec: 64 bytes of pattern, later 124 bytes.
  */
     .macro sys nr
@@ -314,6 +314,93 @@ _start:
     sys 239
     wanterr 9, f24
 
+    /* 25: pwritev2 with RWF_NOAPPEND (0x20) at offset 0 writes at 0, as
+       musl's pwrite asks; preadv2 refuses it (-EOPNOTSUPP) */
+    mov r0, r8
+    ldr r1, =wiov
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    mov r5, #0x20
+    sys 393
+    want 8, f25
+    mov r0, r8
+    ldr r1, =riov1
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    sys 361
+    want 8, f25
+    ldr r0, =rbuf2
+    ldr r1, =wdata
+    mov r2, #8
+    bl memeq
+    want 1, f25
+    mov r0, r8
+    ldr r1, =riov1
+    mov r2, #1
+    mov r3, #0
+    mov r4, #0
+    mov r5, #0x20
+    sys 392
+    wanterr 95, f25
+
+    /* 26: on an O_APPEND descriptor RWF_NOAPPEND at offset 8 still writes
+       at 8 and leaves the size alone; at the current position (offset -1)
+       it is refused with -EOPNOTSUPP */
+    mov r0, r8
+    ldr r1, =statbuf
+    sys 197
+    want 0, f26
+    ldr r0, =statbuf
+    ldr r11, [r0, #48]
+    ldr r0, =path
+    ldr r1, =0x402
+    mov r2, #0
+    sys 5
+    cmp r0, #0
+    blt f26
+    mov r6, r0
+    mov r0, r6
+    ldr r1, =wiov2
+    mov r2, #1
+    mov r3, #8
+    mov r4, #0
+    mov r5, #0x20
+    sys 393
+    want 8, f26
+    mov r0, r6
+    ldr r1, =wiov2
+    mov r2, #1
+    mvn r3, #0
+    mvn r4, #0
+    mov r5, #0x20
+    sys 393
+    wanterr 95, f26
+    mov r0, r6
+    sys 6
+    mov r0, r8
+    ldr r1, =riov1
+    mov r2, #1
+    mov r3, #8
+    mov r4, #0
+    sys 361
+    want 8, f26
+    ldr r0, =rbuf2
+    ldr r1, =wdata
+    add r1, r1, #8
+    mov r2, #8
+    bl memeq
+    want 1, f26
+    mov r0, r8
+    ldr r1, =statbuf
+    sys 197
+    want 0, f26
+    ldr r0, =statbuf
+    ldr r0, [r0, #48]
+    cmp r0, r11
+    bne f26
+
     ldr r0, =path
     sys 10
     ldr r0, =path_out
@@ -336,7 +423,9 @@ f20: mov r0, #20; b exit_guest
 f21: mov r0, #21; b exit_guest
 f22: mov r0, #22; b exit_guest
 f23: mov r0, #23; b exit_guest
-f24: mov r0, #24
+f24: mov r0, #24; b exit_guest
+f25: mov r0, #25; b exit_guest
+f26: mov r0, #26
 exit_guest:
     mov r7, #1
     svc #0
@@ -368,6 +457,7 @@ wdata: .ascii "0123456789abcdefghijklmn"
 wiov: .word wdata, 8, wdata+8, 8, wdata+16, 8
 riov: .word rbuf, 8, rbuf+8, 8, rbuf+16, 8
 riov1: .word rbuf2, 8
+wiov2: .word wdata+8, 8
 
     .section .bss
     .align 3
@@ -376,3 +466,4 @@ rbuf2: .space 8
 offset: .space 8
 pipefds: .space 8
 old_limit: .space 16
+statbuf: .space 104
