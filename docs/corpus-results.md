@@ -142,9 +142,10 @@ What remains is either Phase 3 work or a deliberate refusal.
 | SQLite | `pwritev2` 102 (EOPNOTSUPP, `rwf-flags`) |
 | Vim | none |
 
-- `pwritev2` is implemented. SQLite and Python pass `RWF_APPEND` (flags
-  `0x20`), which Linuxemu refuses with `EOPNOTSUPP`, and they fall back to
-  `pwrite`.
+- `pwritev2` is implemented. SQLite and Python pass `RWF_NOAPPEND` (flags
+  `0x20`, from musl's `pwrite`). This run refused it with `EOPNOTSUPP` and
+  musl fell back to plain `pwrite`. Linuxemu now accepts `RWF_NOAPPEND`, so
+  these reports are gone from later runs.
 - `membarrier` is reported on purpose: Linuxemu supports no commands, so
   musl uses its signal-based fallback.
 - BusyBox `tar` makes a `sendfile64` call whose input descriptor Linuxemu
@@ -178,3 +179,5 @@ which is Phase 3 work. `statx` and `capget` no longer appear, and
   passed earlier in the phase (Task 6). It is a pre-existing fault in the
   smoke test's own Python workload, not a pass, and it is not caused by
   Phase 2. The corpus Python app passes all five stages.
+- `run-git-smoke`, which the full regression runs after `run-python-smoke`,
+  passed when run separately on the same core (rc=0).

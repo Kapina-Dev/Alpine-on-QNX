@@ -555,17 +555,22 @@ measures this on the Passport (not part of any regression runner):
   with `mprotect`. At least one word no longer read back intact (the test
   prints `data-changed`). A JIT literal pool with such values would be
   silently turned into traps.
-- **Patch-table exhaustion: present.** A loop of RW→RX `mprotect` flips over
-  one page containing a single `svc` word fails at iteration 4087 of 5000
-  (the same on two runs). The patch table fills (presumably because every flip records
-  a new patch and none are released; not confirmed in the source). A JIT that recycles code pages would
-  hit `mprotect` failures after about 4000 flips.
+- **Patch-table exhaustion: fixed.** A loop of RW→RX `mprotect` flips over
+  one page containing a single `svc` word failed at iteration 4087 of 5000
+  (the same on three runs). The cause, confirmed in the source:
+  `arm_patch_range` appended a new site for every flip of the rewritten
+  `svc` and never looked for the existing one, so the 4096-entry table
+  filled and `arm_patch_lookup` kept returning the first, stale entry. Now
+  a site at an address already recorded is updated in place. The loop
+  completes all 5000 flips (3 of 3 runs; the test now exits 20, for the
+  data corruption only).
 
-The test exits 21 (the loop failure takes precedence over exit 20 when both
-occur). Both results were measured on the new core, with `cacheflush`
+Before the fix the test exited 21 (the loop failure takes precedence over
+exit 20 when both occur). Both results were measured with `cacheflush`
 implemented, so `cacheflush` doesn't change them: it never patches.
 
-**Hand-off to Phase 4:** the fix is to patch only real instructions, which
+**Hand-off to Phase 4:** the data corruption remains. The fix is to patch
+only real instructions, which
 needs code/data knowledge Linuxemu doesn't have for JIT memory. It belongs
 with Phase 4's "Thumb and stripped-binary support" patcher work. Until then,
 measure Node with `--jitless` if it reaches its JIT and fails because of
@@ -582,10 +587,26 @@ in the code.
   fork child.
 - **`off_t` is 32 bits.** The core was truncating 64-bit offsets in vector
   I/O, `pread64`, `pwrite64`, `ftruncate64`, `_llseek`, `stat64` sizes and
-  `mmap2`. These now use the `*64` calls. `fcntl` record locks still use
-  `off_t`.
-- **File size cap.** Both qnx6 and the exFAT SD card stop a file near 2 GiB,
-  so nothing above that could be tested.
+  `mmap2`. These now use the `*64` calls, and so do `fcntl` record locks
+  (`F_GETLK64`/`F_SETLK64`/`F_SETLKW64`) and resource limits
+  (`getrlimit64`/`setrlimit64`). With 32-bit `off_t`, `rlim_t` is 32 bits
+  and `RLIM_INFINITY` is `0x7fffffff`.
+- **No file size cap; the cap was the open flag.** An earlier note said
+  qnx6 and exFAT stop a file near 2 GiB. A native probe on qnx6 showed the
+  cause: a descriptor opened without `O_LARGEFILE` gets `EFBIG` for a
+  write at 3 GiB and `EOVERFLOW` for a seek past 2 GiB. With `O_LARGEFILE`,
+  `pwrite64` of one byte at 3 GiB and at 4 GiB + 4096 succeeded, and
+  `fstat64` and `pread64` read them back. Linuxemu now opens every guest
+  file with `O_LARGEFILE`. The exFAT card was not re-measured.
+- **qnx6 is not sparse.** The 3 GiB probe file used 3 GiB of blocks and took
+  minutes to write. Even a zero-length `pwrite64` at 4 GiB extends the file
+  and zero-fills it, so Linuxemu sends a zero-length `pwrite64` to QNX at
+  offset 0.
+- **QNX `pwrite` ignores `O_APPEND`.** It writes at the given offset, so
+  `pwritev2(RWF_NOAPPEND)` is a plain positioned write.
+- **No finite `RLIMIT_FSIZE`.** `setrlimit64(RLIMIT_FSIZE, ...)` returns
+  `EINVAL` for every finite value tried (4 KiB to 4 GiB) as the ordinary
+  user. `RLIMIT_DATA` and `RLIMIT_CORE` take 4 GiB.
 - **Pipes hold 5120 bytes** (`F_GETPIPE_SZ` reports it).
 - **`F_SETOWN` and `F_GETOWN` return `ENOSYS`.** Linuxemu answers `EINVAL`.
 - **`sysconf(_SC_PHYS_PAGES)` is -1.** `sysinfo` reads total RAM from the

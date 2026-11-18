@@ -277,14 +277,16 @@ Each item below is covered by a device test suite.
   are covered against pinned public refs.
 - Phase 2 calls, each with a direct ARM guest test: `rt_sigaction` for every
   signal 1 to 64, `cacheflush`, `preadv`/`pwritev`/`preadv2`/`pwritev2`,
-  `sendfile64`, `fallocate`, `fcntl64` owner, pipe-size, OFD-lock and seal
-  commands, `statx`, `statfs64`/`fstatfs64`, `fchmod`, `faccessat2`, the
-  `chown` family, `mknod`/`mknodat`, `sendmmsg`/`recvmmsg`, `getrlimit`
-  family, `getrusage`, `sysinfo`, `setitimer`/`getitimer`,
+  `sendfile64`, `fallocate`, `fcntl64` pipe-size and OFD-lock commands
+  (owner and seal commands answered with `EINVAL`), `statx`,
+  `statfs64`/`fstatfs64`, `fchmod`, `faccessat2`, the `chown` family,
+  `mknod`/`mknodat`, `sendmmsg`/`recvmmsg`, `ugetrlimit`/`prlimit64`/
+  `setrlimit`, `getrusage`, `sysinfo`, `setitimer`/`getitimer`,
   `setpriority`/`getpriority`, `sched_*affinity`, `sched_setscheduler`,
   `capget`/`capset`, `prctl` dumpable/no-new-privs/pdeathsig, `membarrier`
   and `mremap`. File offsets above 4 GiB reach QNX intact on the 32-bit
-  `off_t` core.
+  `off_t` core: guest files are opened with QNX `O_LARGEFILE`, and record
+  locks and resource limits use the 64-bit QNX interfaces.
 - `pipe2`, `dup3` and `accept4` flag handling, replaced typed descriptors and
   hidden-range destinations, including concurrent `dup3` and `close`.
 
@@ -317,19 +319,30 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - Phase 2 limits:
   - Vector I/O and `sendfile64` are not atomic across iovecs. A transfer
     larger than `INT32_MAX` bytes returns `EINVAL` where Linux clamps it.
-  - OFD locks are per-process. `fcntl` record-lock offsets are 32-bit.
+  - OFD locks are per-process: threads of one process don't exclude each
+    other, and closing any descriptor of the file drops the locks.
+  - `pwritev2` accepts `RWF_NOAPPEND` except at the current position of an
+    `O_APPEND` descriptor (`rwf-noappend-position`).
   - Unmapped signals (16, 48 to 64) can be stored and queried, but not sent.
   - `membarrier` supports no commands.
   - `mremap` works only on plain anonymous memory that was never executable
     and never patched.
   - The JIT patch hazard (blind `svc`/TPIDRURO rewriting of data words when
-    memory becomes executable, and a patch table that fills after about
-    4,000 flips) is measured by `jit-patch-hazard` and open until Phase 4.
+    memory becomes executable) is measured by `jit-patch-hazard` and open
+    until Phase 4. Repeated flips no longer fill the patch table: a site
+    seen again is updated in place.
+  - `cacheflush` returns `EINVAL` for start equal to end and for a range
+    across two adjacent mappings.
   - `statx` timestamps are whole seconds, `stx_btime` is not filled, and
     device numbers are synthetic.
   - `ITIMER_VIRTUAL` and `ITIMER_PROF` are unsupported. `ITIMER_REAL` is
     lost across `execve` and reported as `itimer-exec`.
   - Priority is emulated and has no effect (`priority-no-effect`).
-    `PR_SET_PDEATHSIG` is stored but not delivered. Affinity uses the QNX
-    run mask of the calling thread only.
-  - Files above about 2 GiB are untested: qnx6 and exFAT cap a file there.
+    `PR_SET_PDEATHSIG` is stored but not delivered, and is lost across
+    `execve`. Affinity uses the QNX run mask of the calling thread only.
+  - `sysinfo` reports a process count of 1 and no load average.
+  - Access checks (`faccessat2`) ignore supplementary groups.
+  - QNX refuses every finite `RLIMIT_FSIZE` (`rlimit-host-refused`).
+  - Files past 4 GiB work (QNX `O_LARGEFILE`), but qnx6 is not sparse: a
+    write far past the end zero-fills the gap, so `large-offset-syscalls`
+    checks offsets with reads and seeks, not writes.
