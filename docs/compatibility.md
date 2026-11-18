@@ -1,4 +1,4 @@
-# Linuxemu v0.1 compatibility
+# Linuxemu v0.1.6 compatibility
 
 Linuxemu runs 32-bit ARM Linux applications directly on the ARM CPU of a
 BlackBerry 10 phone and translates their Linux system calls to QNX.
@@ -30,27 +30,39 @@ runtime executable mappings, Python application workflows including a
 100-connection threaded HTTP server, local plus HTTPS Git workflows, pathname
 UNIX sockets, `SCM_RIGHTS` descriptor passing (including large nonblocking
 frames), peer credentials, and Linux PTY/forkpty workflows backed by QNX
-pseudoterminals. An attached tmux 3.7c client is verified with
-`TERM=xterm-256color` through an SSH pseudo-terminal, including clean signal
-handling under a full-screen workload.
+pseudoterminals. An attached tmux 3.7c client with `TERM=xterm-256color`
+attaches and exits cleanly, in an SSH pseudo-terminal and in Term49.
+
+The 0.1.6 core adds a Linux-style descriptor table: `RLIMIT_NOFILE` is
+virtual (936 on the Passport), descriptor exhaustion returns `EMFILE`,
+descriptor records survive `fork` and `execve`, and directory listings stay
+complete when entries are deleted mid-walk (`rm -r`, `find -delete`). Set
+`LINUXEMU_DIAGNOSTICS=<file>` to log the unsupported calls a guest makes.
+
+The pinned application corpus scores 7 of 11 apps compatible: BusyBox, apk,
+Python, Git, SQLite, Vim, and GCC with make. nginx and Redis need `epoll`,
+inotify-tools needs `inotify`, and Node.js stops at start-up.
 
 ## Deliberate limits
 
-- ARM `svc #0` patching is supported; general Thumb guest scanning is not.
+- ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
+  only in statically loaded binaries that carry a symbol table, not in
+  libraries mapped at run time.
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
 - Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary
-  ioctls, epoll, graphics, kernel modules, and Linux service management are
+  ioctls, `epoll`, `inotify`, graphics, kernel modules, and Linux service management are
   outside the v0.1 surface.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.
 - Terminal descriptors are exposed through `/proc/self/fd/N` as guest
-  `/dev/pts/N` names. Detached and attached tmux workflows pass. Attached tmux
-  depends on Linuxemu growing QNX's small UNIX-socket send buffer before a
-  large nonblocking `SCM_RIGHTS` terminal-identification frame.
+  `/dev/pts/N` names. Attached and detached tmux workflows pass. Every
+  AF_UNIX stream socket gets a 256 KiB receive buffer, because QNX silently
+  drops `SCM_RIGHTS` messages sent to a full receiver.
 - Default-speed cmatrix and Ctrl-C pass through an SSH pseudo-terminal. The
-  physical Term49 renderer still needs on-device acceptance at that output
-  rate; `cmatrix -s -u 10` remains the conservative Term49 command.
+  physical Term49 session still freezes at that output rate (confirmed on
+  the device on 2026-10-14); `cmatrix -s -u 10` remains the conservative
+  command.
 - `eventfd2` implements the pipe-backed wake descriptor form needed by libcurl,
   rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file

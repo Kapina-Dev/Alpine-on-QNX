@@ -1,0 +1,304 @@
+# Development
+
+How to build Linuxemu on the device, run its test suites, and measure
+compatibility. For installing a release, see the [README](../README.md) and
+[installation.md](installation.md).
+
+- [Building and testing on the device](#building-and-testing-on-the-device)
+- [Diagnostics](#diagnostics)
+- [Application corpus](#application-corpus)
+- [Source layout](#source-layout)
+- [Verified behaviour](#verified-behaviour)
+- [Detailed limits](#detailed-limits)
+
+## Building and testing on the device
+
+The phone workspace is `/accounts/1000/shared/misc/linuxemu-dev`. With the recovered SDK extracted to its `sdk` directory:
+
+```sh
+cd /accounts/1000/shared/misc/linuxemu-dev
+sh scripts/build-native-probes.sh
+```
+
+Run the non-destructive native contract suite:
+
+```sh
+sh scripts/run-native-probes.sh
+```
+
+Run the minimal Linux guest suite:
+
+```sh
+sh scripts/run-linuxemu-smoke.sh
+```
+
+Run malformed-ELF and occupied-address rejection tests:
+
+```sh
+sh scripts/run-loader-negative-tests.sh
+```
+
+Fetch the pinned Alpine 3.24.2 armhf fixture on the laptop:
+
+```sh
+sh scripts/fetch-alpine-test-rootfs.sh
+```
+
+Extract that rootfs as `test-rootfs` in the device workspace, then run:
+
+```sh
+sh scripts/run-dynamic-smoke.sh
+```
+
+Run the file, metadata, path-containment, and shell-redirection suite:
+
+```sh
+sh scripts/run-filesystem-smoke.sh
+```
+
+Run pipelines, child execution, waiting, cwd inheritance, and environment tests:
+
+```sh
+sh scripts/run-process-smoke.sh
+```
+
+Run clock, sleep, poll/select, terminal conversion, and interactive-shell tests. Allocate a pseudo-terminal so the terminal round trip runs:
+
+```sh
+ssh -tt bb10 'cd /accounts/1000/shared/misc/linuxemu-dev && sh scripts/run-terminal-time-smoke.sh'
+```
+
+This suite also runs the pinned musl `forkpty` fixture. Rebuild it while Alpine
+`build-base` is temporarily installed with
+`sh scripts/build-forkpty-fixture.sh`.
+
+Run direct socket coverage, nonblocking connection readiness, loopback HTTP,
+DNS, and connection-error tests:
+
+```sh
+sh scripts/run-network-smoke.sh
+```
+
+The DNS test defaults to resolver `192.168.0.1` and name `example.com`.
+Override them with `DNS_SERVER` and `DNS_NAME` when the device is on another
+network.
+
+Run HTTPS certificate, repository refresh, package install/trigger/execute/remove,
+and cleanup tests:
+
+```sh
+sh scripts/run-package-smoke.sh
+```
+
+This suite temporarily writes the configured resolver into the guest rootfs and
+restores the prior resolver and package world state on exit.
+
+Run synthetic thread/futex races, a self-stack-unmap/exit regression, 2,000
+thread lifecycle cycles, and the pinned Alpine musl pthread fixture:
+
+```sh
+sh scripts/run-thread-smoke.sh
+```
+
+The fixture source is `guest-tests/pthread-smoke.c`. To rebuild its ARM binary,
+temporarily install Alpine `build-base` in the test rootfs and run
+`sh scripts/build-pthread-fixture.sh`.
+
+Run direct signal-frame, mask, alternate-stack, synchronous-fault, real-time,
+thread-directed, and interruption checks:
+
+```sh
+sh scripts/run-signal-smoke.sh
+```
+
+Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
+
+```sh
+sh scripts/run-loader-process-stress.sh
+```
+
+The Phase 9 fixture sources are under `guest-tests`. To rebuild their pinned ARM
+binaries, temporarily install Alpine `build-base` in the test rootfs and run
+`sh scripts/build-phase9-fixtures.sh`.
+
+Run the pinned Python 3.14.7 suite from the clean 16-package rootfs:
+
+```sh
+sh scripts/run-python-smoke.sh
+```
+
+The ignored `artifacts/python-3.14.7-alpine-3.24-armhf` directory contains the
+24-APK offline closure. Its tracked hashes are in
+`docs/python-runtime-apks.sha256`. The runner verifies every archive, installs
+them under one virtual package, runs the Python application suite, and restores
+the resolver, package world, and 16-package baseline on exit. Override the
+default resolver with `DNS_SERVER` when needed.
+
+Run the pinned Git 2.54.0 suite from the clean 16-package rootfs:
+
+```sh
+sh scripts/run-git-smoke.sh
+```
+
+The ignored `artifacts/git-2.54.0-alpine-3.24-armhf` directory contains the
+18-APK offline closure. Its tracked hashes are in
+`docs/git-runtime-apks.sha256`. The runner installs the closure under one
+virtual package, tests local object and multi-megabyte transfer workflows,
+uses pinned commits for HTTPS clone/fetch, covers network failure paths, and
+restores the resolver, package world, and 16-package baseline on exit.
+
+Run the complete release regression from a pseudo-terminal:
+
+```sh
+ssh -tt bb10 'cd /accounts/1000/shared/misc/linuxemu-dev && sh scripts/run-full-regression.sh'
+```
+
+Per-suite logs and the final summary are written under
+`build/full-regression`.
+
+Detailed device evidence is recorded in `root-analysis/native-probe-results-20260922.md`.
+Release inputs and excluded development material are described in
+`docs/provenance.md`.
+
+## Diagnostics
+
+Set `LINUXEMU_DIAGNOSTICS=<file>` to record the unsupported Linux syscalls
+and unsupported behaviour a guest hits. Each guest process appends its own
+report when it exits, crashes, calls `execve`, or is ended by a signal, with
+one line per distinct call. That includes signals it sends itself, such as
+`abort()`, kernel signals such as SIGPIPE and SIGALRM, and signals from other
+processes:
+
+```text
+linuxemu-unsupported exe=/bin/x pid=42 nr=999 name=unknown error=ENOSYS count=2 detail=- args=0x00000001,0x00000002,0x00000003,0x00000004,0x00000005,0x00000006
+```
+
+- `exe` is the guest path, percent-encoded so each field is one token.
+- `args` are r0–r5 of the first occurrence, as raw register values. Memory
+  isn't read.
+- `detail` names the unsupported case when the syscall itself exists, for
+  example `prctl-set-vma`.
+
+After 64 distinct entries, further ones are counted in a
+`linuxemu-unsupported-overflow ... dropped=<n>` line. With the variable
+unset, nothing is written and behaviour is unchanged.
+
+Only SIGKILL (`kill -9`) ends a process without a report, because it can't
+be caught. A process can write more than one line for the same call: it
+writes again each time it flushes (for example, every time it sends itself a
+blocked signal), so add up lines with the same `pid`, `nr`, `error` and
+`detail`.
+
+## Application corpus
+
+Score the pinned application corpus on the device:
+
+```sh
+sh scripts/run-corpus.sh            # all apps in scripts/corpus/apps
+sh scripts/run-corpus.sh git nginx  # selected apps
+```
+
+- **What it scores:** each app is scored on install, startup, basic workload,
+  concurrent workload and clean shutdown. It counts as compatible only when
+  all five pass.
+- **Isolation:** each app runs in a fresh copy of the test rootfs from a
+  pinned package closure (`docs/corpus/<app>-apks.sha256`, fetched with
+  `scripts/corpus/fetch-apks.sh`). The shared test rootfs is never changed.
+- **Results:** they go to `build/corpus/results.tsv` and
+  `build/corpus/summary.txt`, with per-app logs and `LINUXEMU_DIAGNOSTICS`
+  reports in `build/corpus/<app>/`. The current baseline is in
+  `docs/corpus-results.md`.
+- **Not part of the release regression:** the corpus is a separate
+  measurement, and a failing app is a result, not a broken test. The
+  harness's own tests are in `sh tests/corpus-harness-test.sh`.
+
+## Source layout
+
+- `elf_loader.c`: ELF and interpreter validation, executable-section selection, and load orchestration.
+- `guest_memory.c`: guest address ownership, collision-safe mappings, `brk`, final permissions, and cache synchronization.
+- `guest_path.c`: rootfs path normalization, contained symlink resolution, and guest working-directory state.
+- `linux_abi.c`: explicit Linux errno, open-flag, status-flag, and `stat64` conversion.
+- `guest_process.c`: contained ELF/shebang exec trampoline and guest-to-host process environment boundary.
+- `guest_thread.c`: per-QNX-thread guest state, Linux clone/TID behavior, queued signals, wait wakeups, native-stack retirement, and fork reset.
+- `linux_futex.c`: locked futex waiter registry, wake/requeue operations, and timeout conversion.
+- `guest_signal.c`: signal-number conversion, per-thread masks, Linux ARM signal frames, alternate stacks, delivery, and return.
+- `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
+- `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
+- `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
+- `linux_termios.c`: Linux terminal flags, baud rates, control characters, window sizes, and related ioctl conversion.
+- `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
+- `trap.c`: SIGILL/SIGSEGV dispatch and Linux ARM kuser helpers.
+- `linux_syscall.c`: the currently supported Linux syscall translations.
+- `runtime.c`: process entry, initial guest stack, and auxiliary vectors.
+- `linuxemu.c`: initialization and handoff only.
+
+## Verified behaviour
+
+Each item below is covered by a device test suite.
+
+- Native QNX signals and `ucontext_t` register edits in ARM and Thumb modes.
+- Concurrent pthread TLS and directed signal delivery.
+- Writable-to-executable memory transitions with QNX instruction-cache synchronization.
+- Trap-emulated per-thread guest TLS reads in ARM and Thumb modes.
+- Static ARM ELF validation, segment mapping, tracked ARM `svc #0` patching, and Linux process-entry stack construction.
+- Linux ARM file descriptors and I/O: `open`, directory-relative `openat`, `close`, `read`, `write`, `writev`, `lseek`, `_llseek`, `dup`, `dup2`, and the required `fcntl64` subset.
+- Linux ARM filesystem metadata and traversal: `stat64`, `lstat64`, `fstat64`, `fstatat64`, `readlink`, `readlinkat`, `getdents64`, and `getcwd`.
+- Linux ARM memory calls: `brk`, `mmap2`, `mprotect`, and `munmap`, plus process/credential queries, guest TLS setup, exits, and `-ENOSYS` for unsupported calls.
+- Rootfs path normalization and guest-aware symlink traversal. Absolute symlink targets remain inside the guest root, and `..` cannot escape above guest `/`.
+- Linux ARM process calls for shell workloads: pipes, fork and fork-like `vfork`/`clone`, `execve`, `wait4`, process IDs/groups, working-directory changes, and exit-status propagation.
+- Exec preserves guest argv, cwd, rootfs selection, ordinary environment variables, and descriptor inheritance. Host-only `LINUXEMU_ROOT` and `LD_LIBRARY_PATH` values are removed from the guest environment.
+- The noninteractive SIGCHLD action/mask/suspend path needed by BusyBox background jobs. General guest signal delivery remains outside this phase.
+- Linux ARM terminal calls with explicit termios, control-character, baud-rate, window-size, process-group, `FIONREAD`, and `FIONBIO` conversion. Linux `/dev/ptmx`, `/dev/pts/N`, controlling-terminal setup, and `forkpty` are backed by the finite QNX legacy PTY pool. BusyBox `stty` can read and update an SSH pseudo-terminal.
+- Linux ARM readiness calls: `poll`, `ppoll`, legacy and new `select`, and `pselect6`, including time32/time64 timeout conversion and Linux/QNX poll-event mapping.
+- Linux ARM wall and monotonic clocks, resolution queries, `time`, `gettimeofday`, `nanosleep`, and `clock_nanosleep`, with explicit time32/time64 layouts. BusyBox `date` and `sleep` work against the pinned rootfs.
+- Linux ARM socket calls for UNIX, IPv4, and IPv6 endpoints, including contained pathname UNIX sockets, `SCM_RIGHTS`, `SO_PEERCRED`, explicit address, type/descriptor flag, message flag, socket option, and network errno conversion. Both direct ARM socket syscalls and legacy `socketcall` are accepted.
+- Blocking and nonblocking TCP connections, UDP datagrams, socket pairs, DNS queries, and BusyBox HTTP downloads. Numeric IPv4 and `localhost` over IPv6 are covered on the device.
+- HTTPS through Alpine's OpenSSL-backed `ssl_client`, including device entropy through Linux `getrandom` and certificate-chain rejection. The pinned Alpine package index downloads and validates as gzip data.
+- Alpine `apk` repository refresh, package extraction, BusyBox trigger scripts, installed dynamic applications, and package removal. A clean nano transaction restores the original world file.
+- Contained rootfs mutation through legacy and directory-relative mkdir, unlink/rmdir, rename, link, symlink, chmod, access, and timestamp calls. Linux shebang execution restarts Linuxemu with the guest interpreter and argv layout.
+- Thread-style `clone` backed by detached QNX pthreads, with separate host lifecycle state, synthetic Linux TIDs, per-thread guest TLS, parent/child TID stores, safe musl-style self-stack unmapping after returning to the native QNX stack, and correctly ordered `clear_child_tid` wakeup.
+- Futex wait, wake, requeue, compare-and-requeue, bitset selection, and relative/absolute timeout paths. Alpine musl pthread creation, joins, mutex contention, condition broadcast, and timed condition waits pass on the device.
+- Linux ARM classic and real-time signal frames, handler return, per-thread masks, alternate signal stacks, synchronous guest `SIGILL`, `sigsuspend` interruption, thread-directed delivery, and musl pthread cancellation.
+- The process-group query and signal subset needed for BusyBox interactive-shell startup on QNX, including a `getpgid(0)` fallback for QNX's nonfunctional libc stub.
+- PIE and musl interpreter loading at separate biases, Linux kuser helper emulation, guest TLS setup, and explicit Linux-to-QNX memory-protection conversion.
+- PIE startup falls back across four non-overlapping guest biases. Fixed-address Linux executables transparently restart Linuxemu when QNX address randomization occupies their required range.
+- Private executable mappings created after startup are copied into tracked anonymous guest memory, patched for Linux ARM traps, synchronized with the QNX instruction cache, and covered across `mprotect`, `munmap`, and `dlopen` lifecycles.
+- Multithreaded musl `posix_spawn` is covered by 100 repeated child exec/wait cycles while four guest pthreads remain active.
+- Linux positional file I/O, file sync/truncate, `fcntl64` record locks, and
+  self-process `prlimit64` support the SQLite and subprocess paths used by
+  Alpine Python.
+- Alpine Python 3.14.7 imports and runs files, SQLite, clocks, verified HTTPS,
+  loopback TCP/UDP, subprocesses, signals, four-thread synchronization, and a
+  `ThreadingHTTPServer` across 100 sequential connections. Unsupported `epoll`
+  creation returns Linux `ENOSYS`.
+- Alpine Git 2.54.0 creates, commits, verifies, packs, clones, pushes, and
+  incrementally fetches repositories. Verified HTTPS clone/fetch and invalid
+  certificate, unavailable authentication, and unreachable-server failures
+  are covered against pinned public refs.
+
+TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
+
+## Detailed limits
+
+- Dynamic support is currently limited to the pinned Alpine 3.24 musl package
+  fixtures exercised by BusyBox, apk, nano, OpenSSL, Python, and Git.
+- `SA_RESTART` is implemented for the translated blocking read/write, wait, futex, ioctl, and socket calls. Linux real-time signals are mapped only while QNX real-time numbers are available. Each mapped real-time number has a bounded 64-entry per-thread queue; `rt_sigqueueinfo` payload submission is not implemented.
+- `svc #0` patching covers ARM code, plus Thumb-2 code in statically loaded binaries that carry a symbol table. Thumb code in libraries mapped at run time is not patched.
+- `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
+- Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.
+- `ppoll` and `pselect6` use a transient per-thread nonblocking wake pipe to bridge QNX's separate mask and wait operations. `pselect6` returns `EMFILE` if that internal read descriptor is outside QNX `FD_SETSIZE`, which requires the process to have exhausted the descriptor range accepted by `select`.
+- Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
+- Socket ancillary/control messages other than `SCM_RIGHTS` and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
+- Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
+- Linux `fdatasync` uses QNX `fsync`, which provides the required durability
+  with stronger flushing semantics. `prlimit64` currently accepts the current
+  process only.
+- `eventfd2` provides the nonblocking, close-on-exec, zero-initialized wake
+  descriptor form used by libcurl. It is pipe-backed; general counters,
+  semaphore mode, duplication from the event descriptor, and inherited event
+  descriptors are outside the supported surface and fail explicitly where
+  they can be identified. Replacing it as a `dup2`/`dup3` destination is
+  supported for Git's subprocess path.
+- Patching is limited to validated `SHF_EXECINSTR` sections. Thumb instructions are decoded only in statically loaded binaries that carry a symbol table.
+- Section headers are currently required so the loader can avoid patching embedded data in executable segments.
+- Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.

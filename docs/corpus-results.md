@@ -1,6 +1,6 @@
 # Application corpus results
 
-Produced by `sh scripts/run-corpus.sh` (see the README, "Application corpus").
+Produced by `sh scripts/run-corpus.sh` (see `docs/development.md`, "Application corpus").
 Each app is scored on five stages: install, startup, basic workload, concurrent
 workload, and clean shutdown. An app is compatible only when all five pass,
 because installation alone doesn't count. `unsupported` is the number of
