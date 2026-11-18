@@ -356,6 +356,11 @@ static int32_t linux_host_result(int result)
    bound is only a guard against an fd that is genuinely broken. */
 #define FORK_EBADF_RETRIES 1000
 
+/* QNX dup2 is close plus dup, not atomic against another thread closing or
+   replacing the destination: it fails with EBADF or EINVAL.  Linux orders
+   dup2, dup3 and close on one number, so the emulator does too. */
+static pthread_mutex_t fd_replace_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
 {
     pid_t process;
@@ -366,6 +371,8 @@ static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
     if (process == 0) {
         guest_thread_after_fork();
         linux_diag_after_fork();
+        /* another thread may have held it at fork; its owner is gone here */
+        pthread_mutex_init(&fd_replace_lock, 0);
         if (child_stack != 0)
             context->uc_mcontext.cpu.gpr[13] = child_stack;
     }
@@ -691,11 +698,6 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
     guest_fd_put(object);
     return result != 0 ? result : (int32_t)used;
 }
-
-/* QNX dup2 is close plus dup, not atomic against another thread closing or
-   replacing the destination: it fails with EBADF or EINVAL.  Linux orders
-   dup2, dup3 and close on one number, so the emulator does too. */
-static pthread_mutex_t fd_replace_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int32_t linux_close_fd(int fd)
 {
