@@ -115,22 +115,25 @@ static int rlimit_unmapped(uint32_t resource)
     return resource == 8 || (resource >= 10 && resource <= 15);
 }
 
-static uint64_t linux_rlimit_value(rlim_t value)
+/* The 64-bit interface throughout: with QNX's 32-bit off_t, plain rlim_t
+   is 32 bits and RLIM_INFINITY is 0x7fffffff, so 4 GiB would truncate to 0
+   and 0x7fffffff would read back as unlimited. */
+static uint64_t linux_rlimit_value(rlim64_t value)
 {
-    return value == RLIM_INFINITY ? UINT64_MAX : (uint64_t)value;
+    return value == RLIM64_INFINITY ? UINT64_MAX : (uint64_t)value;
 }
 
-static rlim_t host_rlimit_value(uint64_t value)
+static rlim64_t host_rlimit_value(uint64_t value)
 {
-    return value == UINT64_MAX ? RLIM_INFINITY : (rlim_t)value;
+    return value == UINT64_MAX ? RLIM64_INFINITY : (rlim64_t)value;
 }
 
 static int32_t linux_prlimit64(int32_t process, uint32_t resource,
     const struct linux_rlimit64 *guest_new_limit,
     struct linux_rlimit64 *guest_old_limit)
 {
-    struct rlimit host_limit;
-    struct rlimit host_new_limit;
+    struct rlimit64 host_limit;
+    struct rlimit64 host_new_limit;
     int host_resource = linux_resource_number(resource);
     if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
     if (host_resource < 0) return -EINVAL;
@@ -147,7 +150,7 @@ static int32_t linux_prlimit64(int32_t process, uint32_t resource,
         }
         return 0;
     }
-    if (getrlimit(host_resource, &host_limit) != 0)
+    if (getrlimit64(host_resource, &host_limit) != 0)
         return -(int32_t)linux_errno_number(errno);
     if (guest_old_limit != 0) {
         guest_old_limit->current = linux_rlimit_value(host_limit.rlim_cur);
@@ -164,8 +167,25 @@ static int32_t linux_prlimit64(int32_t process, uint32_t resource,
             return -LINUX_EPERM;
         host_new_limit.rlim_cur = host_rlimit_value(guest_new_limit->current);
         host_new_limit.rlim_max = host_rlimit_value(guest_new_limit->maximum);
-        if (setrlimit(host_resource, &host_new_limit) != 0)
-            return -(int32_t)linux_errno_number(errno);
+        /* A finite value that is QNX's own RLIM64_INFINITY or one of its
+           SAVED markers cannot be expressed. */
+        if ((guest_new_limit->current != UINT64_MAX &&
+                guest_new_limit->current >= RLIM64_INFINITY) ||
+                (guest_new_limit->maximum != UINT64_MAX &&
+                guest_new_limit->maximum >= RLIM64_INFINITY))
+            return -LINUX_EINVAL;
+        if (setrlimit64(host_resource, &host_new_limit) != 0) {
+            uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
+            if (errno != EINVAL) return -(int32_t)linux_errno_number(errno);
+            /* Linux accepted the request above; QNX refuses it (for
+               example any finite RLIMIT_FSIZE, measured on the device). */
+            arguments[0] = (uint32_t)process;
+            arguments[1] = resource;
+            arguments[2] = (uint32_t)(uintptr_t)guest_new_limit;
+            arguments[3] = (uint32_t)(uintptr_t)guest_old_limit;
+            return linux_report_unsupported(LINUX_NR_PRLIMIT64,
+                LINUX_EINVAL, "rlimit-host-refused", arguments);
+        }
     }
     return 0;
 }
@@ -252,16 +272,35 @@ static uint64_t qnx_total_ram(void)
     return total;
 }
 
+/* The "/sysram" descriptor is opened once and kept in the hidden range
+   with FD_CLOEXEC, so it never occupies a guest number and never leaks
+   into an exec'd image (which opens its own).  A fork child inherits it,
+   which is harmless.  If the hidden range is full, the low descriptor is
+   used once and closed, as before. */
+static int sysram_fd = -1;
+
 static uint64_t qnx_free_ram(void)
 {
     struct posix_typed_mem_info info;
     uint64_t free_bytes = 0;
-    int fd = posix_typed_mem_open("/sysram", O_RDWR,
-        POSIX_TYPED_MEM_ALLOCATE);
-    if (fd < 0) return 0;
+    int fd = sysram_fd;
+    int transient = 0;
+    if (fd < 0) {
+        int opened = posix_typed_mem_open("/sysram", O_RDWR,
+            POSIX_TYPED_MEM_ALLOCATE);
+        if (opened < 0) return 0;
+        fd = guest_fd_hide(opened);
+        if (fd < 0) {
+            fd = opened;
+            transient = 1;
+        } else if (!__sync_bool_compare_and_swap(&sysram_fd, -1, fd)) {
+            close(fd);
+            fd = sysram_fd;
+        }
+    }
     if (posix_typed_mem_get_info(fd, &info) == 0)
         free_bytes = (uint64_t)info.posix_tmi_length;
-    close(fd);
+    if (transient) close(fd);
     return free_bytes;
 }
 
@@ -719,7 +758,9 @@ static int32_t linux_prctl(const uint32_t *args)
 static int32_t linux_membarrier(uint32_t number, uint32_t command,
     const uint32_t *args)
 {
-    if (command == LINUX_MEMBARRIER_CMD_QUERY) return 0;
+    /* QUERY takes no flags; Linux answers EINVAL to any. */
+    if (command == LINUX_MEMBARRIER_CMD_QUERY)
+        return args[1] == 0 ? 0 : -LINUX_EINVAL;
     return linux_report_unsupported(number, LINUX_EINVAL,
         "membarrier-cmd", args);
 }

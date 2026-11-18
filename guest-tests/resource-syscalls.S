@@ -6,7 +6,7 @@
 
 /*
  * ugetrlimit/setrlimit, getrusage, sysinfo and setitimer/getitimer.  Each
- * failing check exits with its own number (10..20); 9 is a setup failure.
+ * failing check exits with its own number (10..23); 9 is a setup failure.
  * A line on stdout records whether ITIMER_VIRTUAL is supported.
  */
     .macro sys nr
@@ -290,6 +290,128 @@ stack_done:
     sys 105
     wanterr 14, f20
 
+    /* 22: 64-bit limits are not truncated.  prlimit64(RLIMIT_DATA,
+       {4 GiB, old max}) reads back 4 GiB (a 32-bit rlim_t made it 0), and
+       the old pair is restored.  RLIMIT_FSIZE {4 GiB, 4 GiB} either reads
+       back exactly or is refused with -EINVAL (QNX refuses every finite
+       FSIZE) and stays unchanged; never 0. */
+    mov r0, #0
+    mov r1, #2
+    mov r2, #0
+    ldr r3, =old64
+    sys 369
+    want 0, f22
+    ldr r1, =new64
+    mov r2, #0
+    str r2, [r1]
+    mov r2, #1
+    str r2, [r1, #4]
+    ldr r3, =old64
+    ldr r2, [r3, #8]
+    str r2, [r1, #8]
+    ldr r2, [r3, #12]
+    str r2, [r1, #12]
+    mov r0, #0
+    mov r1, #2
+    ldr r2, =new64
+    mov r3, #0
+    sys 369
+    want 0, f22
+    mov r0, #0
+    mov r1, #2
+    mov r2, #0
+    ldr r3, =got64
+    sys 369
+    want 0, f22
+    ldr r1, =got64
+    ldr r2, [r1]
+    cmp r2, #0
+    bne f22
+    ldr r2, [r1, #4]
+    cmp r2, #1
+    bne f22
+    mov r0, #0
+    mov r1, #2
+    ldr r2, =old64
+    mov r3, #0
+    sys 369
+    want 0, f22
+    mov r0, #0
+    mov r1, #1
+    mov r2, #0
+    ldr r3, =old64
+    sys 369
+    want 0, f22
+    ldr r1, =new64
+    mov r2, #0
+    str r2, [r1]
+    str r2, [r1, #8]
+    mov r2, #1
+    str r2, [r1, #4]
+    str r2, [r1, #12]
+    mov r0, #0
+    mov r1, #1
+    ldr r2, =new64
+    mov r3, #0
+    sys 369
+    mov r6, r0
+    mov r0, #0
+    mov r1, #1
+    mov r2, #0
+    ldr r3, =got64
+    sys 369
+    want 0, f22
+    ldr r1, =got64
+    cmp r6, #0
+    bne 1f
+    ldr r2, [r1]
+    cmp r2, #0
+    bne f22
+    ldr r2, [r1, #4]
+    cmp r2, #1
+    bne f22
+    ldr r2, [r1, #8]
+    cmp r2, #0
+    bne f22
+    ldr r2, [r1, #12]
+    cmp r2, #1
+    bne f22
+    b 2f
+1:  cmn r6, #22
+    bne f22
+    ldr r3, =old64
+    mov r4, #0
+3:  ldr r2, [r1, r4]
+    ldr r5, [r3, r4]
+    cmp r2, r5
+    bne f22
+    add r4, r4, #4
+    cmp r4, #16
+    bne 3b
+2:
+
+    /* 23: setrlimit(RLIMIT_CORE, {0x7fffffff, 0x7fffffff}) reads back as
+       0x7fffffff, not as unlimited (QNX's 32-bit RLIM_INFINITY) */
+    ldr r1, =set32
+    ldr r2, =0x7fffffff
+    str r2, [r1]
+    str r2, [r1, #4]
+    mov r0, #4
+    sys 75
+    want 0, f23
+    mov r0, #4
+    ldr r1, =r32
+    sys 191
+    want 0, f23
+    ldr r1, =r32
+    ldr r2, [r1]
+    ldr r3, =0x7fffffff
+    cmp r2, r3
+    bne f23
+    ldr r2, [r1, #4]
+    cmp r2, r3
+    bne f23
+
     mov r0, #0
     b exit_guest
 
@@ -312,7 +434,9 @@ f17: mov r0, #17; b exit_guest
 f18: mov r0, #18; b exit_guest
 f19: mov r0, #19; b exit_guest
 f20: mov r0, #20; b exit_guest
-f21: mov r0, #21
+f21: mov r0, #21; b exit_guest
+f22: mov r0, #22; b exit_guest
+f23: mov r0, #23
 exit_guest:
     mov r7, #1
     svc #0
@@ -341,6 +465,8 @@ timer_off: .word 0, 0, 0, 0
 r32: .space 8
 set32: .space 8
 old64: .space 16
+new64: .space 16
+got64: .space 16
 rusage: .space 72
 sysinfo: .space 64
 timerbuf: .space 16

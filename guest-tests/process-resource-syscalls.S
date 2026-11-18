@@ -308,7 +308,7 @@ _start:
     wanterr 22, f19
 
     /* 20: membarrier QUERY is 0; PRIVATE_EXPEDITED is EINVAL (no fake
-       barrier) */
+       barrier); QUERY with flags is EINVAL */
     mov r0, #0
     mov r1, #0
     mov r2, #0
@@ -316,6 +316,12 @@ _start:
     want 0, f20
     mov r0, #8
     mov r1, #0
+    mov r2, #0
+    sys 389
+    wanterr 22, f20
+    /* QUERY with nonzero flags is EINVAL, as on Linux */
+    mov r0, #0
+    mov r1, #1
     mov r2, #0
     sys 389
     wanterr 22, f20
