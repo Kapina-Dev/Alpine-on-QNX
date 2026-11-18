@@ -53,6 +53,14 @@ status=$?
 echo "android-process-syscalls exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+# mremap-syscalls maps /dev/zero, so it needs the host root.
+echo "=== guest: mremap-syscalls ==="
+LINUXEMU_ROOT=/ "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/mremap-syscalls"
+status=$?
+echo "mremap-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 diag_dir="$project_dir/build/diag"
 rm -rf "$diag_dir"
 mkdir -p "$diag_dir"

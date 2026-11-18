@@ -1308,8 +1308,11 @@ static int32_t linux_mmap2(ucontext_t *context)
         munmap(result, mapped_length);
         return -(int32_t)linux_errno_number(saved_errno);
     }
-    if (guest_memory_runtime_map(mapped_address, mapped_length,
-            (host_protection & PROT_EXEC) != 0) != 0) {
+    if (guest_memory_runtime_map_kind(mapped_address, mapped_length,
+            (host_protection & PROT_EXEC) != 0,
+            (linux_flags & LINUX_MAP_ANONYMOUS) != 0 &&
+                (linux_flags & LINUX_MAP_PRIVATE) != 0,
+            host_protection == (PROT_READ | PROT_WRITE)) != 0) {
         int saved_errno = errno;
         trace_internal_failure("linuxemu: runtime mapping registry full\n");
         arm_patch_forget_range(mapped_address, mapped_length);
@@ -1364,7 +1367,8 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
         return -(int32_t)linux_errno_number(saved_errno);
     }
     if (guest_memory_runtime_protect(address, mapped_length,
-            (host_protection & PROT_EXEC) != 0) != 0)
+            (host_protection & PROT_EXEC) != 0,
+            host_protection == (PROT_READ | PROT_WRITE)) != 0)
         return -(int32_t)linux_errno_number(errno);
     return 0;
 }
@@ -1399,6 +1403,99 @@ static int32_t linux_munmap_runtime(uintptr_t address, size_t length)
     arm_patch_forget_range(address, mapped_length);
     guest_memory_runtime_unmap(address, mapped_length);
     return 0;
+}
+
+#define LINUX_NR_MREMAP 163
+#define LINUX_MREMAP_MAYMOVE 1u
+#define LINUX_MREMAP_FIXED 2u
+#define LINUX_MREMAP_DONTUNMAP 4u
+
+/* mremap for private anonymous read-write guest memory only. An old range
+   that is not wholly a tracked mapping gets EFAULT (Linux's error for an
+   unmapped range) unless other guest memory covers it, which is the
+   unsupported-kind EINVAL; executable, file-backed and non-read-write
+   mappings keep patch, icache or protection state and are refused. */
+static int32_t linux_mremap(uintptr_t old_address, size_t old_length,
+    size_t new_length, uint32_t flags, uintptr_t new_address)
+{
+    uintptr_t page = (uintptr_t)runtime_page_size();
+    uint32_t args[5] = { (uint32_t)old_address, (uint32_t)old_length,
+        (uint32_t)new_length, flags, (uint32_t)new_address };
+    size_t old_size;
+    size_t new_size;
+    void *result;
+    uintptr_t mapped;
+    int32_t status;
+
+    if ((flags & ~(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED |
+            LINUX_MREMAP_DONTUNMAP)) != 0) return -EINVAL;
+    if ((flags & (LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP)) != 0)
+        return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
+            "mremap-kind", args);
+    if ((old_address & (page - 1u)) != 0 || new_length == 0 ||
+        old_length > SIZE_MAX - (page - 1u) ||
+        new_length > SIZE_MAX - (page - 1u)) return -EINVAL;
+    if (old_length == 0)
+        return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
+            "mremap-kind", args);
+    old_size = align_up(old_length, page);
+    new_size = align_up(new_length, page);
+    if (!guest_memory_runtime_owned(old_address, old_size)) {
+        if (guest_memory_range_owned(old_address, old_size))
+            return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
+                "mremap-kind", args);
+        return -EFAULT;
+    }
+    if (!guest_memory_runtime_is_plain(old_address, old_size))
+        return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
+            "mremap-kind", args);
+    if (new_size == old_size) return (int32_t)old_address;
+    if (new_size < old_size) {
+        status = linux_munmap_runtime(old_address + new_size,
+            old_size - new_size);
+        return status != 0 ? status : (int32_t)old_address;
+    }
+    if (old_size <= GUEST_MAX_ADDRESS - old_address &&
+        new_size - old_size <=
+            GUEST_MAX_ADDRESS - (old_address + old_size)) {
+        /* Grow in place: a hinted, non-fixed mmap only lands on the hint when
+           that range is free, so no other mapping can be overwritten. */
+        result = mmap((void *)(old_address + old_size), new_size - old_size,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (result != MAP_FAILED) {
+            if ((uintptr_t)result == old_address + old_size) {
+                if (guest_memory_runtime_map_kind(old_address + old_size,
+                        new_size - old_size, 0, 1, 1) != 0) {
+                    munmap(result, new_size - old_size);
+                    return -ENOMEM;
+                }
+                return (int32_t)old_address;
+            }
+            munmap(result, new_size - old_size);
+        }
+    }
+    if ((flags & LINUX_MREMAP_MAYMOVE) == 0) return -ENOMEM;
+    result = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (result == MAP_FAILED) return -ENOMEM;
+    mapped = (uintptr_t)result;
+    if (mapped < GUEST_MIN_ADDRESS || mapped >= GUEST_MAX_ADDRESS ||
+        new_size > GUEST_MAX_ADDRESS - mapped) {
+        munmap(result, new_size);
+        return -ENOMEM;
+    }
+    memcpy(result, (const void *)old_address, old_size);
+    if (guest_memory_runtime_map_kind(mapped, new_size, 0, 1, 1) != 0) {
+        munmap(result, new_size);
+        return -ENOMEM;
+    }
+    status = linux_munmap_runtime(old_address, old_size);
+    if (status != 0) {
+        guest_memory_runtime_unmap(mapped, new_size);
+        munmap(result, new_size);
+        return status;
+    }
+    return (int32_t)mapped;
 }
 
 static int32_t linux_getrandom(void *buffer, size_t length, uint32_t flags)
@@ -1792,6 +1889,13 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_MUNMAP:
         result = linux_munmap_runtime(context->uc_mcontext.cpu.gpr[0],
             (size_t)context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_MREMAP:
+        result = linux_mremap(context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1],
+            (size_t)context->uc_mcontext.cpu.gpr[2],
+            context->uc_mcontext.cpu.gpr[3],
+            context->uc_mcontext.cpu.gpr[4]);
         break;
     case LINUX_NR_SOCKETCALL:
     case LINUX_NR_SOCKET:

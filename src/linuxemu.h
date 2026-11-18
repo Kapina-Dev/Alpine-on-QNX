@@ -57,8 +57,11 @@ void guest_memory_rollback(size_t segment_count);
 int guest_memory_range_owned(uintptr_t address, size_t length);
 int guest_memory_runtime_owned(uintptr_t address, size_t length);
 int guest_memory_runtime_map(uintptr_t address, size_t length, int executable);
+int guest_memory_runtime_map_kind(uintptr_t address, size_t length,
+    int executable, int anonymous, int readwrite);
 int guest_memory_runtime_protect(uintptr_t address, size_t length,
-    int executable);
+    int executable, int readwrite);
+int guest_memory_runtime_is_plain(uintptr_t address, size_t length);
 void guest_memory_runtime_unmap(uintptr_t address, size_t length);
 void guest_memory_after_fork(void);
 int guest_brk_initialize(uintptr_t initial_break);

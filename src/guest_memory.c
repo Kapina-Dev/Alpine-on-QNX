@@ -23,6 +23,8 @@ struct runtime_mapping {
     uintptr_t start;
     uintptr_t end;
     int executable;
+    int anonymous; /* private anonymous memory, not file backed */
+    int readwrite; /* protection is exactly PROT_READ | PROT_WRITE */
 };
 
 static struct runtime_mapping runtime_mappings[MAX_RUNTIME_MAPPINGS];
@@ -224,7 +226,7 @@ static int runtime_range_owned_locked(uintptr_t start, uintptr_t end)
 }
 
 static int runtime_replace_locked(uintptr_t start, uintptr_t end,
-    int add_replacement, int executable)
+    int add_replacement, int executable, int anonymous, int readwrite)
 {
     size_t replacement_count = 0;
     size_t compacted_count = 0;
@@ -240,6 +242,10 @@ static int runtime_replace_locked(uintptr_t start, uintptr_t end,
                 runtime_mapping_scratch[replacement_count].end = start;
                 runtime_mapping_scratch[replacement_count].executable =
                     old.executable;
+                runtime_mapping_scratch[replacement_count].anonymous =
+                    old.anonymous;
+                runtime_mapping_scratch[replacement_count].readwrite =
+                    old.readwrite;
                 replacement_count++;
             }
             if (old.end > end) {
@@ -247,6 +253,10 @@ static int runtime_replace_locked(uintptr_t start, uintptr_t end,
                 runtime_mapping_scratch[replacement_count].end = old.end;
                 runtime_mapping_scratch[replacement_count].executable =
                     old.executable;
+                runtime_mapping_scratch[replacement_count].anonymous =
+                    old.anonymous;
+                runtime_mapping_scratch[replacement_count].readwrite =
+                    old.readwrite;
                 replacement_count++;
             }
         }
@@ -255,6 +265,8 @@ static int runtime_replace_locked(uintptr_t start, uintptr_t end,
         runtime_mapping_scratch[replacement_count].start = start;
         runtime_mapping_scratch[replacement_count].end = end;
         runtime_mapping_scratch[replacement_count].executable = executable;
+        runtime_mapping_scratch[replacement_count].anonymous = anonymous;
+        runtime_mapping_scratch[replacement_count].readwrite = readwrite;
         replacement_count++;
     }
     for (i = 1; i < replacement_count; ++i) {
@@ -273,7 +285,11 @@ static int runtime_replace_locked(uintptr_t start, uintptr_t end,
             runtime_mapping_scratch[compacted_count - 1].end ==
                 runtime_mapping_scratch[i].start &&
             runtime_mapping_scratch[compacted_count - 1].executable ==
-                runtime_mapping_scratch[i].executable) {
+                runtime_mapping_scratch[i].executable &&
+            runtime_mapping_scratch[compacted_count - 1].anonymous ==
+                runtime_mapping_scratch[i].anonymous &&
+            runtime_mapping_scratch[compacted_count - 1].readwrite ==
+                runtime_mapping_scratch[i].readwrite) {
             runtime_mapping_scratch[compacted_count - 1].end =
                 runtime_mapping_scratch[i].end;
         } else {
@@ -315,7 +331,8 @@ int guest_memory_runtime_owned(uintptr_t address, size_t length)
     return owned;
 }
 
-int guest_memory_runtime_map(uintptr_t address, size_t length, int executable)
+int guest_memory_runtime_map_kind(uintptr_t address, size_t length,
+    int executable, int anonymous, int readwrite)
 {
     uintptr_t end;
     int result = -1;
@@ -325,18 +342,27 @@ int guest_memory_runtime_map(uintptr_t address, size_t length, int executable)
     }
     end = address + length;
     pthread_mutex_lock(&runtime_mapping_lock);
-    if (runtime_replace_locked(address, end, 1, executable) == 0) {
+    if (runtime_replace_locked(address, end, 1, executable, anonymous,
+            readwrite) == 0) {
         result = 0;
     } else errno = ENOMEM;
     pthread_mutex_unlock(&runtime_mapping_lock);
     return result;
 }
 
+int guest_memory_runtime_map(uintptr_t address, size_t length, int executable)
+{
+    return guest_memory_runtime_map_kind(address, length, executable, 0, 0);
+}
+
+/* Re-records [address, address + length) with a new protection, keeping each
+   piece's anonymous/file kind. Returns 1 if the range is not wholly tracked. */
 int guest_memory_runtime_protect(uintptr_t address, size_t length,
-    int executable)
+    int executable, int readwrite)
 {
     uintptr_t end;
-    int result = -1;
+    uintptr_t cursor;
+    int result = 0;
     if (length == 0 || length > UINTPTR_MAX - address) {
         errno = EINVAL;
         return -1;
@@ -347,20 +373,66 @@ int guest_memory_runtime_protect(uintptr_t address, size_t length,
         pthread_mutex_unlock(&runtime_mapping_lock);
         return 1;
     }
-    else if (runtime_replace_locked(address, end, 1, executable) != 0)
-        errno = ENOMEM;
-    else {
-        result = 0;
+    cursor = address;
+    while (cursor < end) {
+        size_t i;
+        uintptr_t piece_end = end;
+        int anonymous = 0;
+        for (i = 0; i < runtime_mapping_count; ++i)
+            if (runtime_mappings[i].start <= cursor &&
+                runtime_mappings[i].end > cursor) {
+                anonymous = runtime_mappings[i].anonymous;
+                if (runtime_mappings[i].end < piece_end)
+                    piece_end = runtime_mappings[i].end;
+                break;
+            }
+        if (runtime_replace_locked(cursor, piece_end, 1, executable,
+                anonymous, readwrite) != 0) {
+            errno = ENOMEM;
+            result = -1;
+            break;
+        }
+        cursor = piece_end;
     }
     pthread_mutex_unlock(&runtime_mapping_lock);
     return result;
+}
+
+/* One wholly tracked run of private anonymous, read-write, non-executable
+   memory: the only kind mremap may grow or move. */
+int guest_memory_runtime_is_plain(uintptr_t address, size_t length)
+{
+    uintptr_t end;
+    uintptr_t cursor;
+    int plain = 1;
+    if (length == 0 || length > UINTPTR_MAX - address) return 0;
+    end = address + length;
+    cursor = address;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    while (cursor < end) {
+        size_t i;
+        uintptr_t next = cursor;
+        for (i = 0; i < runtime_mapping_count; ++i)
+            if (runtime_mappings[i].start <= cursor &&
+                runtime_mappings[i].end > cursor) {
+                if (runtime_mappings[i].executable ||
+                    !runtime_mappings[i].anonymous ||
+                    !runtime_mappings[i].readwrite) plain = 0;
+                next = runtime_mappings[i].end;
+                break;
+            }
+        if (next == cursor || !plain) { plain = 0; break; }
+        cursor = next;
+    }
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    return plain;
 }
 
 void guest_memory_runtime_unmap(uintptr_t address, size_t length)
 {
     if (length == 0 || length > UINTPTR_MAX - address) return;
     pthread_mutex_lock(&runtime_mapping_lock);
-    runtime_replace_locked(address, address + length, 0, 0);
+    runtime_replace_locked(address, address + length, 0, 0, 0, 0);
     pthread_mutex_unlock(&runtime_mapping_lock);
 }
 
