@@ -13,12 +13,12 @@ uintptr_t align_up(uintptr_t value, uintptr_t alignment)
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-int read_exact_at(int fd, void *buffer, size_t length, off_t offset)
+int read_exact_at(int fd, void *buffer, size_t length, off64_t offset)
 {
     unsigned char *cursor = buffer;
 
     while (length != 0) {
-        ssize_t result = pread(fd, cursor, length, offset);
+        ssize_t result = pread64(fd, cursor, length, offset);
         if (result < 0 && errno == EINTR) {
             continue;
         }

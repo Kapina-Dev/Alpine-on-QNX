@@ -101,12 +101,12 @@ size_t arm_patch_count(void)
     return patch_count;
 }
 
-int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
+int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length)
 {
     Elf32_Ehdr header;
     Elf32_Shdr *sections = 0;
-    struct stat status;
+    struct stat64 status;
     size_t table_size;
     size_t i;
     int result = 0;
@@ -115,7 +115,7 @@ int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
 
     if (fd < 0 || offset < 0 || length == 0 ||
         (uint64_t)length > UINT64_MAX - (uint64_t)offset) return 0;
-    if (fstat(fd, &status) != 0 || status.st_size < 0 ||
+    if (fstat64(fd, &status) != 0 || status.st_size < 0 ||
         read_exact_at(fd, &header, sizeof(header), 0) != 0) return 0;
     if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
         header.e_ident[EI_CLASS] != ELFCLASS32 ||
@@ -128,7 +128,7 @@ int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
             (uint64_t)status.st_size - (uint64_t)header.e_shoff) return 0;
     sections = malloc(table_size);
     if (sections == 0 || read_exact_at(fd, sections, table_size,
-            (off_t)header.e_shoff) != 0) {
+            (off64_t)header.e_shoff) != 0) {
         free(sections);
         return -1;
     }

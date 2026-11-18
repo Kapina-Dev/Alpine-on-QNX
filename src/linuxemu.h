@@ -2,6 +2,9 @@
 #define LINUXEMU_H
 
 #define _QNX_SOURCE 1
+/* The core builds with a 32-bit off_t; guest-visible file offsets and sizes
+   must go through the *64 interfaces (pread64, lseek64, fstat64, ...). */
+#define _LARGEFILE64_SOURCE 1
 #include <sys/elf.h>
 #include <signal.h>
 #include <semaphore.h>
@@ -42,7 +45,7 @@ struct elf_object {
 
 uintptr_t align_down(uintptr_t value, uintptr_t alignment);
 uintptr_t align_up(uintptr_t value, uintptr_t alignment);
-int read_exact_at(int fd, void *buffer, size_t length, off_t offset);
+int read_exact_at(int fd, void *buffer, size_t length, off64_t offset);
 
 int guest_memory_initialize(long page_size);
 int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
@@ -73,7 +76,7 @@ struct arm_patch_site {
 
 int arm_patch_range(uintptr_t start, size_t length);
 int arm_patch_thumb_range(uintptr_t start, size_t length);
-int arm_patch_elf_mapping(int fd, off_t offset, uintptr_t address,
+int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length);
 void arm_patch_forget_range(uintptr_t address, size_t length);
 const struct arm_patch_site *arm_patch_lookup(uintptr_t address);
@@ -188,7 +191,8 @@ void guest_thread_altstack_set(uint32_t pointer, uint32_t size);
 int linux_errno_number(int host_errno);
 int linux_open_flags(uint32_t linux_flags, int *host_flags);
 uint32_t linux_status_flags(int host_flags);
-void linux_stat64_store(void *guest_buffer, const struct stat *host_status);
+void linux_stat64_store(void *guest_buffer,
+    const struct stat64 *host_status);
 void linux_rusage_store(void *guest_buffer, const struct rusage *host_usage);
 
 void runtime_initialize(long page_size, int trace_enabled);

@@ -102,6 +102,7 @@ run_fd_guest fd-close-all
 run_fd_guest fd-exhaust
 run_fd_guest file-vector-syscalls
 run_fd_guest fallocate-fcntl-syscalls
+run_fd_guest large-offset-syscalls
 
 echo "=== filesystem guest: sendfile-interrupt ==="
 LINUXEMU_ROOT="$alpine_root" "$linuxemu" \

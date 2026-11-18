@@ -160,7 +160,7 @@ static void store_u64(unsigned char *buffer, size_t offset, uint64_t value)
     memcpy(buffer + offset, &value, sizeof(value));
 }
 
-void linux_stat64_store(void *guest_buffer, const struct stat *status)
+void linux_stat64_store(void *guest_buffer, const struct stat64 *status)
 {
     unsigned char *buffer = guest_buffer;
     memset(buffer, 0, 104);

@@ -468,13 +468,14 @@ static int32_t linux_stat_path(int directory_fd, const char *guest_path,
     void *guest_status, int follow)
 {
     char host_path[PATH_MAX];
-    struct stat status;
+    struct stat64 status;
     int result;
 
     if (resolve_at(directory_fd, guest_path, 0, !follow, host_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
-    result = follow ? stat(host_path, &status) : lstat(host_path, &status);
+    result = follow ? stat64(host_path, &status) :
+        lstat64(host_path, &status);
     if (result != 0) return -(int32_t)linux_errno_number(errno);
     linux_stat64_store(guest_status, &status);
     return 0;
@@ -651,8 +652,8 @@ static int32_t linux_fstatfs64(int descriptor, size_t guest_size,
 
 static int32_t linux_fstat_fd(int fd, void *guest_status)
 {
-    struct stat status;
-    if (fstat(fd, &status) != 0) return -(int32_t)linux_errno_number(errno);
+    struct stat64 status;
+    if (fstat64(fd, &status) != 0) return -(int32_t)linux_errno_number(errno);
     linux_stat64_store(guest_status, &status);
     return 0;
 }
@@ -1146,7 +1147,7 @@ static int32_t linux_mmap2(ucontext_t *context)
     int mapping_protection;
     int copy_executable_file;
     void *result;
-    off_t offset;
+    off64_t offset;
     size_t mapped_length;
     uintptr_t mapped_address;
     uintptr_t host_page_size = (uintptr_t)runtime_page_size();
@@ -1179,7 +1180,7 @@ static int32_t linux_mmap2(ucontext_t *context)
         (host_protection & PROT_EXEC) != 0)
         return linux_unsupported(LINUX_NR_MMAP2, LINUX_EOPNOTSUPP,
             "mmap-shared-exec", (const uint32_t *)context->uc_mcontext.cpu.gpr);
-    offset = (off_t)context->uc_mcontext.cpu.gpr[5] * 4096;
+    offset = (off64_t)context->uc_mcontext.cpu.gpr[5] * 4096;
     host_descriptor = (int)context->uc_mcontext.cpu.gpr[4];
     copy_executable_file =
         (linux_flags & LINUX_MAP_PRIVATE) != 0 &&
@@ -1194,7 +1195,7 @@ static int32_t linux_mmap2(ucontext_t *context)
         (linux_flags & LINUX_MAP_ANONYMOUS) == 0)
         mapping_protection =
             (host_protection | PROT_READ | PROT_WRITE) & ~PROT_EXEC;
-    result = mmap((void *)requested_address, requested_length,
+    result = mmap64((void *)requested_address, requested_length,
         mapping_protection, host_flags,
         host_descriptor, copy_executable_file ? 0 : offset);
     if (result == MAP_FAILED) {
@@ -1210,10 +1211,10 @@ static int32_t linux_mmap2(ucontext_t *context)
         return -ENOMEM;
     }
     if (copy_executable_file) {
-        struct stat status;
+        struct stat64 status;
         size_t file_bytes;
         int descriptor = (int)context->uc_mcontext.cpu.gpr[4];
-        if (fstat(descriptor, &status) != 0) {
+        if (fstat64(descriptor, &status) != 0) {
             int saved_errno = errno;
             munmap(result, mapped_length);
             return -(int32_t)linux_errno_number(saved_errno);
@@ -1223,7 +1224,7 @@ static int32_t linux_mmap2(ucontext_t *context)
             return -EINVAL;
         }
         file_bytes = requested_length;
-        if ((off_t)file_bytes > status.st_size - offset)
+        if ((off64_t)file_bytes > status.st_size - offset)
             file_bytes = (size_t)(status.st_size - offset);
         if (file_bytes != 0 && read_exact_at(descriptor, result,
                 file_bytes, offset) != 0) {
@@ -1458,17 +1459,17 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_PREAD64: {
         uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
             ((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32);
-        result = linux_result(pread((int)context->uc_mcontext.cpu.gpr[0],
+        result = linux_result(pread64((int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
-            (size_t)context->uc_mcontext.cpu.gpr[2], (off_t)offset));
+            (size_t)context->uc_mcontext.cpu.gpr[2], (off64_t)offset));
         break;
     }
     case LINUX_NR_PWRITE64: {
         uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
             ((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32);
-        result = linux_result(pwrite((int)context->uc_mcontext.cpu.gpr[0],
+        result = linux_result(pwrite64((int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
-            (size_t)context->uc_mcontext.cpu.gpr[2], (off_t)offset));
+            (size_t)context->uc_mcontext.cpu.gpr[2], (off64_t)offset));
         break;
     }
     case 361: case 362: case 392: case 393: {
@@ -1513,8 +1514,8 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_FTRUNCATE64: {
         uint64_t length = (uint64_t)context->uc_mcontext.cpu.gpr[2] |
             ((uint64_t)context->uc_mcontext.cpu.gpr[3] << 32);
-        result = linux_host_result(ftruncate(
-            (int)context->uc_mcontext.cpu.gpr[0], (off_t)length));
+        result = linux_host_result(ftruncate64(
+            (int)context->uc_mcontext.cpu.gpr[0], (off64_t)length));
         break;
     }
     case LINUX_NR_READV:
@@ -1648,9 +1649,9 @@ void linux_syscall_dispatch(ucontext_t *context)
         uint64_t unsigned_offset =
             ((uint64_t)context->uc_mcontext.cpu.gpr[1] << 32) |
             context->uc_mcontext.cpu.gpr[2];
-        off_t offset = lseek((int)context->uc_mcontext.cpu.gpr[0],
-            (off_t)unsigned_offset, (int)context->uc_mcontext.cpu.gpr[4]);
-        if (offset == (off_t)-1) result = -linux_errno_number(errno);
+        off64_t offset = lseek64((int)context->uc_mcontext.cpu.gpr[0],
+            (off64_t)unsigned_offset, (int)context->uc_mcontext.cpu.gpr[4]);
+        if (offset == (off64_t)-1) result = -linux_errno_number(errno);
         else {
             uint64_t stored = (uint64_t)offset;
             memcpy((void *)context->uc_mcontext.cpu.gpr[3], &stored, 8);

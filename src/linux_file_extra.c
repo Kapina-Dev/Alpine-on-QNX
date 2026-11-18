@@ -1,6 +1,5 @@
 /* File calls QNX lacks: vector positional I/O and sendfile64, emulated with
    loops.  These run inside the SIGILL handler: no malloc, no stdio. */
-#define _LARGEFILE64_SOURCE 1
 #include "linuxemu.h"
 #include "guest_fd.h"
 
@@ -84,10 +83,10 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
         ssize_t moved;
         if (length == 0) continue;
         moved = writing ?
-            pwrite(fd, vector[index].iov_base, length,
-                (off_t)(offset + total)) :
-            pread(fd, vector[index].iov_base, length,
-                (off_t)(offset + total));
+            pwrite64(fd, vector[index].iov_base, length,
+                (off64_t)(offset + total)) :
+            pread64(fd, vector[index].iov_base, length,
+                (off64_t)(offset + total));
         if (moved < 0) {
             if (total > 0) break;
             return host_errno_result();
@@ -122,7 +121,7 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
 
     if (guest_fd_is_hidden(out_fd) || guest_fd_is_hidden(in_fd))
         return -LINUX_EBADF;
-    if (lseek(in_fd, 0, SEEK_CUR) < 0) {
+    if (lseek64(in_fd, 0, SEEK_CUR) < 0) {
         uint32_t arguments[6];
         /* a bad descriptor and the like keep their own error */
         if (errno != ESPIPE) return host_errno_result();
@@ -147,7 +146,7 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
         ssize_t put;
         if (chunk > SENDFILE_CHUNK) chunk = SENDFILE_CHUNK;
         got = offset_pointer != 0 ?
-            pread(in_fd, buffer, chunk, (off_t)(offset + total)) :
+            pread64(in_fd, buffer, chunk, (off64_t)(offset + total)) :
             read(in_fd, buffer, chunk);
         if (got < 0) {
             error = host_errno_result();
@@ -164,8 +163,8 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
         if (written < (size_t)got) {
             /* the input position moved past what was delivered: put it back
                so a restart or the caller's next call sees the true state */
-            if (offset_pointer == 0 && lseek(in_fd,
-                    -(off_t)((size_t)got - written), SEEK_CUR) < 0)
+            if (offset_pointer == 0 && lseek64(in_fd,
+                    -(off64_t)((size_t)got - written), SEEK_CUR) < 0)
                 error = host_errno_result();
             break;
         }

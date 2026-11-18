@@ -128,7 +128,7 @@ int guest_memory_map_load_segment(int fd, const Elf32_Phdr *header,
 
     if (header->p_filesz != 0 &&
         read_exact_at(fd, (void *)segment_start, header->p_filesz,
-            (off_t)header->p_offset) != 0) {
+            (off64_t)header->p_offset) != 0) {
         int saved_errno = errno;
         munmap(mapping, map_end - map_start);
         errno = saved_errno;

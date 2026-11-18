@@ -119,9 +119,9 @@ static struct mapping_symbol *load_mapping_symbols(int fd,
         symbols = malloc((entries ? entries : 1) * sizeof(*symbols));
         if (table == 0 || strings == 0 || symbols == 0 ||
             read_exact_at(fd, table, symtab->sh_size,
-                (off_t)symtab->sh_offset) != 0 ||
+                (off64_t)symtab->sh_offset) != 0 ||
             read_exact_at(fd, strings, strtab->sh_size,
-                (off_t)strtab->sh_offset) != 0) {
+                (off64_t)strtab->sh_offset) != 0) {
             free(symbols);
             symbols = 0;
             break;
@@ -205,7 +205,7 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
     }
     sections = malloc(table_size);
     if (sections == 0 || read_exact_at(fd, sections, table_size,
-            (off_t)elf_header->e_shoff) != 0) {
+            (off64_t)elf_header->e_shoff) != 0) {
         free(sections);
         return -1;
     }
@@ -303,7 +303,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
     }
     program_headers = malloc(headers_size);
     if (program_headers == 0 || read_exact_at(fd, program_headers,
-            headers_size, (off_t)elf_header.e_phoff) != 0) goto done;
+            headers_size, (off64_t)elf_header.e_phoff) != 0) goto done;
 
     for (i = 0; i < elf_header.e_phnum; ++i) {
         if (validate_program_header(&program_headers[i], file_status.st_size) != 0)
@@ -321,7 +321,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
         if (header->p_type == PT_INTERP) {
             if (header->p_filesz < 2 || header->p_filesz > interpreter_capacity ||
                 read_exact_at(fd, interpreter, header->p_filesz,
-                    (off_t)header->p_offset) != 0 ||
+                    (off64_t)header->p_offset) != 0 ||
                 interpreter[header->p_filesz - 1] != '\0' ||
                 memchr(interpreter, '\0', header->p_filesz - 1) != 0 ||
                 !safe_interpreter_path(interpreter)) {
