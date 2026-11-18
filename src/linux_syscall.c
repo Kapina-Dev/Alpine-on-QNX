@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -691,11 +692,20 @@ static int32_t linux_getdents64(int fd, void *guest_buffer, size_t capacity)
     return result != 0 ? result : (int32_t)used;
 }
 
+/* QNX dup2 is close plus dup, not atomic against another thread closing or
+   replacing the destination: it fails with EBADF or EINVAL.  Linux orders
+   dup2, dup3 and close on one number, so the emulator does too. */
+static pthread_mutex_t fd_replace_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int32_t linux_close_fd(int fd)
 {
+    int32_t result;
     if (guest_fd_is_hidden(fd)) return -EBADF;
+    pthread_mutex_lock(&fd_replace_lock);
     guest_fd_clear(fd);
-    return linux_host_result(close(fd));
+    result = linux_host_result(close(fd));
+    pthread_mutex_unlock(&fd_replace_lock);
+    return result;
 }
 
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
@@ -1586,12 +1596,14 @@ void linux_syscall_dispatch(ucontext_t *context)
         else {
             int source = (int)context->uc_mcontext.cpu.gpr[0];
             int destination = (int)context->uc_mcontext.cpu.gpr[1];
+            pthread_mutex_lock(&fd_replace_lock);
             if (fcntl(source, F_GETFD, 0) < 0)
                 result = -(int32_t)linux_errno_number(errno);
             else result = linux_host_result(dup2(source, destination));
             if (result >= 0 &&
                 (int)context->uc_mcontext.cpu.gpr[0] != result)
                 (void)guest_fd_duplicate((int)context->uc_mcontext.cpu.gpr[0], result);
+            pthread_mutex_unlock(&fd_replace_lock);
         }
         break;
     case LINUX_NR_ACCESS: {
@@ -1907,11 +1919,13 @@ void linux_syscall_dispatch(ucontext_t *context)
         else if (fcntl(source, F_GETFD, 0) < 0)
             result = -(int32_t)linux_errno_number(errno);
         else {
+            pthread_mutex_lock(&fd_replace_lock);
             result = linux_host_result(dup2(source, destination));
             if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
                 fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)
                 result = -(int32_t)linux_errno_number(errno);
             if (result >= 0) (void)guest_fd_duplicate(source, destination);
+            pthread_mutex_unlock(&fd_replace_lock);
         }
         break;
     }
