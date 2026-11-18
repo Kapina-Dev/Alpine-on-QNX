@@ -212,80 +212,6 @@ struct linux_flock64 {
     int32_t trailing_padding;
 };
 
-struct linux_rlimit64 {
-    uint64_t current;
-    uint64_t maximum;
-};
-
-static int linux_resource_number(uint32_t resource)
-{
-    switch (resource) {
-    case 0: return RLIMIT_CPU;
-    case 1: return RLIMIT_FSIZE;
-    case 2: return RLIMIT_DATA;
-    case 3: return RLIMIT_STACK;
-    case 4: return RLIMIT_CORE;
-#ifdef RLIMIT_RSS
-    case 5: return RLIMIT_RSS;
-#endif
-#ifdef RLIMIT_NPROC
-    case 6: return RLIMIT_NPROC;
-#endif
-    case 7: return RLIMIT_NOFILE;
-#ifdef RLIMIT_AS
-    case 9: return RLIMIT_AS;
-#endif
-    default: return -1;
-    }
-}
-
-static uint64_t linux_rlimit_value(rlim_t value)
-{
-    return value == RLIM_INFINITY ? UINT64_MAX : (uint64_t)value;
-}
-
-static rlim_t host_rlimit_value(uint64_t value)
-{
-    return value == UINT64_MAX ? RLIM_INFINITY : (rlim_t)value;
-}
-
-static int32_t linux_prlimit64(int32_t process, uint32_t resource,
-    const struct linux_rlimit64 *guest_new_limit,
-    struct linux_rlimit64 *guest_old_limit)
-{
-    struct rlimit host_limit;
-    struct rlimit host_new_limit;
-    int host_resource = linux_resource_number(resource);
-    if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
-    if (host_resource < 0) return -EINVAL;
-    if (host_resource == RLIMIT_NOFILE) {
-        uint64_t soft, hard;
-        guest_fd_nofile_get(&soft, &hard);
-        if (guest_new_limit != 0 &&
-                guest_fd_nofile_set(guest_new_limit->current,
-                    guest_new_limit->maximum) != 0)
-            return -(int32_t)linux_errno_number(errno);
-        if (guest_old_limit != 0) {
-            guest_old_limit->current = soft;
-            guest_old_limit->maximum = hard;
-        }
-        return 0;
-    }
-    if (getrlimit(host_resource, &host_limit) != 0)
-        return -(int32_t)linux_errno_number(errno);
-    if (guest_old_limit != 0) {
-        guest_old_limit->current = linux_rlimit_value(host_limit.rlim_cur);
-        guest_old_limit->maximum = linux_rlimit_value(host_limit.rlim_max);
-    }
-    if (guest_new_limit != 0) {
-        host_new_limit.rlim_cur = host_rlimit_value(guest_new_limit->current);
-        host_new_limit.rlim_max = host_rlimit_value(guest_new_limit->maximum);
-        if (setrlimit(host_resource, &host_new_limit) != 0)
-            return -(int32_t)linux_errno_number(errno);
-    }
-    return 0;
-}
-
 static size_t append_text(char *buffer, size_t position, const char *text)
 {
     while (*text != '\0') buffer[position++] = *text++;
@@ -1933,12 +1859,14 @@ void linux_syscall_dispatch(ucontext_t *context)
             (size_t)context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2]);
         break;
+    case 75:
+    case 77:
+    case 104:
+    case 105:
+    case 116:
+    case 191:
     case LINUX_NR_PRLIMIT64:
-        result = linux_prlimit64(
-            (int32_t)context->uc_mcontext.cpu.gpr[0],
-            context->uc_mcontext.cpu.gpr[1],
-            (const struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[2],
-            (struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[3]);
+        result = linux_resource_syscall(number, context->uc_mcontext.cpu.gpr);
         break;
     case 266:
         result = linux_statfs64((const char *)context->uc_mcontext.cpu.gpr[0],
