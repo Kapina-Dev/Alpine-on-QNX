@@ -50,8 +50,8 @@ static void install(int flags)
     sigaction(SIGALRM, &action, 0);
 }
 
-/* setitimer comes later; a forked child signals the parent after a delay and
-   then, if asked, sends a datagram. */
+/* A forked child signals the parent after a delay and then, if asked,
+   sends a datagram. */
 static pid_t child_signals(int send_fd, int send_after)
 {
     pid_t child = fork();
