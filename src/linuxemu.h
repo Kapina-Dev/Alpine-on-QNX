@@ -84,6 +84,7 @@ int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
 void arm_patch_forget_range(uintptr_t address, size_t length);
 const struct arm_patch_site *arm_patch_lookup(uintptr_t address);
 size_t arm_patch_count(void);
+int arm_patch_any_in_range(uintptr_t start, size_t length);
 void arm_patch_rollback(size_t patch_count);
 
 int load_guest_image(const char *path, struct guest_image *image);

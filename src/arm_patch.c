@@ -175,6 +175,18 @@ void arm_patch_forget_range(uintptr_t address, size_t length)
     patch_count = destination;
 }
 
+/* Nonzero if any patch site lies in [start, start + length). */
+int arm_patch_any_in_range(uintptr_t start, size_t length)
+{
+    uintptr_t end;
+    size_t i;
+    if (length > UINTPTR_MAX - start) end = UINTPTR_MAX;
+    else end = start + length;
+    for (i = 0; i < patch_count; ++i)
+        if (patches[i].address >= start && patches[i].address < end) return 1;
+    return 0;
+}
+
 void arm_patch_rollback(size_t retained_count)
 {
     while (patch_count > retained_count) {

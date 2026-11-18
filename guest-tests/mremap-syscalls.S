@@ -6,7 +6,7 @@
 
 /*
  * mremap for private anonymous read-write memory.  Each failing check exits
- * with its own number (10..15); 9 is a setup failure.
+ * with its own number (10..18); 9 is a setup failure.
  */
     .macro sys nr
     movw r7, #\nr
@@ -164,6 +164,96 @@ _start:
     cmn r0, #22
     bne f15
 
+    /* 16: guaranteed move: the page after the shrunk mapping is taken */
+    mapanon 8192, 3
+    cmn r0, #4096
+    bhi f9
+    mov r8, r0
+    ldr r1, =0x44444444
+    str r1, [r8]
+    movw r1, #8192
+    movw r2, #4096
+    mov r3, #0
+    sys 163
+    cmp r0, r8
+    bne f16
+    add r0, r8, #4096
+    movw r1, #4096
+    mov r2, #3
+    mov r3, #0x22
+    mvn r4, #0
+    mov r5, #0
+    sys 192
+    add r1, r8, #4096
+    cmp r0, r1
+    bne f16
+    mov r0, r8
+    movw r1, #4096
+    movw r2, #8192
+    mov r3, #1
+    sys 163
+    cmn r0, #4096
+    bhi f16
+    cmp r0, r8
+    beq f16
+    mov r9, r0
+    ldr r1, [r9]
+    ldr r2, =0x44444444
+    cmp r1, r2
+    bne f16
+    movw r2, #4096
+    ldr r1, [r9, r2]
+    cmp r1, #0
+    bne f16
+
+    /* 17: in-place grow: the freed page after a shrink is reused */
+    mapanon 8192, 3
+    cmn r0, #4096
+    bhi f9
+    mov r8, r0
+    movw r1, #8192
+    movw r2, #4096
+    mov r3, #0
+    sys 163
+    cmp r0, r8
+    bne f17
+    mov r0, r8
+    movw r1, #4096
+    movw r2, #8192
+    mov r3, #1
+    sys 163
+    cmp r0, r8
+    bne f17
+
+    /* 18: memory that was patched (RW -> RX -> RW) is refused */
+    mapanon 4096, 3
+    cmn r0, #4096
+    bhi f9
+    mov r8, r0
+    mov r1, #0xef000000
+    str r1, [r8]
+    ldr r1, =0xe12fff1e
+    str r1, [r8, #4]
+    mov r0, r8
+    movw r1, #4096
+    mov r2, #5
+    sys 125
+    cmp r0, #0
+    bne f9
+    mov r0, r8
+    movw r1, #4096
+    mov r2, #3
+    sys 125
+    cmp r0, #0
+    bne f9
+    mov r0, r8
+    movw r1, #4096
+    movw r2, #8192
+    mov r3, #1
+    sys 163
+    cmn r0, #22
+    bne f18
+
     mov r0, #0
     b done
 f9: mov r0, #9
@@ -179,6 +269,12 @@ f13: mov r0, #13
 f14: mov r0, #14
     b done
 f15: mov r0, #15
+    b done
+f16: mov r0, #16
+    b done
+f17: mov r0, #17
+    b done
+f18: mov r0, #18
 done:
     sys 1
 

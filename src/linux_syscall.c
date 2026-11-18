@@ -1449,6 +1449,11 @@ static int32_t linux_mremap(uintptr_t old_address, size_t old_length,
     if (!guest_memory_runtime_is_plain(old_address, old_size))
         return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
             "mremap-kind", args);
+    /* Memory that was ever executable carries UDF traps and site records
+       (a W^X flip back to RW leaves them): never shrink, grow or move it. */
+    if (arm_patch_any_in_range(old_address, old_size))
+        return linux_unsupported(LINUX_NR_MREMAP, LINUX_EINVAL,
+            "mremap-kind", args);
     if (new_size == old_size) return (int32_t)old_address;
     if (new_size < old_size) {
         status = linux_munmap_runtime(old_address + new_size,
@@ -1484,6 +1489,8 @@ static int32_t linux_mremap(uintptr_t old_address, size_t old_length,
         munmap(result, new_size);
         return -ENOMEM;
     }
+    /* A racing guest munmap of the old range can fault the emulator in this
+       copy; Linux serialises mremap against munmap with mmap_lock, we do not. */
     memcpy(result, (const void *)old_address, old_size);
     if (guest_memory_runtime_map_kind(mapped, new_size, 0, 1, 1) != 0) {
         munmap(result, new_size);
