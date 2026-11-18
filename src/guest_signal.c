@@ -284,7 +284,7 @@ static int restartable_syscall(uint32_t number)
     switch (number) {
     case 3: case 4: case 54: case 114: case 145: case 146: case 240:
     case 239: case 283: case 285: case 291: case 292: case 297: case 361:
-    case 362: case 366: case 392: case 393:
+    case 362: case 365: case 366: case 374: case 392: case 393:
         return 1;
     default:
         return 0;

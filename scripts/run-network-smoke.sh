@@ -99,6 +99,20 @@ status=$?
 echo "syscall-probe exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+echo "=== network guest: socket-mmsg-syscalls ==="
+LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+    "$project_dir/build/guest-tests/socket-mmsg-syscalls"
+status=$?
+echo "socket-mmsg-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
+echo "=== network guest: socket-mmsg-interrupt ==="
+LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+    "$project_dir/guest-tests/fixtures/socket-mmsg-interrupt-armhf"
+status=$?
+echo "socket-mmsg-interrupt exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
 echo "=== network guest: unix-rights-backlog ==="
 LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
     "$project_dir/build/guest-tests/unix-rights-backlog"

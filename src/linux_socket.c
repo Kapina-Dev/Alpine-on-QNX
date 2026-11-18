@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LINUX_NR_SOCKETCALL 102
@@ -31,7 +32,9 @@
 #define LINUX_NR_GETSOCKOPT 295
 #define LINUX_NR_SENDMSG 296
 #define LINUX_NR_RECVMSG 297
+#define LINUX_NR_RECVMMSG 365
 #define LINUX_NR_ACCEPT4 366
+#define LINUX_NR_SENDMMSG 374
 
 #define LINUX_AF_UNIX 1
 #define LINUX_AF_INET 2
@@ -694,9 +697,13 @@ static int32_t socket_option_call(uint32_t number, uint32_t *arguments)
     return result == 0 ? 0 : -(int32_t)linux_errno_number(errno);
 }
 
-static int32_t message_call(uint32_t number, uint32_t *arguments)
+/* One sendmsg or recvmsg on a guest msghdr copy.  Shared by sendmsg,
+   recvmsg, sendmmsg and recvmmsg.  On a successful receive *guest holds the
+   updated header and the caller stores it back. */
+static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
+    uint32_t linux_flags)
 {
-    struct linux_msghdr guest;
+    struct linux_msghdr guest = *header;
     struct msghdr host;
     struct sockaddr_storage address;
     socklen_t address_length;
@@ -707,9 +714,7 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     int converted;
     ssize_t result;
     uint32_t iov_index;
-    if (arguments[1] == 0) return -EFAULT;
-    memcpy(&guest, (void *)arguments[1], sizeof(guest));
-    if (message_flags(arguments[2], &flags) != 0) return -EINVAL;
+    if (message_flags(linux_flags, &flags) != 0) return -EINVAL;
     memset(&host, 0, sizeof(host));
     host.msg_iov = (struct iovec *)guest.iov;
     host.msg_iovlen = guest.iov_count;
@@ -718,39 +723,39 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
             return -EINVAL;
         payload_length += host.msg_iov[iov_index].iov_len;
     }
-    if (number == LINUX_NR_SENDMSG && guest.control_length != 0) {
+    if (!receiving && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         converted = send_control((void *)guest.control, guest.control_length,
             &control, &control_length);
         if (converted != 0) return converted;
         host.msg_control = control;
         host.msg_controllen = control_length;
-    } else if (number == LINUX_NR_RECVMSG && guest.control_length != 0) {
+    } else if (receiving && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         control = calloc(1, guest.control_length);
         if (control == 0) return -ENOMEM;
         host.msg_control = control;
         host.msg_controllen = guest.control_length;
     }
-    if (number == LINUX_NR_SENDMSG && guest.name != 0) {
+    if (!receiving && guest.name != 0) {
         converted = guest_address((void *)guest.name, guest.name_length, 0,
             &address, &address_length);
         if (converted != 0) { free(control); return converted; }
         host.msg_name = &address;
         host.msg_namelen = address_length;
-    } else if (number == LINUX_NR_RECVMSG && guest.name != 0) {
+    } else if (receiving && guest.name != 0) {
         host.msg_name = &address;
         host.msg_namelen = sizeof(address);
     }
-    result = number == LINUX_NR_SENDMSG ?
-        sendmsg((int)arguments[0], &host, flags) :
-        recvmsg((int)arguments[0], &host, flags);
+    result = !receiving ?
+        sendmsg(fd, &host, flags) :
+        recvmsg(fd, &host, flags);
     if (result < 0) {
         int saved_errno = errno;
         free(control);
         return -(int32_t)linux_errno_number(saved_errno);
     }
-    if (number == LINUX_NR_RECVMSG) {
+    if (receiving) {
         guest.flags = linux_message_flags(host.msg_flags);
         if (guest.name != 0) {
             uint32_t capacity = guest.name_length;
@@ -767,7 +772,7 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
             uint32_t received_length = 0;
             converted = receive_control(&host, (void *)guest.control,
                 guest.control_length,
-                (arguments[2] & LINUX_MSG_CMSG_CLOEXEC) != 0,
+                (linux_flags & LINUX_MSG_CMSG_CLOEXEC) != 0,
                 &received_length, &guest.flags);
             if (converted != 0) {
                 close_received_rights(&host);
@@ -776,10 +781,98 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
             }
             guest.control_length = received_length;
         }
-        memcpy((void *)arguments[1], &guest, sizeof(guest));
+        *header = guest;
     }
     free(control);
     return (int32_t)result;
+}
+
+static int32_t message_call(uint32_t number, uint32_t *arguments)
+{
+    struct linux_msghdr guest;
+    int32_t result;
+    if (arguments[1] == 0) return -EFAULT;
+    if (guest_fd_is_hidden((int)arguments[0])) return -EBADF;
+    memcpy(&guest, (void *)arguments[1], sizeof(guest));
+    result = message_one((int)arguments[0], number == LINUX_NR_RECVMSG,
+        &guest, arguments[2]);
+    if (result >= 0 && number == LINUX_NR_RECVMSG)
+        memcpy((void *)arguments[1], &guest, sizeof(guest));
+    return result;
+}
+
+/* struct mmsghdr on ARM: a msghdr and the byte count of that message. */
+struct linux_mmsghdr {
+    struct linux_msghdr header;
+    uint32_t length;
+};
+
+struct linux_timespec32 {
+    int32_t seconds;
+    int32_t nanoseconds;
+};
+
+#define LINUX_UIO_MAXIOV 1024u
+#define LINUX_MSG_DONTWAIT 0x00000040u
+#define LINUX_MSG_WAITFORONE 0x00010000u
+
+/* sendmmsg (receiving 0) and recvmmsg (receiving 1) as a loop over
+   message_one.  An error on the first message is returned; one after at
+   least one message returns the count so far.  The recvmmsg timeout is
+   checked only between messages. */
+static int32_t multi_message_call(int receiving, uint32_t *arguments)
+{
+    struct linux_mmsghdr *vector = (struct linux_mmsghdr *)arguments[1];
+    uint32_t count = arguments[2];
+    uint32_t flags = arguments[3];
+    struct timespec deadline;
+    struct timespec now;
+    int has_timeout = 0;
+    uint32_t done = 0;
+    if (guest_fd_is_hidden((int)arguments[0])) return -EBADF;
+    if (count > LINUX_UIO_MAXIOV) count = LINUX_UIO_MAXIOV;
+    if (receiving && arguments[4] != 0) {
+        struct linux_timespec32 timeout;
+        memcpy(&timeout, (void *)arguments[4], sizeof(timeout));
+        if (timeout.seconds < 0 || timeout.nanoseconds < 0 ||
+            timeout.nanoseconds >= 1000000000)
+            return -EINVAL;
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_sec += timeout.seconds;
+        deadline.tv_nsec += timeout.nanoseconds;
+        if (deadline.tv_nsec >= 1000000000) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000;
+        }
+        has_timeout = 1;
+    }
+    if (count == 0) return 0;
+    if (vector == 0) return -EFAULT;
+    while (done != count) {
+        struct linux_msghdr header;
+        int32_t result;
+        uint32_t length;
+        memcpy(&header, &vector[done].header, sizeof(header));
+        result = message_one((int)arguments[0], receiving, &header,
+            receiving ? flags & ~LINUX_MSG_WAITFORONE : flags);
+        if (result < 0) return done != 0 ? (int32_t)done : result;
+        if (receiving) memcpy(&vector[done].header, &header, sizeof(header));
+        length = (uint32_t)result;
+        memcpy(&vector[done].length, &length, sizeof(length));
+        ++done;
+        if (receiving) {
+            if ((flags & LINUX_MSG_WAITFORONE) != 0)
+                flags |= LINUX_MSG_DONTWAIT;
+            if (has_timeout) {
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec > deadline.tv_sec ||
+                    (now.tv_sec == deadline.tv_sec &&
+                        now.tv_nsec >= deadline.tv_nsec))
+                    break;
+            }
+        }
+    }
+    return (int32_t)done;
 }
 
 static uint32_t socketcall_number(uint32_t call)
@@ -789,7 +882,8 @@ static uint32_t socketcall_number(uint32_t call)
         LINUX_NR_GETSOCKNAME, LINUX_NR_GETPEERNAME, LINUX_NR_SOCKETPAIR,
         LINUX_NR_SEND, LINUX_NR_RECV, LINUX_NR_SENDTO, LINUX_NR_RECVFROM,
         LINUX_NR_SHUTDOWN, LINUX_NR_SETSOCKOPT, LINUX_NR_GETSOCKOPT,
-        LINUX_NR_SENDMSG, LINUX_NR_RECVMSG, LINUX_NR_ACCEPT4 };
+        LINUX_NR_SENDMSG, LINUX_NR_RECVMSG, LINUX_NR_ACCEPT4,
+        LINUX_NR_RECVMMSG, LINUX_NR_SENDMMSG };
     return call < ARRAY_COUNT(calls) ? calls[call] : 0;
 }
 
@@ -823,6 +917,8 @@ int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6])
     case LINUX_NR_GETSOCKOPT: return socket_option_call(number, arguments);
     case LINUX_NR_SENDMSG:
     case LINUX_NR_RECVMSG: return message_call(number, arguments);
+    case LINUX_NR_SENDMMSG: return multi_message_call(0, arguments);
+    case LINUX_NR_RECVMMSG: return multi_message_call(1, arguments);
     default: return -ENOSYS;
     }
 }

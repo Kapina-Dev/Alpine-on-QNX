@@ -146,7 +146,9 @@
 #define LINUX_NR_PPOLL 336
 #define LINUX_NR_DUP3 358
 #define LINUX_NR_PIPE2 359
+#define LINUX_NR_RECVMMSG 365
 #define LINUX_NR_ACCEPT4 366
+#define LINUX_NR_SENDMMSG 374
 #define LINUX_NR_PRLIMIT64 369
 #define LINUX_NR_GETRANDOM 384
 #define LINUX_NR_CLOCK_GETTIME64 403
@@ -1922,6 +1924,8 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_SENDMSG:
     case LINUX_NR_RECVMSG:
     case LINUX_NR_ACCEPT4:
+    case LINUX_NR_RECVMMSG:
+    case LINUX_NR_SENDMMSG:
         result = linux_socket_syscall(number, context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_GETRANDOM:
