@@ -288,6 +288,12 @@ static int32_t linux_unsupported(uint32_t number, int32_t linux_error,
     return -linux_error;
 }
 
+int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
+    const char *detail, const uint32_t *args)
+{
+    return linux_unsupported(number, linux_error, detail, args);
+}
+
 static void trace_call(uint32_t number, const ucontext_t *context)
 {
     char message[160];
@@ -1602,7 +1608,8 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_KILL:
         result = guest_signal_send(
             (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0],
-            (int)context->uc_mcontext.cpu.gpr[1]);
+            (int)context->uc_mcontext.cpu.gpr[1], LINUX_NR_KILL,
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_SETSID:
         result = linux_host_result(setsid());
@@ -1785,20 +1792,23 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_TKILL:
         result = guest_signal_send_thread(0,
             (int32_t)context->uc_mcontext.cpu.gpr[0],
-            (int)context->uc_mcontext.cpu.gpr[1]);
+            (int)context->uc_mcontext.cpu.gpr[1], LINUX_NR_TKILL,
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_TGKILL:
         result = guest_signal_send_thread(
             (int32_t)context->uc_mcontext.cpu.gpr[0],
             (int32_t)context->uc_mcontext.cpu.gpr[1],
-            (int)context->uc_mcontext.cpu.gpr[2]);
+            (int)context->uc_mcontext.cpu.gpr[2], LINUX_NR_TGKILL,
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_RT_TGSIGQUEUEINFO:
         result = guest_signal_queue_thread(
             (int32_t)context->uc_mcontext.cpu.gpr[0],
             (int32_t)context->uc_mcontext.cpu.gpr[1],
             (int)context->uc_mcontext.cpu.gpr[2],
-            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[3]);
+            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[3],
+            LINUX_NR_RT_TGSIGQUEUEINFO, (const uint32_t *)context->uc_mcontext.cpu.gpr);
         break;
     case LINUX_NR_PERSONALITY:
         result = (int32_t)guest_process_personality(

@@ -453,10 +453,14 @@ void guest_signal_diagnostics_initialize(void)
     }
 }
 
-int32_t guest_signal_send(pid_t process, int linux_signal)
+int32_t guest_signal_send(pid_t process, int linux_signal, uint32_t number,
+    const uint32_t *args)
 {
     int host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
-    if (linux_signal != 0 && host_signal == 0) return -EINVAL;
+    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT) return -EINVAL;
+    if (linux_signal != 0 && host_signal == 0)
+        return linux_report_unsupported(number, EINVAL, "signal-unmapped",
+            args);
     if (process == 0 || process == -1 || process == getpid() ||
         process == -getpgrp())
         flush_before_self_signal(linux_signal);
@@ -465,12 +469,15 @@ int32_t guest_signal_send(pid_t process, int linux_signal)
 }
 
 int32_t guest_signal_send_thread(int32_t process, int32_t thread,
-    int linux_signal)
+    int linux_signal, uint32_t number, const uint32_t *args)
 {
     int host_signal;
     if (process != 0 && process != (int32_t)getpid()) return -ESRCH;
     host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
-    if (linux_signal != 0 && host_signal == 0) return -EINVAL;
+    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT) return -EINVAL;
+    if (linux_signal != 0 && host_signal == 0)
+        return linux_report_unsupported(number, EINVAL, "signal-unmapped",
+            args);
     flush_before_self_signal(linux_signal);
     return guest_thread_kill(thread, host_signal);
 }
@@ -484,19 +491,22 @@ int32_t guest_signal_send_thread(int32_t process, int32_t thread,
  * Only this process can be targeted, as with tgkill.
  */
 int32_t guest_signal_queue_thread(int32_t process, int32_t thread,
-    int linux_signal, const void *guest_information)
+    int linux_signal, const void *guest_information, uint32_t number,
+    const uint32_t *args)
 {
     int32_t words[6];
     siginfo_t information;
 
     if (process <= 0 || thread <= 0) return -EINVAL;
-    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT ||
-        (linux_signal != 0 && linux_signal_to_host(linux_signal) == 0))
-        return -EINVAL;
+    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT) return -EINVAL;
+    if (linux_signal != 0 && linux_signal_to_host(linux_signal) == 0)
+        return linux_report_unsupported(number, EINVAL, "signal-unmapped",
+            args);
     if (process != (int32_t)getpid()) return -ESRCH;
     if (linux_signal == 0 || thread != guest_thread_tid() ||
         guest_actions[linux_signal].handler <= 1u)
-        return guest_signal_send_thread(process, thread, linux_signal);
+        return guest_signal_send_thread(process, thread, linux_signal, number,
+            args);
     memcpy(words, guest_information, sizeof(words));
     memset(&information, 0, sizeof(information));
     information.si_signo = GUEST_NATIVE_SIGINFO;
@@ -516,15 +526,16 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
     struct linux_sigaction action;
     int host_signal;
     if (signal_set_size != 8 || linux_signal <= 0 ||
-        linux_signal > LINUX_SIGNAL_COUNT ||
-        (host_signal = linux_signal_to_host(linux_signal)) == 0) return -EINVAL;
+        linux_signal > LINUX_SIGNAL_COUNT) return -EINVAL;
+    host_signal = linux_signal_to_host(linux_signal);
     if (guest_old_action != 0)
         memcpy(guest_old_action, &guest_actions[linux_signal], sizeof(action));
     if (guest_action == 0) return 0;
     memcpy(&action, guest_action, sizeof(action));
     if (linux_signal == 9 || linux_signal == 19) return -EINVAL;
     guest_actions[linux_signal] = action;
-    if (linux_signal == 4 || linux_signal == 11) return 0;
+    /* Signals QNX lacks (16, 48-64): the action is stored only. */
+    if (host_signal == 0 || linux_signal == 4 || linux_signal == 11) return 0;
     memset(&host_action, 0, sizeof(host_action));
     if (action.handler == 1) host_action.sa_handler = SIG_IGN;
     else if (action.handler == 0)

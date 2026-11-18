@@ -23,3 +23,9 @@ while test "$iteration" -le 20; do
     test "$status" -eq 0 || exit "$status"
     iteration=$((iteration + 1))
 done
+
+echo "=== signal guest: unmapped-signal-actions ==="
+"$timeout_command" -s 9 10 "$linuxemu" "$project_dir/build/guest-tests/signal-unmapped"
+status=$?
+echo "signal-unmapped exit=$status expected=0"
+test "$status" -eq 0 || exit "$status"

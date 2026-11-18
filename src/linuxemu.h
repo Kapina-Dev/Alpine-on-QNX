@@ -114,11 +114,15 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
 int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
     size_t signal_set_size);
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
-int32_t guest_signal_send(pid_t process, int linux_signal);
+int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
+    const char *detail, const uint32_t *args);
+int32_t guest_signal_send(pid_t process, int linux_signal, uint32_t number,
+    const uint32_t *args);
 int32_t guest_signal_queue_thread(int32_t process, int32_t thread,
-    int linux_signal, const void *guest_information);
+    int linux_signal, const void *guest_information, uint32_t number,
+    const uint32_t *args);
 int32_t guest_signal_send_thread(int32_t process, int32_t thread,
-    int linux_signal);
+    int linux_signal, uint32_t number, const uint32_t *args);
 int guest_signal_host_mask(const void *guest_set, size_t signal_set_size,
     sigset_t *host_set);
 int guest_signal_deliver(ucontext_t *context, int linux_signal,
