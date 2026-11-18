@@ -275,6 +275,18 @@ Each item below is covered by a device test suite.
   incrementally fetches repositories. Verified HTTPS clone/fetch and invalid
   certificate, unavailable authentication, and unreachable-server failures
   are covered against pinned public refs.
+- Phase 2 calls, each with a direct ARM guest test: `rt_sigaction` for every
+  signal 1 to 64, `cacheflush`, `preadv`/`pwritev`/`preadv2`/`pwritev2`,
+  `sendfile64`, `fallocate`, `fcntl64` owner, pipe-size, OFD-lock and seal
+  commands, `statx`, `statfs64`/`fstatfs64`, `fchmod`, `faccessat2`, the
+  `chown` family, `mknod`/`mknodat`, `sendmmsg`/`recvmmsg`, `getrlimit`
+  family, `getrusage`, `sysinfo`, `setitimer`/`getitimer`,
+  `setpriority`/`getpriority`, `sched_*affinity`, `sched_setscheduler`,
+  `capget`/`capset`, `prctl` dumpable/no-new-privs/pdeathsig, `membarrier`
+  and `mremap`. File offsets above 4 GiB reach QNX intact on the 32-bit
+  `off_t` core.
+- `pipe2`, `dup3` and `accept4` flag handling, replaced typed descriptors and
+  hidden-range destinations, including concurrent `dup3` and `close`.
 
 TPIDRURW must not hold persistent guest TLS. This QNX build does not context-switch it per pthread; values bleed between threads and CPUs. Guest TLS reads must be trapped and emulated.
 
@@ -302,3 +314,22 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - Patching is limited to validated `SHF_EXECINSTR` sections. Thumb instructions are decoded only in statically loaded binaries that carry a symbol table.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
 - Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.
+- Phase 2 limits:
+  - Vector I/O and `sendfile64` are not atomic across iovecs. A transfer
+    larger than `INT32_MAX` bytes returns `EINVAL` where Linux clamps it.
+  - OFD locks are per-process. `fcntl` record-lock offsets are 32-bit.
+  - Unmapped signals (16, 48 to 64) can be stored and queried, but not sent.
+  - `membarrier` supports no commands.
+  - `mremap` works only on plain anonymous memory that was never executable
+    and never patched.
+  - The JIT patch hazard (blind `svc`/TPIDRURO rewriting of data words when
+    memory becomes executable, and a patch table that fills after about
+    4,000 flips) is measured by `jit-patch-hazard` and open until Phase 4.
+  - `statx` timestamps are whole seconds, `stx_btime` is not filled, and
+    device numbers are synthetic.
+  - `ITIMER_VIRTUAL` and `ITIMER_PROF` are unsupported. `ITIMER_REAL` is
+    lost across `execve` and reported as `itimer-exec`.
+  - Priority is emulated and has no effect (`priority-no-effect`).
+    `PR_SET_PDEATHSIG` is stored but not delivered. Affinity uses the QNX
+    run mask of the calling thread only.
+  - Files above about 2 GiB are untested: qnx6 and exFAT cap a file there.

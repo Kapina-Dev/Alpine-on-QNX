@@ -570,3 +570,39 @@ needs code/data knowledge Linuxemu doesn't have for JIT memory. It belongs
 with Phase 4's "Thumb and stripped-binary support" patcher work. Until then,
 measure Node with `--jitless` if it reaches its JIT and fails because of
 this.
+
+## 2026-11-18 — Phase 2: QNX facts found while adding syscalls
+
+Found on the Passport as the ordinary user. Each has a guest test or a note
+in the code.
+
+- **`dup2` is not atomic against a concurrent `close`.** Racing `dup3` and
+  `close` threads produced `EBADF` and `EINVAL`. Linuxemu now takes a
+  process-wide lock around `dup2`, `dup3` and `close`, and resets it in the
+  fork child.
+- **`off_t` is 32 bits.** The core was truncating 64-bit offsets in vector
+  I/O, `pread64`, `pwrite64`, `ftruncate64`, `_llseek`, `stat64` sizes and
+  `mmap2`. These now use the `*64` calls. `fcntl` record locks still use
+  `off_t`.
+- **File size cap.** Both qnx6 and the exFAT SD card stop a file near 2 GiB,
+  so nothing above that could be tested.
+- **Pipes hold 5120 bytes** (`F_GETPIPE_SZ` reports it).
+- **`F_SETOWN` and `F_GETOWN` return `ENOSYS`.** Linuxemu answers `EINVAL`.
+- **`sysconf(_SC_PHYS_PAGES)` is -1.** `sysinfo` reads total RAM from the
+  system page and free RAM from typed memory.
+- **`getpriority` and `setpriority` are stubs** that always return 0. Nice
+  values are emulated in Linuxemu and carried across `exec`.
+- **No parent-death notification.** `PR_SET_PDEATHSIG` is stored and
+  reported, never delivered.
+- **Run masks.** `_NTO_TCTL_RUNMASK_GET_AND_SET` does not write back the old
+  mask; the `_INHERIT` form is needed for `sched_getaffinity`.
+- **Anonymous mappings that are read-execute fail with `ENOMEM`**, so
+  `mremap` and JIT paths avoid that combination.
+- **`ITIMER_VIRTUAL` is `EINVAL`**, and an armed `ITIMER_REAL` doesn't
+  survive `exec`.
+- **`stat` timestamps are whole seconds**, so `statx` has no nanoseconds.
+- **`run-python-smoke` faults.** The phase-gate run hit a python3 SIGSEGV at
+  pc `0x60067dc4` in 4 of 4 runs on the new core, and on the pre-phase core
+  too. It's a pre-existing fault, recorded in `docs/corpus-results.md` and
+  not fixed here.
+

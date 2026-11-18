@@ -39,11 +39,60 @@ descriptor records survive `fork` and `execve`, and directory listings stay
 complete when entries are deleted mid-walk (`rm -r`, `find -delete`). Set
 `LINUXEMU_DIAGNOSTICS=<file>` to log the unsupported calls a guest makes.
 
+Phase 2 adds these Linux calls, each with a direct ARM guest test:
+
+- `rt_sigaction` queries and stores for every signal 1 to 64, and ARM
+  `cacheflush`.
+- `preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendfile64`, `fallocate`, and
+  the `fcntl64` owner, pipe-size and open-file-description lock commands.
+  Positional and vector I/O keep 64-bit offsets.
+- `statx`, `statfs64`, `fchmod`, `faccessat2`, `chown32` and its relatives,
+  `mknod` and `mknodat`.
+- `sendmmsg` and `recvmmsg`, direct and through `socketcall`.
+- `getrlimit`, `ugetrlimit`, `setrlimit`, `getrusage`, `sysinfo`,
+  `setitimer`, `getitimer`, `setpriority`, `getpriority`,
+  `sched_getaffinity`, `sched_setaffinity`, `sched_setscheduler`, `capget`,
+  `capset`, the `prctl` dumpable, no-new-privs and parent-death-signal
+  options, `membarrier`, and `mremap`.
+- `pipe2`, `dup3` and `accept4` now have direct tests for flags and
+  replaced descriptors. `dup2` and `dup3` are serialized against `close`
+  inside one process.
+
 The pinned application corpus scores 7 of 11 apps compatible: BusyBox, apk,
 Python, Git, SQLite, Vim, and GCC with make. nginx and Redis need `epoll`,
-inotify-tools needs `inotify`, and Node.js stops at start-up.
+inotify-tools needs `inotify`, and Node.js stops at start-up on `epoll_create1`. After Phase 2 none of the corpus apps hit ENOSYS for the calls it added.
 
 ## Deliberate limits
+
+Limits of the Phase 2 calls:
+
+- `preadv`, `pwritev` and their `*2` forms, and `sendfile64`, are loops over
+  `pread`/`pwrite` and `read`/`write`. They are not atomic across iovecs.
+  `RWF_HIPRI`, `RWF_NOWAIT` and `RWF_APPEND` are refused.
+- Open-file-description locks (`F_OFD_*`) are per-process, not per open file.
+  `fcntl` record-lock offsets are still 32-bit.
+- Signals 16 and 48 to 64 have no QNX number. Their actions can be queried
+  and stored, but sending one (`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`)
+  returns `EINVAL`.
+- `membarrier` supports no commands: `QUERY` returns 0 and every other
+  command returns `EINVAL`, so libc falls back to its signal-based method.
+- `mremap` handles plain anonymous guest memory that was never executable.
+  File mappings, executable memory, `MREMAP_FIXED` and
+  `MREMAP_DONTUNMAP` return `EINVAL`. Memory that was ever patched is
+  refused too.
+- Memory that a JIT flips to executable is scanned blindly for `svc #0` and
+  TPIDRURO words. Data words that match are rewritten, and about 4,000 flips
+  fill the patch table. The fix belongs with Phase 4.
+- `statx` returns whole-second timestamps and no birth time. Device numbers
+  are a synthetic major/minor split of the QNX device number.
+- `ITIMER_VIRTUAL` and `ITIMER_PROF` are unsupported. An armed `ITIMER_REAL`
+  is lost across `execve`.
+- `setpriority` is emulated inside Linuxemu and has no scheduling effect, as
+  QNX's own `getpriority`/`setpriority` are stubs. The parent-death signal
+  is stored but never delivered, because QNX has no parent-death
+  notification. `sysinfo` reports no load average.
+- Files larger than about 2 GiB could not be tested: the device file systems
+  (qnx6 and exFAT) cap a file near 2 GiB.
 
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
   only in statically loaded binaries that carry a symbol table, not in

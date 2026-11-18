@@ -94,10 +94,61 @@ stage used to pass only because of this. It now installs Python's SIGINT handler
 which makes the stage hold under Linux semantics too. The divergence itself
 is still open (signal ABI work, Phase 2/6).
 
-## Phase 2
+## Phase 2: 2026-11-18
 
-Progress note after Task 2 (ARM `cacheflush` and the `rt_sigaction` fix).
-The full Phase 2 baseline comes at the end of the phase.
+- **Device:** Passport, QNX 8.0.0, as the ordinary user.
+- **Linuxemu:** branch `phase2-syscalls` at `4132ccd`, core sha256
+  `9ec53575afe18e656ef04244d46d5cf79437a5c7599e33000e95f39c06b2609b`.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+- **Leftovers:** no Linuxemu process was left running.
+
+```text
+apk install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+busybox install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+gcc-make install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+git install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+inotify-tools install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=2
+nginx install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=2
+node install=pass startup=fail basic=skip concurrent=skip shutdown=skip compatible=no unsupported=1
+python install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=3
+redis install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=2
+sqlite install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+vim install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+corpus apps=11 compatible=7
+```
+
+The score is the same as the baseline (7 of 11) and every stage result is
+unchanged. The unsupported-call counts dropped for every app: the baseline
+totals 2 to 7 per app, and now they are 0 to 3.
+
+### Unsupported calls per app
+
+None of the calls Phase 2 implemented returns ENOSYS any more. `statx`,
+`getrusage`, `sysinfo`, `sched_getaffinity`, `capget`, `faccessat2`, `mknod`,
+`chown32`, `fchmod`, `statfs64`, `setitimer` and `mremap` no longer appear.
+What remains is either Phase 3 work or a deliberate refusal.
+
+| App | Calls (occurrences) |
+|---|---|
+| apk | none |
+| BusyBox | `sendfile64` 3 (EINVAL, `sendfile-input`) |
+| GCC/make | none |
+| Git | none |
+| inotify-tools | `inotify_init` 1, `inotify_init1` 1 (ENOSYS) |
+| nginx | `epoll_create` 1, `epoll_create1` 1 (ENOSYS) |
+| Node.js | `epoll_create1` 1 (ENOSYS) |
+| Python | `epoll_create1` 3 (ENOSYS), `pwritev2` 14 (EOPNOTSUPP, `rwf-flags`), `membarrier` 2 (EINVAL, `membarrier-cmd`) |
+| Redis | `epoll_create` 1, `epoll_create1` 1 (ENOSYS) |
+| SQLite | `pwritev2` 102 (EOPNOTSUPP, `rwf-flags`) |
+| Vim | none |
+
+- `pwritev2` is implemented. SQLite and Python pass `RWF_APPEND` (flags
+  `0x20`), which Linuxemu refuses with `EOPNOTSUPP`, and they fall back to
+  `pwrite`.
+- `membarrier` is reported on purpose: Linuxemu supports no commands, so
+  musl uses its signal-based fallback.
+- BusyBox `tar` makes a `sendfile64` call whose input descriptor Linuxemu
+  refuses. `tar` falls back to read and write.
 
 ### Node.js
 
@@ -107,12 +158,23 @@ The full Phase 2 baseline comes at the end of the phase.
 | startup | fail |
 | basic, concurrent, shutdown | skipped after startup failed |
 
-The `ResetSignalHandlers` abort is gone. Node now starts, then dies on an
-assertion in `node::tracing::LegacyTracingAgent::LegacyTracingAgent()`
-(`../../src/tracing/agent_legacy.cc:88`). The diagnostics report shows the
-last unsupported call before that abort is `epoll_create1` (357, flags
-`0x80000` = `EPOLL_CLOEXEC`, ENOSYS, once). Node's libuv loop can't be
-created without it, which fits the assertion. The same run also reports
-`statx` (27 calls) and `capget` (11 calls) as ENOSYS. `cacheflush` doesn't
-appear in the report, so V8's JIT was not reached. No fix was attempted;
-`epoll` is Phase 3 work.
+The `ResetSignalHandlers` abort is gone. The fix came from the
+`rt_sigaction` change (Task 1): signals with no QNX number can now be
+queried and stored. Node starts, then dies on an assertion in
+`node::tracing::LegacyTracingAgent::LegacyTracingAgent()`
+(`../../src/tracing/agent_legacy.cc:88`). The only unsupported call in its
+report is `epoll_create1` with `EPOLL_CLOEXEC` (ENOSYS, once), and libuv
+can't create its loop without it. Node's next blocker is therefore `epoll`,
+which is Phase 3 work. `statx` and `capget` no longer appear, and
+`cacheflush` is not reached, so V8's JIT hasn't run yet.
+
+### Phase gate notes
+
+- The full regression passes every suite up to `run-python-smoke`. That
+  suite fails on this core and on the pre-phase core
+  (`build/linuxemu-pre-phase2`, sha256 `5089cc4c...`) with the same fault: a
+  python3 SIGSEGV at pc `0x60067dc4`, address 0 (exit 125). It failed in 4 of 4
+  runs on 2026-11-18 on the new core, and once on the pre-phase core. It
+  passed earlier in the phase (Task 6). It is a pre-existing fault in the
+  smoke test's own Python workload, not a pass, and it is not caused by
+  Phase 2. The corpus Python app passes all five stages.
