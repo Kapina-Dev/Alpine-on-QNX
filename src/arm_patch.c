@@ -19,6 +19,7 @@ int arm_patch_range(uintptr_t start, size_t length)
 {
     uintptr_t address;
     uintptr_t end;
+    int may_repeat;
 
     if ((start & 3u) != 0 || (length & 3u) != 0 ||
         length > UINTPTR_MAX - start) {
@@ -26,23 +27,39 @@ int arm_patch_range(uintptr_t start, size_t length)
         return -1;
     }
     end = start + length;
+    /* A runtime page flipped back to executable may hold a site recorded on
+       an earlier flip (a JIT rewrote the svc in place).  That entry is
+       overwritten, not appended: an appended duplicate would fill the table
+       and arm_patch_lookup would keep returning the stale first one. */
+    may_repeat = arm_patch_any_in_range(start, length);
     for (address = start; address < end; address += 4) {
         uint32_t *instruction = (uint32_t *)address;
         uint32_t word = *instruction;
+        struct arm_patch_site *site = 0;
 
         if (word != ARM_LINUX_SVC_0 &&
             (word & ARM_TPIDRURO_MASK) != ARM_TPIDRURO_READ) {
             continue;
         }
-        if (patch_count == ARRAY_COUNT(patches)) {
-            errno = E2BIG;
-            return -1;
+        if (may_repeat) {
+            size_t i;
+            for (i = 0; i < patch_count; ++i)
+                if (patches[i].address == address) {
+                    site = &patches[i];
+                    break;
+                }
         }
-        patches[patch_count].address = address;
-        patches[patch_count].original = word;
-        patches[patch_count].width = 4;
-        patches[patch_count].thumb = 0;
-        patch_count++;
+        if (site == 0) {
+            if (patch_count == ARRAY_COUNT(patches)) {
+                errno = E2BIG;
+                return -1;
+            }
+            site = &patches[patch_count++];
+        }
+        site->address = address;
+        site->original = word;
+        site->width = 4;
+        site->thumb = 0;
         *instruction = ARM_UDF_TRAP;
     }
     return 0;
