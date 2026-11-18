@@ -37,7 +37,6 @@ run_guest runtime-exec-syscalls 0
 run_guest entropy-syscalls 0
 run_guest cacheflush-syscalls 0
 run_guest thread-futex-syscalls 0
-run_guest resource-syscalls 0
 
 echo "=== guest: file-syscalls ==="
 LINUXEMU_ROOT="$alpine_root" "$timeout_command" 10 \
@@ -57,6 +56,22 @@ if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 diag_dir="$project_dir/build/diag"
 rm -rf "$diag_dir"
 mkdir -p "$diag_dir"
+
+# resource-syscalls must also leave itimer-virtual and rlimit-resource lines
+# in the diagnostics report.
+echo "=== guest: resource-syscalls ==="
+resource_report="$diag_dir/resource.txt"
+LINUXEMU_DIAGNOSTICS="$resource_report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/resource-syscalls"
+status=$?
+echo "resource-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+for detail in itimer-virtual rlimit-resource; do
+    if ! grep -q "detail=$detail" "$resource_report" 2>/dev/null; then
+        echo "resource-syscalls: diagnostics report lacks detail=$detail" >&2
+        failures=$((failures + 1))
+    fi
+done
 
 diag_fail()
 {

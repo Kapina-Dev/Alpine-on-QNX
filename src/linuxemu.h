@@ -166,6 +166,7 @@ extern void linuxemu_rt_signal_return_trampoline(void);
 int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_resource_syscall(uint32_t number, uint32_t args[6]);
+void linux_resource_note_exec(const uint32_t args[6]);
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
 int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_futex(uint32_t *address, uint32_t operation, uint32_t value,

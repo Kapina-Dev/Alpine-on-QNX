@@ -51,6 +51,14 @@ static int linux_resource_number(uint32_t resource)
     }
 }
 
+/* Linux resources 8 (MEMLOCK), 10 (LOCKS), 11 (SIGPENDING), 12 (MSGQUEUE),
+   13 (NICE), 14 (RTPRIO) and 15 (RTTIME) are valid there but have no QNX
+   counterpart; 16 and above are plain EINVAL. */
+static int rlimit_unmapped(uint32_t resource)
+{
+    return resource == 8 || (resource >= 10 && resource <= 15);
+}
+
 static uint64_t linux_rlimit_value(rlim_t value)
 {
     return value == RLIM_INFINITY ? UINT64_MAX : (uint64_t)value;
@@ -95,7 +103,7 @@ static int32_t linux_prlimit64(int32_t process, uint32_t resource,
            the host's own setrlimit does. */
         if (guest_new_limit->current > guest_new_limit->maximum)
             return -LINUX_EINVAL;
-        if (guest_new_limit->maximum >
+        if (geteuid() != 0 && guest_new_limit->maximum >
                 linux_rlimit_value(host_limit.rlim_max))
             return -LINUX_EPERM;
         host_new_limit.rlim_cur = host_rlimit_value(guest_new_limit->current);
@@ -145,8 +153,9 @@ static int32_t linux_getrusage(int32_t who, void *guest)
         if (getrusage(who == 0 ? RUSAGE_SELF : RUSAGE_CHILDREN, &usage) != 0)
             return -(int32_t)linux_errno_number(errno);
     } else if (who == 1) {
-        /* RUSAGE_THREAD: only the thread CPU clock exists, so all of it is
-           reported as user time and every other field is 0. */
+        /* RUSAGE_THREAD: QNX cannot split user from system time for a
+           thread (only the thread CPU clock exists), so all thread CPU time
+           is reported as user time and every other field is 0. */
         struct timespec now;
         memset(&usage, 0, sizeof(usage));
         if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0)
@@ -240,17 +249,45 @@ static void itimer_store(uint32_t *guest, const struct itimerval *value)
     guest[3] = (uint32_t)value->it_value.tv_usec;
 }
 
-static int32_t linux_getitimer(uint32_t which, uint32_t *guest)
+/* QNX refuses ITIMER_VIRTUAL and ITIMER_PROF: report them for
+   LINUXEMU_DIAGNOSTICS and return EINVAL. */
+static int32_t itimer_host_failure(uint32_t number, uint32_t which,
+    const uint32_t *args)
+{
+    if (which == 1)
+        return linux_report_unsupported(number, LINUX_EINVAL,
+            "itimer-virtual", args);
+    if (which == 2)
+        return linux_report_unsupported(number, LINUX_EINVAL,
+            "itimer-prof", args);
+    return -(int32_t)linux_errno_number(errno);
+}
+
+/* Linux keeps an armed ITIMER_REAL across execve; QNX drops it.  When the
+   guest execs with a timer armed, record it as unsupported (detail
+   itimer-exec, not an error: errno 0) and let the exec proceed.  Carrying
+   the timer over is Phase 6 work. */
+void linux_resource_note_exec(const uint32_t args[6])
+{
+    struct itimerval value;
+    if (getitimer(ITIMER_REAL, &value) != 0) return;
+    if (value.it_value.tv_sec == 0 && value.it_value.tv_usec == 0) return;
+    linux_report_unsupported(11, 0, "itimer-exec", args);
+}
+
+static int32_t linux_getitimer(uint32_t number, uint32_t which,
+    uint32_t *guest, const uint32_t *args)
 {
     struct itimerval value;
     int host = itimer_which(which);
     if (guest == 0) return -EFAULT;
     if (host < 0) return -LINUX_EINVAL;
     if (getitimer(host, &value) != 0) {
+        if (host != ITIMER_REAL) return itimer_host_failure(number, which, args);
         /* QNX fails getitimer(ITIMER_REAL) with EINVAL while no timer has
            been created in the process (a fresh process, a fork child, or
            after exec); Linux reports a disarmed timer. */
-        if (host != ITIMER_REAL || errno != EINVAL)
+        if (errno != EINVAL)
             return -(int32_t)linux_errno_number(errno);
         memset(&value, 0, sizeof(value));
     }
@@ -258,8 +295,10 @@ static int32_t linux_getitimer(uint32_t which, uint32_t *guest)
     return 0;
 }
 
-static int32_t linux_setitimer(uint32_t which, const uint32_t *guest_new,
-    uint32_t *guest_old)
+/* Limit: an armed ITIMER_REAL does not survive execve on QNX, unlike Linux
+   (see linux_resource_note_exec). */
+static int32_t linux_setitimer(uint32_t number, uint32_t which,
+    const uint32_t *guest_new, uint32_t *guest_old, const uint32_t *args)
 {
     struct itimerval value, old;
     int host = itimer_which(which);
@@ -275,7 +314,7 @@ static int32_t linux_setitimer(uint32_t which, const uint32_t *guest_new,
         value.it_value.tv_usec = (int32_t)guest_new[3];
     }
     if (setitimer(host, &value, &old) != 0)
-        return -(int32_t)linux_errno_number(errno);
+        return itimer_host_failure(number, which, args);
     if (guest_old != 0) itimer_store(guest_old, &old);
     return 0;
 }
@@ -284,10 +323,19 @@ int32_t linux_resource_syscall(uint32_t number, uint32_t args[6])
 {
     switch (number) {
     case LINUX_NR_SETRLIMIT:
+        if (rlimit_unmapped(args[0]))
+            return linux_report_unsupported(number, LINUX_EINVAL,
+                "rlimit-resource", args);
         return linux_setrlimit(args[0], (const uint32_t *)args[1]);
     case LINUX_NR_UGETRLIMIT:
+        if (rlimit_unmapped(args[0]))
+            return linux_report_unsupported(number, LINUX_EINVAL,
+                "rlimit-resource", args);
         return linux_ugetrlimit(args[0], (uint32_t *)args[1]);
     case LINUX_NR_PRLIMIT64:
+        if (rlimit_unmapped(args[1]))
+            return linux_report_unsupported(number, LINUX_EINVAL,
+                "rlimit-resource", args);
         return linux_prlimit64((int32_t)args[0], args[1],
             (const struct linux_rlimit64 *)args[2],
             (struct linux_rlimit64 *)args[3]);
@@ -296,10 +344,10 @@ int32_t linux_resource_syscall(uint32_t number, uint32_t args[6])
     case LINUX_NR_SYSINFO:
         return linux_sysinfo((void *)args[0]);
     case LINUX_NR_SETITIMER:
-        return linux_setitimer(args[0], (const uint32_t *)args[1],
-            (uint32_t *)args[2]);
+        return linux_setitimer(number, args[0], (const uint32_t *)args[1],
+            (uint32_t *)args[2], args);
     case LINUX_NR_GETITIMER:
-        return linux_getitimer(args[0], (uint32_t *)args[1]);
+        return linux_getitimer(number, args[0], (uint32_t *)args[1], args);
     default:
         return linux_report_unsupported(number, LINUX_ENOSYS,
             "resource-syscall", args);

@@ -78,7 +78,21 @@ _start:
     str r2, [r1, #4]
     mov r0, #3
     sys 75
+    cmn r0, #1
+    beq stack_skip
     want 0, f12
+    mov r0, #3
+    ldr r1, =r32
+    sys 191
+    want 0, f12
+    ldr r1, =r32
+    ldr r2, [r1]
+    ldr r3, =0x800000
+    cmp r2, r3
+    bne f12
+    ldr r2, [r1, #4]
+    cmp r2, r3
+    bne f12
     ldr r1, =set32
     ldr r2, =0x800001
     str r2, [r1]
@@ -93,6 +107,21 @@ _start:
     mov r0, #3
     sys 75
     wanterr 1, f12
+    b stack_done
+stack_skip:
+    /* host hard limit below 8 MiB: setup skip, not a failure */
+    mov r0, #1
+    ldr r1, =msg_skip
+    mov r2, #msg_skip_len
+    sys 4
+stack_done:
+
+    /* 21: a Linux resource with no QNX counterpart (RLIMIT_MEMLOCK) is
+       -EINVAL and is reported as rlimit-resource */
+    mov r0, #8
+    ldr r1, =r32
+    sys 191
+    wanterr 22, f21
 
     /* 13: an infinite host value reads as 0xffffffff (RLIMIT_CPU) */
     mov r0, #0
@@ -282,7 +311,8 @@ f16: mov r0, #16; b exit_guest
 f17: mov r0, #17; b exit_guest
 f18: mov r0, #18; b exit_guest
 f19: mov r0, #19; b exit_guest
-f20: mov r0, #20
+f20: mov r0, #20; b exit_guest
+f21: mov r0, #21
 exit_guest:
     mov r7, #1
     svc #0
@@ -293,6 +323,8 @@ exit_guest:
     .section .rodata
 msg_ok: .ascii "itimer-virtual: supported\n"
     .equ msg_ok_len, . - msg_ok
+msg_skip: .ascii "stack-rlimit: skipped (host hard limit below 8 MiB)\n"
+    .equ msg_skip_len, . - msg_skip
 msg_einval: .ascii "itimer-virtual: EINVAL\n"
     .equ msg_einval_len, . - msg_einval
 

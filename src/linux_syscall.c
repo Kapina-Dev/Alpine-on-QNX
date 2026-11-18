@@ -1077,9 +1077,15 @@ static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
     char *const guest_envp[])
 {
     char host_path[PATH_MAX];
+    uint32_t report_args[6] = { (uint32_t)(uintptr_t)guest_path,
+        (uint32_t)(uintptr_t)guest_argv, (uint32_t)(uintptr_t)guest_envp,
+        0, 0, 0 };
 
     if (guest_path_resolve(guest_path, 0, host_path, sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
+    /* Known limit: QNX drops an armed ITIMER_REAL at exec, Linux keeps it.
+       Record it for LINUXEMU_DIAGNOSTICS; the exec itself proceeds. */
+    linux_resource_note_exec(report_args);
     guest_process_exec(host_path, guest_path, guest_argv, guest_envp);
     return -(int32_t)linux_errno_number(errno);
 }
