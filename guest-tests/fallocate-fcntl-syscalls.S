@@ -6,7 +6,7 @@
 
 /*
  * fallocate and the fcntl64 additions.  Each failing check exits with its
- * own number (10..18); 9 is a setup failure.  The file is
+ * own number (10..19); 9 is a setup failure.  The file is
  * /tmp/linuxemu-falloc.
  */
     .macro sys nr
@@ -283,6 +283,124 @@ cexit:
     beq f18
     cmn r0, #9
     beq f18
+
+    /* 19: F_SETLK64 write lock at 4 GiB + 10, length 1, keeps its high
+       word: a fork child (another process, so the lock conflicts) sees
+       no lock at byte 10 and sees this one, start intact, at 4 GiB + 10.
+       A 32-bit host lock would land on byte 10. */
+    ldr r0, =lock
+    mov r1, #1
+    strh r1, [r0]
+    mov r1, #0
+    strh r1, [r0, #2]
+    mov r1, #10
+    str r1, [r0, #8]
+    mov r1, #1
+    str r1, [r0, #12]
+    str r1, [r0, #16]
+    mov r1, #0
+    str r1, [r0, #20]
+    str r1, [r0, #24]
+    mov r0, r8
+    mov r1, #13
+    ldr r2, =lock
+    sys 221
+    want 0, f19
+    sys 2
+    cmp r0, #0
+    blt f19
+    beq child19
+    ldr r1, =status
+    mov r2, #0
+    mov r3, #0
+    sys 114
+    ldr r0, =status
+    ldr r0, [r0]
+    cmp r0, #0
+    bne f19
+    b 4f
+child19:
+    ldr r0, =path
+    ldr r1, =2
+    mov r2, #0
+    sys 5
+    cmp r0, #0
+    blt c19fail1
+    mov r6, r0
+    /* F_GETLK64 for a write lock at byte 10: none (F_UNLCK) */
+    ldr r5, =lock
+    mov r1, #1
+    strh r1, [r5]
+    mov r1, #0
+    strh r1, [r5, #2]
+    mov r1, #10
+    str r1, [r5, #8]
+    mov r1, #0
+    str r1, [r5, #12]
+    mov r1, #1
+    str r1, [r5, #16]
+    mov r1, #0
+    str r1, [r5, #20]
+    str r1, [r5, #24]
+    mov r0, r6
+    mov r1, #12
+    mov r2, r5
+    sys 221
+    cmp r0, #0
+    bne c19fail2
+    ldrh r0, [r5]
+    cmp r0, #2
+    bne c19fail3
+    /* F_GETLK64 at 4 GiB + 10: the parent's write lock, start and length
+       back in 64 bits */
+    mov r1, #1
+    strh r1, [r5]
+    mov r1, #0
+    strh r1, [r5, #2]
+    mov r1, #10
+    str r1, [r5, #8]
+    mov r1, #1
+    str r1, [r5, #12]
+    str r1, [r5, #16]
+    mov r1, #0
+    str r1, [r5, #20]
+    mov r0, r6
+    mov r1, #12
+    mov r2, r5
+    sys 221
+    cmp r0, #0
+    bne c19fail4
+    ldrh r0, [r5]
+    cmp r0, #1
+    bne c19fail5
+    ldr r0, [r5, #8]
+    cmp r0, #10
+    bne c19fail6
+    ldr r0, [r5, #12]
+    cmp r0, #1
+    bne c19fail6
+    ldr r0, [r5, #16]
+    cmp r0, #1
+    bne c19fail6
+    ldr r0, [r5, #20]
+    cmp r0, #0
+    bne c19fail6
+    mov r0, #0
+    b c19exit
+c19fail1: mov r0, #1
+    b c19exit
+c19fail2: mov r0, #2
+    b c19exit
+c19fail3: mov r0, #3
+    b c19exit
+c19fail4: mov r0, #4
+    b c19exit
+c19fail5: mov r0, #5
+    b c19exit
+c19fail6: mov r0, #6
+c19exit:
+    sys 1
+4:
     ldr r0, =path
     sys 10
     mov r0, #0
@@ -297,7 +415,8 @@ f14: mov r0, #14; b exit_guest
 f15: mov r0, #15; b exit_guest
 f16: mov r0, #16; b exit_guest
 f17: mov r0, #17; b exit_guest
-f18: mov r0, #18
+f18: mov r0, #18; b exit_guest
+f19: mov r0, #19
 exit_guest:
     mov r7, #1
     svc #0

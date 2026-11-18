@@ -40,7 +40,7 @@ struct guest_fd_ops {
 };
 
 /* Created with one reference owned by the caller; identity is taken from
-   fstat(backing_fd).  Returns 0 on failure (errno set). */
+   fstat64(backing_fd).  Returns 0 on failure (errno set). */
 struct guest_fd_object *guest_fd_object_new(enum guest_fd_type type,
     const struct guest_fd_ops *ops, int backing_fd, size_t extra_size);
 void *guest_fd_object_data(struct guest_fd_object *object);

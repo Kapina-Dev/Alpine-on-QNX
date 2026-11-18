@@ -627,7 +627,8 @@ int32_t linux_mknod_at(int directory_fd, const char *guest_path,
     if (type == LINUX_S_IFIFO)
         return linux_host_result(mkfifo(host_path, permissions));
     {
-        int fd = open(host_path, O_WRONLY | O_CREAT | O_EXCL, permissions);
+        int fd = open(host_path, O_WRONLY | O_CREAT | O_EXCL | O_LARGEFILE,
+            permissions);
         if (fd < 0) return -(int32_t)linux_errno_number(errno);
         close(fd);
         return 0;
@@ -638,7 +639,7 @@ static int32_t linux_utimensat(int directory_fd, const char *guest_path,
     const uint32_t *guest_times, uint32_t flags)
 {
     char host_path[PATH_MAX];
-    struct stat status;
+    struct stat64 status;
     struct utimbuf times;
     time_t now;
     size_t index;
@@ -650,7 +651,7 @@ static int32_t linux_utimensat(int directory_fd, const char *guest_path,
         return -(int32_t)linux_errno_number(errno);
     if (guest_times == 0) return linux_host_result(utime(host_path, 0));
     if ((flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
-        if (lstat(host_path, &status) != 0)
+        if (lstat64(host_path, &status) != 0)
             return -(int32_t)linux_errno_number(errno);
         if (S_ISLNK(status.st_mode)) {
             const uint32_t args[6] = { (uint32_t)directory_fd,
@@ -659,7 +660,7 @@ static int32_t linux_utimensat(int directory_fd, const char *guest_path,
             return linux_unsupported(LINUX_NR_UTIMENSAT, LINUX_EOPNOTSUPP,
                 "utimensat-symlink", args);
         }
-    } else if (stat(host_path, &status) != 0)
+    } else if (stat64(host_path, &status) != 0)
         return -(int32_t)linux_errno_number(errno);
     now = time(0);
     if (now == (time_t)-1) return -(int32_t)linux_errno_number(errno);
@@ -813,7 +814,7 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
         int ofd = command >= 36;
         int base = ofd ? command - 24 : command;
         struct linux_flock64 guest_lock;
-        struct flock host_lock;
+        struct flock64 host_lock;
         if (argument == 0) return -EFAULT;
         memcpy(&guest_lock, (const void *)argument, sizeof(guest_lock));
         memset(&host_lock, 0, sizeof(host_lock));
@@ -825,16 +826,16 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
             return -EINVAL;
         if (ofd && guest_lock.pid != 0) return -EINVAL;
         host_lock.l_whence = guest_lock.whence;
-        host_lock.l_start = (off_t)guest_lock.start;
-        host_lock.l_len = (off_t)guest_lock.length;
-        result = fcntl(fd, base == 12 ? F_GETLK :
-            base == 13 ? F_SETLK : F_SETLKW, &host_lock);
+        host_lock.l_start = (off64_t)guest_lock.start;
+        host_lock.l_len = (off64_t)guest_lock.length;
+        result = fcntl(fd, base == 12 ? F_GETLK64 :
+            base == 13 ? F_SETLK64 : F_SETLKW64, &host_lock);
         if (result == 0 && base == 12) {
             guest_lock.type = host_lock.l_type == F_RDLCK ? 0 :
                 host_lock.l_type == F_WRLCK ? 1 : 2;
             guest_lock.whence = host_lock.l_whence;
-            guest_lock.start = host_lock.l_start;
-            guest_lock.length = host_lock.l_len;
+            guest_lock.start = (int64_t)host_lock.l_start;
+            guest_lock.length = (int64_t)host_lock.l_len;
             guest_lock.pid = ofd ? -1 : host_lock.l_pid;
             memcpy((void *)argument, &guest_lock, sizeof(guest_lock));
         }
@@ -844,7 +845,7 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     case 9: {
         /* F_SETOWN/F_GETOWN: QNX answers ENOSYS (measured on the device),
            so there is nothing to forward; Linux EINVAL, reported. */
-        uint32_t arguments[3];
+        uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
         arguments[0] = (uint32_t)fd;
         arguments[1] = (uint32_t)command;
         arguments[2] = argument;
@@ -855,19 +856,26 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     case 1031: {
         /* F_GETPIPE_SZ / F_SETPIPE_SZ: the QNX pipe buffer is fixed, so
            report it and accept a request that fits in it. */
-        struct stat status;
+        struct stat64 status;
         long size;
-        if (fstat(fd, &status) != 0) return linux_host_result(-1);
+        if (fstat64(fd, &status) != 0) return linux_host_result(-1);
         if (!S_ISFIFO(status.st_mode)) return -EBADF;
         size = fpathconf(fd, _PC_PIPE_BUF);
         if (size <= 0) size = 5120;
-        if (command == 1031 && argument > (uint32_t)size) return -EPERM;
+        if (command == 1031 && argument > (uint32_t)size) {
+            uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
+            arguments[0] = (uint32_t)fd;
+            arguments[1] = (uint32_t)command;
+            arguments[2] = argument;
+            return linux_report_unsupported(221, EPERM, "pipe-size",
+                arguments);
+        }
         return (int32_t)size;
     }
     case 1033:
     case 1034: {
         /* F_ADD_SEALS / F_GET_SEALS: no memfd, so no sealable file. */
-        uint32_t arguments[3];
+        uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
         arguments[0] = (uint32_t)fd;
         arguments[1] = (uint32_t)command;
         arguments[2] = argument;
@@ -1581,6 +1589,13 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_PWRITE64: {
         uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
             ((uint64_t)context->uc_mcontext.cpu.gpr[5] << 32);
+        /* QNX extends (zero-fills) a file to the offset of a zero-length
+           pwrite; Linux leaves it alone.  Offset 0 keeps QNX's descriptor
+           checks without moving the size. */
+        if (context->uc_mcontext.cpu.gpr[2] == 0) {
+            if ((int64_t)offset < 0) { result = -EINVAL; break; }
+            offset = 0;
+        }
         result = linux_result(pwrite64((int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2], (off64_t)offset));

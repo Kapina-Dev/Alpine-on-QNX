@@ -81,7 +81,7 @@ restart:
             size_t component_length = end == 0 ? strlen(cursor) :
                 (size_t)(end - cursor);
             int last = end == 0;
-            struct stat status;
+            struct stat64 status;
             int length;
 
             if (component_length + 1 > sizeof(component)) {
@@ -96,7 +96,7 @@ restart:
                 errno = ENAMETOOLONG;
                 return -1;
             }
-            if (lstat(host_candidate, &status) != 0) {
+            if (lstat64(host_candidate, &status) != 0) {
                 if (allow_missing_leaf && last && errno == ENOENT) break;
                 return -1;
             }
@@ -377,7 +377,7 @@ int guest_path_chdir(const char *path)
     char normalized[PATH_MAX];
     char resolved[PATH_MAX];
     char host_path[PATH_MAX];
-    struct stat status;
+    struct stat64 status;
     int length;
 
     if (normalize_guest_path(path, normalized, sizeof(normalized)) != 0 ||
@@ -389,7 +389,7 @@ int guest_path_chdir(const char *path)
         errno = ENAMETOOLONG;
         return -1;
     }
-    if (stat(host_path, &status) != 0) return -1;
+    if (stat64(host_path, &status) != 0) return -1;
     if (!S_ISDIR(status.st_mode)) {
         errno = ENOTDIR;
         return -1;

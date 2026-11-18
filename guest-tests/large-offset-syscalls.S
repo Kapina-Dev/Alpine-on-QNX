@@ -5,14 +5,17 @@
     .type _start, %function
 
 /*
- * 64-bit file offsets must reach the host intact.  The device filesystems
- * (qnx6 and exFAT alike) cap a file near 2 GiB, so no file can hold data
- * past 4 GiB.  Instead the file is small and holds a marker byte at 4096:
- * an offset of 4 GiB + 4096 whose high word is dropped lands on that marker,
- * while the intact offset is past EOF (a read there gives 0 or the error QNX
- * returns, never a byte).  Each failing check exits with its own
- * number (10..20); 9 is a setup failure.  File: /tmp/linuxemu-large, 4097
- * bytes: 'A'..'H' at 0 and the marker 0x5A at 4096.
+ * 64-bit file offsets must reach the host intact.  Guest files are opened
+ * with QNX O_LARGEFILE, so the device's qnx6 filesystem takes offsets past
+ * 4 GiB, but it is not sparse: a write (even a zero-length QNX pwrite) at
+ * 4 GiB zero-fills the whole gap, about 2 minutes and 4 GiB of flash.  So
+ * no data is written past EOF here.  The file is small and holds a marker
+ * byte at 4096: an offset of 4 GiB + 4096 whose high word is dropped lands
+ * on that marker, while the intact offset is past EOF (a read there gives
+ * 0, never a byte), and a seek there returns it exactly.  Each failing
+ * check exits with its own number (10..20); 9 is a setup failure.  File:
+ * /tmp/linuxemu-large, 4097 bytes: 'A'..'H' at 0 and the marker 0x5A at
+ * 4096.
  */
     .macro sys nr
     movw r7, #\nr
@@ -105,29 +108,62 @@ _start:
     cmp r2, #0x5a
     bne f12
 
-    /* 13: pwritev at 4 GiB + 4096 fails (this filesystem's EFBIG); a
-       dropped high word would overwrite the marker and succeed */
+    /* 13: _llseek to 2 GiB + 4096 and to 4 GiB + 4096 returns exactly
+       that position (a descriptor without O_LARGEFILE gets EOVERFLOW) */
     mov r0, r8
-    ldr r1, =wiov
-    mov r2, #1
-    mov r3, #4096
-    mov r4, #1
-    sys 362
-    cmp r0, #0
-    bge f13
+    mov r1, #0
+    ldr r2, =0x80001000
+    ldr r3, =res
+    mov r4, #0
+    sys 140
+    want 0, f13
+    ldr r3, =res
+    ldr r1, [r3]
+    ldr r2, [r3, #4]
+    ldr r4, =0x80001000
+    cmp r1, r4
+    bne f13
+    cmp r2, #0
+    bne f13
+    mov r0, r8
+    mov r1, #1
+    mov r2, #4096
+    ldr r3, =res
+    mov r4, #0
+    sys 140
+    want 0, f13
+    ldr r3, =res
+    ldr r1, [r3]
+    ldr r2, [r3, #4]
+    cmp r1, #4096
+    bne f13
+    cmp r2, #1
+    bne f13
 
-    /* 14: pwrite64 at 4 GiB + 4096 fails the same way */
+    /* 14: a zero-length pwrite64 at 4 GiB + 4096 returns 0 and leaves the
+       size alone (QNX would zero-fill up to the offset) */
     mov r0, r8
     ldr r1, =pattern
-    mov r2, #1
+    mov r2, #0
     mov r3, #0
     mov r4, #4096
     mov r5, #1
     sys 181
-    cmp r0, #0
-    bge f14
+    want 0, f14
+    mov r0, r8
+    ldr r1, =statbuf
+    sys 197
+    want 0, f14
+    ldr r1, =statbuf
+    ldr r2, [r1, #48]
+    ldr r3, [r1, #52]
+    ldr r4, =4097
+    cmp r2, r4
+    bne f14
+    cmp r3, #0
+    bne f14
 
-    /* 15: the marker survived checks 13 and 14 */
+    /* 15: the marker survived check 14 */
     mov r0, r8
     ldr r1, =rbuf
     mov r2, #1
@@ -152,16 +188,14 @@ _start:
     cmp r0, #0
     bgt f16
 
-    /* 17: _llseek to 2 GiB + 4096 returns exactly that position, or fails
-       where the filesystem refuses the offset */
+    /* 17: _llseek to 2 GiB + 4096 returns exactly that position */
     mov r0, r8
     mov r1, #0
     ldr r2, =0x80001000
     ldr r3, =res
     mov r4, #0
     sys 140
-    cmp r0, #0
-    blt 4f
+    want 0, f17
     ldr r3, =res
     ldr r1, [r3]
     ldr r2, [r3, #4]
@@ -170,17 +204,15 @@ _start:
     bne f17
     cmp r2, #0
     bne f17
-4:
-    /* 18: _llseek to 4 GiB + 4096 either fails (this filesystem) or returns
-       exactly 4 GiB + 4096; a dropped high word would return 4096 */
+    /* 18: _llseek to 4 GiB + 4096 returns exactly 4 GiB + 4096; a dropped
+       high word would return 4096 */
     mov r0, r8
     mov r1, #1
     mov r2, #4096
     ldr r3, =res
     mov r4, #0
     sys 140
-    cmp r0, #0
-    blt 1f
+    want 0, f18
     ldr r3, =res
     ldr r1, [r3]
     ldr r2, [r3, #4]
@@ -188,7 +220,6 @@ _start:
     bne f18
     cmp r2, #1
     bne f18
-1:
     /* 19: ftruncate64 with a negative 64-bit length (high word 0x80000000)
        fails and leaves the size alone; a dropped high word would resize the
        file to 8192.  (A real 4 GiB length is not tried: QNX zero-fills about
@@ -267,7 +298,6 @@ marker: .byte 0x5a
 
     .section .data
     .align 3
-wiov: .word pattern, 1
 riov: .word rbuf, 1
 
     .section .bss

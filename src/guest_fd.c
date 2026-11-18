@@ -22,7 +22,7 @@ struct guest_fd_object {
     enum guest_fd_type type;
     unsigned references;
     dev_t device;
-    ino_t inode;
+    ino64_t inode;
     const struct guest_fd_ops *ops;
     union { long long integer; void *pointer; double real; } data[];
 };
@@ -42,9 +42,9 @@ static int valid_fd(int fd)
 struct guest_fd_object *guest_fd_object_new(enum guest_fd_type type,
     const struct guest_fd_ops *ops, int backing_fd, size_t extra_size)
 {
-    struct stat status;
+    struct stat64 status;
     struct guest_fd_object *object;
-    if (ops == 0 || fstat(backing_fd, &status) != 0) {
+    if (ops == 0 || fstat64(backing_fd, &status) != 0) {
         if (ops == 0) errno = EINVAL;
         return 0;
     }
@@ -121,11 +121,11 @@ void guest_fd_clear(int fd)
    open-file description.  Anything else starts native. */
 void guest_fd_received(int fd)
 {
-    struct stat status;
+    struct stat64 status;
     struct guest_fd_object *match = 0;
     int other;
     guest_fd_clear(fd);
-    if (!valid_fd(fd) || fstat(fd, &status) != 0) return;
+    if (!valid_fd(fd) || fstat64(fd, &status) != 0) return;
     pthread_mutex_lock(&table_lock);
     for (other = 0; other != GUEST_FD_SLOTS && match == 0; ++other) {
         struct guest_fd_object *object = slots[other];
@@ -162,13 +162,13 @@ int guest_fd_duplicate(int source, int destination)
 
 struct guest_fd_object *guest_fd_acquire(int fd)
 {
-    struct stat status;
+    struct stat64 status;
     struct guest_fd_object *object, *stale = 0;
     if (!valid_fd(fd)) return 0;
     pthread_mutex_lock(&table_lock);
     object = slots[fd];
     if (object != 0) {
-        if (fstat(fd, &status) != 0 || status.st_dev != object->device ||
+        if (fstat64(fd, &status) != 0 || status.st_dev != object->device ||
                 status.st_ino != object->inode) {
             stale = detach_locked(fd);
             object = 0;

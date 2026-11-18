@@ -254,7 +254,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
 {
     Elf32_Ehdr elf_header;
     Elf32_Phdr *program_headers = 0;
-    struct stat file_status;
+    struct stat64 file_status;
     size_t headers_size;
     size_t i;
     size_t attempt;
@@ -276,7 +276,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
     memset(object, 0, sizeof(*object));
     if (interpreter != 0 && interpreter_capacity != 0) interpreter[0] = '\0';
     fd = open(path, O_RDONLY);
-    if (fd < 0 || fstat(fd, &file_status) != 0 || file_status.st_size < 0 ||
+    if (fd < 0 || fstat64(fd, &file_status) != 0 || file_status.st_size < 0 ||
         (uint64_t)file_status.st_size > SIZE_MAX ||
         read_exact_at(fd, &elf_header, sizeof(elf_header), 0) != 0) goto done;
 

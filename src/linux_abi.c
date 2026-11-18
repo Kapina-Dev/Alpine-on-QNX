@@ -108,6 +108,12 @@ int linux_open_flags(uint32_t linux_flags, int *host_flags)
     case 1: result = O_WRONLY; break;
     default: result = O_RDWR; break;
     }
+    /* Linux ARM EABI user space always uses 64-bit offsets, and a QNX
+       descriptor opened without O_LARGEFILE refuses any offset past
+       2 GiB (EFBIG on write, EOVERFLOW on seek; measured on the device),
+       so every guest open asks for it, whether or not
+       LINUX_O_LARGEFILE is set. */
+    result |= O_LARGEFILE;
     if ((linux_flags & LINUX_O_CREAT) != 0) result |= O_CREAT;
     if ((linux_flags & LINUX_O_EXCL) != 0) result |= O_EXCL;
     if ((linux_flags & LINUX_O_NOCTTY) != 0) result |= O_NOCTTY;
