@@ -128,6 +128,15 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset,
     uint32_t count);
 int32_t linux_fallocate(int fd, uint32_t mode, int64_t offset,
     int64_t length);
+struct stat64;
+struct statvfs64;
+int32_t linux_host_stat_at(int dirfd, const char *guest_path,
+    uint32_t at_flags, struct stat64 *out);
+int32_t linux_statx(int dirfd, const char *path, uint32_t flags,
+    uint32_t mask, void *out);
+int32_t linux_statfs64_store(const struct statvfs64 *st, size_t guest_size,
+    void *out);
+int32_t linux_statfs64(const char *path, size_t guest_size, void *out);
 int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
     const char *detail, const uint32_t *args);
 int32_t guest_signal_send(pid_t process, int linux_signal, uint32_t number,

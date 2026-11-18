@@ -464,19 +464,43 @@ static int32_t linux_open_path(int directory_fd, const char *guest_path,
     return linux_host_result(fd);
 }
 
-static int32_t linux_stat_path(int directory_fd, const char *guest_path,
-    void *guest_status, int follow)
+int32_t linux_host_stat_at(int directory_fd, const char *guest_path,
+    uint32_t at_flags, struct stat64 *out)
 {
     char host_path[PATH_MAX];
-    struct stat64 status;
+    int follow = (at_flags & LINUX_AT_SYMLINK_NOFOLLOW) == 0;
     int result;
 
+    if ((at_flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | 0x1000u)) != 0)
+        return -EINVAL;
+    if (guest_path == 0) return -EFAULT;
+    if ((at_flags & 0x1000u) != 0 && guest_path[0] == '\0') {
+        if (directory_fd == LINUX_AT_FDCWD) {
+            if (resolve_at(directory_fd, ".", 0, 0, host_path,
+                    sizeof(host_path)) != 0)
+                return -(int32_t)linux_errno_number(errno);
+            result = stat64(host_path, out);
+        } else {
+            if (guest_fd_is_hidden(directory_fd)) return -EBADF;
+            result = fstat64(directory_fd, out);
+        }
+        return result != 0 ? -(int32_t)linux_errno_number(errno) : 0;
+    }
     if (resolve_at(directory_fd, guest_path, 0, !follow, host_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
-    result = follow ? stat64(host_path, &status) :
-        lstat64(host_path, &status);
+    result = follow ? stat64(host_path, out) : lstat64(host_path, out);
     if (result != 0) return -(int32_t)linux_errno_number(errno);
+    return 0;
+}
+
+static int32_t linux_stat_path(int directory_fd, const char *guest_path,
+    void *guest_status, int follow)
+{
+    struct stat64 status;
+    int32_t result = linux_host_stat_at(directory_fd, guest_path,
+        follow ? 0 : LINUX_AT_SYMLINK_NOFOLLOW, &status);
+    if (result != 0) return result;
     linux_stat64_store(guest_status, &status);
     return 0;
 }
@@ -609,45 +633,17 @@ static int32_t linux_utimensat(int directory_fd, const char *guest_path,
     return linux_host_result(utime(host_path, &times));
 }
 
-static void store_guest_u32(unsigned char *buffer, size_t offset,
-    uint32_t value)
-{
-    memcpy(buffer + offset, &value, sizeof(value));
-}
-
-static void store_guest_u64(unsigned char *buffer, size_t offset,
-    uint64_t value)
-{
-    memcpy(buffer + offset, &value, sizeof(value));
-}
-
 static int32_t linux_fstatfs64(int descriptor, size_t guest_size,
     void *guest_buffer)
 {
-    struct statvfs status;
-    unsigned char *buffer = guest_buffer;
-    uint32_t flags = 0;
+    struct statvfs64 status;
 
-    if (guest_size < 88) return -EINVAL;
-    if (fstatvfs(descriptor, &status) != 0)
+    if (guest_fd_is_hidden(descriptor)) return -EBADF;
+    if (guest_size != 84 && guest_size != 88) return -EINVAL;
+    if (guest_buffer == 0) return -EFAULT;
+    if (fstatvfs64(descriptor, &status) != 0)
         return -(int32_t)linux_errno_number(errno);
-#ifdef ST_RDONLY
-    if ((status.f_flag & ST_RDONLY) != 0) flags |= 1u;
-#endif
-#ifdef ST_NOSUID
-    if ((status.f_flag & ST_NOSUID) != 0) flags |= 2u;
-#endif
-    memset(buffer, 0, 88);
-    store_guest_u32(buffer, 4, (uint32_t)status.f_bsize);
-    store_guest_u64(buffer, 8, (uint64_t)status.f_blocks);
-    store_guest_u64(buffer, 16, (uint64_t)status.f_bfree);
-    store_guest_u64(buffer, 24, (uint64_t)status.f_bavail);
-    store_guest_u64(buffer, 32, (uint64_t)status.f_files);
-    store_guest_u64(buffer, 40, (uint64_t)status.f_ffree);
-    store_guest_u32(buffer, 56, (uint32_t)status.f_namemax);
-    store_guest_u32(buffer, 60, (uint32_t)status.f_frsize);
-    store_guest_u32(buffer, 64, flags);
-    return 0;
+    return linux_statfs64_store(&status, guest_size, guest_buffer);
 }
 
 static int32_t linux_fstat_fd(int fd, void *guest_status)
@@ -1779,6 +1775,17 @@ void linux_syscall_dispatch(ucontext_t *context)
             context->uc_mcontext.cpu.gpr[1],
             (const struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[2],
             (struct linux_rlimit64 *)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case 266:
+        result = linux_statfs64((const char *)context->uc_mcontext.cpu.gpr[0],
+            (size_t)context->uc_mcontext.cpu.gpr[1],
+            (void *)context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case 397:
+        result = linux_statx((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], context->uc_mcontext.cpu.gpr[3],
+            (void *)context->uc_mcontext.cpu.gpr[4]);
         break;
     case LINUX_NR_FSTATFS64:
         result = linux_fstatfs64((int)context->uc_mcontext.cpu.gpr[0],

@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -201,4 +203,108 @@ int32_t linux_fallocate(int fd, uint32_t mode, int64_t offset, int64_t length)
        to keep offsets above 4 GiB intact. */
     error = posix_fallocate64(fd, (off64_t)offset, (off64_t)length);
     return error == 0 ? 0 : -(int32_t)linux_errno_number(error);
+}
+
+static void put_u32(unsigned char *buffer, size_t offset, uint32_t value)
+{
+    memcpy(buffer + offset, &value, sizeof(value));
+}
+
+static void put_u64(unsigned char *buffer, size_t offset, uint64_t value)
+{
+    memcpy(buffer + offset, &value, sizeof(value));
+}
+
+int32_t linux_statfs64_store(const struct statvfs64 *status,
+    size_t guest_size, void *out)
+{
+    unsigned char buffer[88];
+    uint32_t flags = 0;
+
+    if (guest_size != 84 && guest_size != 88) return -LINUX_EINVAL;
+#ifdef ST_RDONLY
+    if ((status->f_flag & ST_RDONLY) != 0) flags |= 1u;
+#endif
+#ifdef ST_NOSUID
+    if ((status->f_flag & ST_NOSUID) != 0) flags |= 2u;
+#endif
+    memset(buffer, 0, sizeof(buffer));
+    put_u32(buffer, 4, (uint32_t)status->f_bsize);
+    put_u64(buffer, 8, (uint64_t)status->f_blocks);
+    put_u64(buffer, 16, (uint64_t)status->f_bfree);
+    put_u64(buffer, 24, (uint64_t)status->f_bavail);
+    put_u64(buffer, 32, (uint64_t)status->f_files);
+    put_u64(buffer, 40, (uint64_t)status->f_ffree);
+    put_u32(buffer, 56, (uint32_t)status->f_namemax);
+    put_u32(buffer, 60, (uint32_t)status->f_frsize);
+    put_u32(buffer, 64, flags);
+    memcpy(out, buffer, guest_size);
+    return 0;
+}
+
+int32_t linux_statfs64(const char *guest_path, size_t guest_size, void *out)
+{
+    char host_path[PATH_MAX];
+    struct statvfs64 status;
+
+    if (guest_size != 84 && guest_size != 88) return -LINUX_EINVAL;
+    if (guest_path == 0 || out == 0) return -LINUX_EFAULT;
+    if (guest_path_resolve(guest_path, 0, host_path, sizeof(host_path)) != 0)
+        return host_errno_result();
+    if (statvfs64(host_path, &status) != 0) return host_errno_result();
+    return linux_statfs64_store(&status, guest_size, out);
+}
+
+#define STATX_BASIC_STATS 0x7ffu
+#define STATX_RESERVED 0x80000000u
+#define STATX_FLAGS_OK (0x100u | 0x800u | 0x1000u | 0x6000u)
+
+static void put_statx_time(unsigned char *buffer, size_t offset,
+    int32_t seconds)
+{
+    put_u64(buffer, offset, (uint64_t)(int64_t)seconds);
+}
+
+int32_t linux_statx(int dirfd, const char *guest_path, uint32_t flags,
+    uint32_t mask, void *out)
+{
+    unsigned char buffer[256];
+    struct stat64 status;
+    uint32_t major_device, minor_device, major_rdev, minor_rdev;
+    int32_t result;
+
+    if ((flags & ~STATX_FLAGS_OK) != 0 || (mask & STATX_RESERVED) != 0)
+        return -LINUX_EINVAL;
+    if (out == 0) return -LINUX_EFAULT;
+    result = linux_host_stat_at(dirfd, guest_path,
+        flags & (0x100u | 0x1000u), &status);
+    if (result != 0) return result;
+    major_device = (uint32_t)((status.st_dev >> 8) & 0xfffu);
+    minor_device = (uint32_t)((status.st_dev & 0xffu) |
+        ((status.st_dev >> 12) & 0xfff00u));
+    major_rdev = (uint32_t)((status.st_rdev >> 8) & 0xfffu);
+    minor_rdev = (uint32_t)((status.st_rdev & 0xffu) |
+        ((status.st_rdev >> 12) & 0xfff00u));
+    memset(buffer, 0, sizeof(buffer));
+    put_u32(buffer, 0, STATX_BASIC_STATS);
+    put_u32(buffer, 4, (uint32_t)status.st_blksize);
+    put_u32(buffer, 16, (uint32_t)status.st_nlink);
+    put_u32(buffer, 20, (uint32_t)status.st_uid);
+    put_u32(buffer, 24, (uint32_t)status.st_gid);
+    {
+        uint16_t mode = (uint16_t)status.st_mode;
+        memcpy(buffer + 28, &mode, sizeof(mode));
+    }
+    put_u64(buffer, 32, (uint64_t)status.st_ino);
+    put_u64(buffer, 40, (uint64_t)status.st_size);
+    put_u64(buffer, 48, (uint64_t)status.st_blocks);
+    put_statx_time(buffer, 64, (int32_t)status.st_atime);
+    put_statx_time(buffer, 96, (int32_t)status.st_ctime);
+    put_statx_time(buffer, 112, (int32_t)status.st_mtime);
+    put_u32(buffer, 128, major_rdev);
+    put_u32(buffer, 132, minor_rdev);
+    put_u32(buffer, 136, major_device);
+    put_u32(buffer, 140, minor_device);
+    memcpy(out, buffer, sizeof(buffer));
+    return 0;
 }
