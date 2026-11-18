@@ -604,15 +604,17 @@ static unsigned cap_elements(uint32_t version)
 }
 
 /* QNX processes have no Linux capability sets: every set reads as empty and
-   only an empty set can be installed. */
+   only an empty set can be installed.  An unknown version gets the preferred
+   one written back; capget with NULL data then succeeds (the probe libcap
+   uses), anything else is EINVAL. */
 static int32_t cap_header_check(struct linux_cap_header *header,
-    unsigned *elements)
+    unsigned *elements, int probe_ok)
 {
     if (header == 0) return -EFAULT;
     *elements = cap_elements(header->version);
     if (*elements == 0) {
         header->version = LINUX_CAP_VERSION_3;
-        return -LINUX_EINVAL;
+        return probe_ok ? 0 : -LINUX_EINVAL;
     }
     if (header->pid < 0) return -LINUX_EINVAL;
     return 0;
@@ -621,8 +623,8 @@ static int32_t cap_header_check(struct linux_cap_header *header,
 static int32_t linux_capget(struct linux_cap_header *header, uint32_t *data)
 {
     unsigned elements;
-    int32_t result = cap_header_check(header, &elements);
-    if (result != 0) return result;
+    int32_t result = cap_header_check(header, &elements, data == 0);
+    if (result != 0 || elements == 0) return result;
     if (data == 0) return 0;
     if (!task_exists(header->pid)) return -LINUX_ESRCH;
     /* Each element is {effective, permitted, inheritable}. */
@@ -634,7 +636,7 @@ static int32_t linux_capset(struct linux_cap_header *header,
     const uint32_t *data, const uint32_t *args)
 {
     unsigned elements, i;
-    int32_t result = cap_header_check(header, &elements);
+    int32_t result = cap_header_check(header, &elements, 0);
     if (result != 0) return result;
     if (data == 0) return -EFAULT;
     if (header->pid != 0 && header->pid != (int32_t)getpid())

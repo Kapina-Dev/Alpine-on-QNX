@@ -49,7 +49,16 @@ _start:
     mov r1, #0
     mvn r2, #4
     sys 97
-    wanterr 13, f10
+    mov r5, r0
+    sys 201
+    cmp r0, #0
+    bne 4f
+    cmp r5, #0
+    bne f10
+    b 5f
+4:  cmn r5, #13
+    bne f10
+5:
 
     /* 11: PRIO_PGRP and PRIO_USER on the caller work (15) or are EINVAL.
        A line records which. */
@@ -172,8 +181,8 @@ _start:
     want 0, f14
     wantmem param, 0, f14
 
-    /* 15: capget v3 gives all-zero sets; a bad version with NULL data is
-       EINVAL and the header comes back with the preferred version */
+    /* 15: capget v3 gives all-zero sets; a bad version with NULL data is the probe (0), with data
+       EINVAL; the header comes back with the preferred version */
     ldr r1, =capdata
     mvn r2, #0
     str r2, [r1]
@@ -203,6 +212,14 @@ _start:
     str r2, [r1]
     ldr r0, =caphdr
     mov r1, #0
+    sys 184
+    want 0, f15
+    wantmem caphdr, 0x20080522, f15
+    ldr r1, =caphdr
+    ldr r2, =0x12345678
+    str r2, [r1]
+    ldr r0, =caphdr
+    ldr r1, =capdata
     sys 184
     wanterr 22, f15
     wantmem caphdr, 0x20080522, f15

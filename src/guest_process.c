@@ -53,7 +53,16 @@ int guest_process_initialize(const char *emulator)
     /* PR_SET_NO_NEW_PRIVS and the nice value also survive execve. */
     guest_no_new_privs = getenv("LINUXEMU_GUEST_NO_NEW_PRIVS") != 0;
     value = getenv("LINUXEMU_GUEST_NICE");
-    guest_nice = value == 0 ? 0 : (int)strtol(value, 0, 10);
+    guest_nice = 0;
+    if (value != 0 && value[0] != '\0') {
+        char *end;
+        long parsed = strtol(value, &end, 10);
+        if (*end == '\0') {
+            if (parsed < -20) parsed = -20;
+            if (parsed > 19) parsed = 19;
+            guest_nice = (int)parsed;
+        }
+    }
     return 0;
 }
 
