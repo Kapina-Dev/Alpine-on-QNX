@@ -546,8 +546,12 @@ static int32_t accept_socket(uint32_t *arguments, int with_flags)
     int status_flags = 0, descriptor_flags = 0, ignored_type;
     int fd;
     int converted;
-    if (with_flags && socket_type(SOCK_STREAM | arguments[3], &ignored_type,
-            &status_flags, &descriptor_flags) != 0) return -EINVAL;
+    /* The flags share bits with the socket type, so they are checked on
+       their own: accept4(..., 1) must not pass as SOCK_STREAM. */
+    if (with_flags && ((arguments[3] & ~(LINUX_SOCK_NONBLOCK |
+            LINUX_SOCK_CLOEXEC)) != 0 ||
+            socket_type(SOCK_STREAM | arguments[3], &ignored_type,
+            &status_flags, &descriptor_flags) != 0)) return -EINVAL;
     fd = guest_fd_admit(accept((int)arguments[0], arguments[1] == 0 ? 0 :
         (struct sockaddr *)&address, arguments[1] == 0 ? 0 : &length));
     if (fd < 0) return -(int32_t)linux_errno_number(errno);

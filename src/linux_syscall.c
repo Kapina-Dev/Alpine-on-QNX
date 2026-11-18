@@ -173,6 +173,7 @@
 #define LINUX_O_NOFOLLOW 0x00008000u
 #define LINUX_O_NONBLOCK 0x00000800u
 #define LINUX_O_CLOEXEC 0x00080000u
+#define LINUX_O_DIRECT 0x00010000u
 #define LINUX_EFD_SEMAPHORE 0x00000001u
 #define LINUX_WNOHANG 0x00000001u
 #define LINUX_WUNTRACED 0x00000002u
@@ -783,6 +784,13 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
     int descriptors[2];
     int host_status_flags = 0;
 
+    if ((flags & LINUX_O_DIRECT) != 0) {
+        /* packet-mode pipes have no QNX equivalent */
+        const uint32_t args[6] = { (uint32_t)(uintptr_t)guest_descriptors,
+            flags, 0, 0, 0, 0 };
+        return linux_unsupported(LINUX_NR_PIPE2, LINUX_EINVAL,
+            "pipe2-packet", args);
+    }
     if ((flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)) != 0) return -EINVAL;
     if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
     if (guest_fd_is_hidden(descriptors[0]) || guest_fd_is_hidden(descriptors[1])) {

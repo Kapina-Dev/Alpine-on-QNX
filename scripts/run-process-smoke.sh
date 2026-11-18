@@ -93,6 +93,22 @@ run_rootfs_fixture()
 run_rootfs_fixture fork-fd-churn
 run_rootfs_fixture fd-exec-carry
 run_rootfs_fixture fd-stress
+run_rootfs_fixture dup3-race
+
+# pipe2, dup3 and accept4 flag cases.  pipe2(O_DIRECT) must also leave a
+# pipe2-packet line in the diagnostics report.
+echo "=== process guest: fd-flags-syscalls ==="
+flags_report="$output_dir/fd-flags.diag"
+rm -f "$flags_report"
+LINUXEMU_DIAGNOSTICS="$flags_report" "$linuxemu" \
+    "$project_dir/build/guest-tests/fd-flags-syscalls"
+status=$?
+echo "fd-flags-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+if ! grep -q 'detail=pipe2-packet' "$flags_report" 2>/dev/null; then
+    echo "fd-flags-syscalls: diagnostics report lacks detail=pipe2-packet" >&2
+    failures=$((failures + 1))
+fi
 
 echo "linuxemu_process_smoke_failures=$failures"
 test "$failures" -eq 0
