@@ -379,7 +379,7 @@ static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
     return (int32_t)process;
 }
 
-static int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
+int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
     int count)
 {
     unsigned char *buffer;
@@ -1425,6 +1425,31 @@ void linux_syscall_dispatch(ucontext_t *context)
             (size_t)context->uc_mcontext.cpu.gpr[2], (off_t)offset));
         break;
     }
+    case 361: case 362: case 392: case 393: {
+        /* preadv/pwritev: pos_l, pos_h in r3, r4 (no pair alignment); the
+           *2 calls add flags in r5 */
+        uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[3] |
+            ((uint64_t)context->uc_mcontext.cpu.gpr[4] << 32);
+        int kind = number >= 392;
+        uint32_t flags = kind ? context->uc_mcontext.cpu.gpr[5] : 0;
+        if (number == 361 || number == 392)
+            result = linux_preadv((int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int32_t)context->uc_mcontext.cpu.gpr[2], (int64_t)offset,
+                flags, kind);
+        else
+            result = linux_pwritev((int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int32_t)context->uc_mcontext.cpu.gpr[2], (int64_t)offset,
+                flags, kind);
+        break;
+    }
+    case 239:
+        result = linux_sendfile64((int)context->uc_mcontext.cpu.gpr[0],
+            (int)context->uc_mcontext.cpu.gpr[1],
+            (int64_t *)context->uc_mcontext.cpu.gpr[2],
+            context->uc_mcontext.cpu.gpr[3]);
+        break;
     case LINUX_NR_FSYNC:
     case LINUX_NR_FDATASYNC:
         /* QNX 10.3 has fsync but no distinct fdatasync operation. */

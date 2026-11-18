@@ -114,6 +114,15 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
 int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
     size_t signal_set_size);
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size);
+struct iovec;
+int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
+    int count);
+int32_t linux_preadv(int fd, const struct iovec *iov, int32_t count,
+    int64_t offset, uint32_t flags, int vectored_kind);
+int32_t linux_pwritev(int fd, const struct iovec *iov, int32_t count,
+    int64_t offset, uint32_t flags, int vectored_kind);
+int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset,
+    uint32_t count);
 int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
     const char *detail, const uint32_t *args);
 int32_t guest_signal_send(pid_t process, int linux_signal, uint32_t number,

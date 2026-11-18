@@ -100,6 +100,14 @@ run_fd_guest wake-eventfd-dup
 run_fd_guest getdents-chunks
 run_fd_guest fd-close-all
 run_fd_guest fd-exhaust
+run_fd_guest file-vector-syscalls
+
+echo "=== filesystem guest: sendfile-interrupt ==="
+LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
+    "$project_dir/guest-tests/fixtures/sendfile-interrupt-armhf"
+status=$?
+echo "sendfile-interrupt exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
 echo "=== filesystem guest: getdents-unlink ==="
 LINUXEMU_ROOT="$alpine_root" "$linuxemu" \
