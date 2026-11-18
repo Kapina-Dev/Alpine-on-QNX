@@ -119,8 +119,10 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
     if (guest_fd_is_hidden(out_fd) || guest_fd_is_hidden(in_fd))
         return -LINUX_EBADF;
     if (lseek(in_fd, 0, SEEK_CUR) < 0) {
-        /* pipe, socket or tty input: Linux needs an mmappable file */
         uint32_t arguments[6];
+        /* a bad descriptor and the like keep their own error */
+        if (errno != ESPIPE) return host_errno_result();
+        /* pipe, socket or tty input: Linux needs an mmappable file */
         arguments[0] = (uint32_t)out_fd;
         arguments[1] = (uint32_t)in_fd;
         arguments[2] = (uint32_t)(uintptr_t)offset_pointer;

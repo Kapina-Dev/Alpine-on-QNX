@@ -6,7 +6,7 @@
 
 /*
  * preadv, pwritev, preadv2, pwritev2 and sendfile64.  Each failing check
- * exits with its own number (10..23); 9 is a setup failure.  The file is
+ * exits with its own number (10..24); 9 is a setup failure.  The file is
  * /tmp/linuxemu-vec: 64 bytes of pattern, later 124 bytes.
  */
     .macro sys nr
@@ -289,6 +289,29 @@ _start:
     sys 239
     wanterr 22, f23
 
+    /* 24: a closed, non-hidden in or out fd = -EBADF */
+    ldr r0, =path_out
+    mov r1, #2
+    mov r2, #0
+    sys 5
+    cmp r0, #0
+    blt f24
+    mov r6, r0
+    mov r0, r6
+    sys 6
+    mov r0, r9
+    mov r1, r6
+    mov r2, #0
+    mov r3, #20
+    sys 239
+    wanterr 9, f24
+    mov r0, r6
+    mov r1, r8
+    mov r2, #0
+    mov r3, #20
+    sys 239
+    wanterr 9, f24
+
     ldr r0, =path
     sys 10
     ldr r0, =path_out
@@ -310,7 +333,8 @@ f19: mov r0, #19; b exit_guest
 f20: mov r0, #20; b exit_guest
 f21: mov r0, #21; b exit_guest
 f22: mov r0, #22; b exit_guest
-f23: mov r0, #23
+f23: mov r0, #23; b exit_guest
+f24: mov r0, #24
 exit_guest:
     mov r7, #1
     svc #0
