@@ -132,6 +132,10 @@ struct stat64;
 struct statvfs64;
 int32_t linux_host_stat_at(int dirfd, const char *guest_path,
     uint32_t at_flags, struct stat64 *out);
+int32_t linux_chown_at(int dirfd, const char *path, uint32_t uid,
+    uint32_t gid, uint32_t at_flags);
+int32_t linux_mknod_at(int dirfd, const char *path, uint32_t mode,
+    uint32_t dev);
 int32_t linux_statx(int dirfd, const char *path, uint32_t flags,
     uint32_t mask, void *out);
 int32_t linux_statfs64_store(const struct statvfs64 *st, size_t guest_size,

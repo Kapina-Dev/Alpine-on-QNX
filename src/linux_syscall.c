@@ -23,6 +23,7 @@
 
 #define LINUX_ENOSYS 38
 #define LINUX_EINVAL 22
+#define LINUX_EPERM 1
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_NR_EXIT 1
 #define LINUX_NR_FORK 2
@@ -165,7 +166,23 @@
 #define LINUX_PROT_READ 0x1u
 #define LINUX_PROT_WRITE 0x2u
 #define LINUX_PROT_EXEC 0x4u
+#define LINUX_NR_MKNOD 14
+#define LINUX_NR_FCHMOD 94
+#define LINUX_NR_LCHOWN32 198
+#define LINUX_NR_FCHOWN32 207
+#define LINUX_NR_CHOWN32 212
+#define LINUX_NR_MKNODAT 324
+#define LINUX_NR_FCHOWNAT 325
+#define LINUX_NR_FACCESSAT2 439
 #define LINUX_AT_FDCWD (-100)
+#define LINUX_AT_EACCESS 0x200u
+#define LINUX_AT_EMPTY_PATH 0x1000u
+#define LINUX_S_IFMT 0170000u
+#define LINUX_S_IFREG 0100000u
+#define LINUX_S_IFCHR 0020000u
+#define LINUX_S_IFBLK 0060000u
+#define LINUX_S_IFIFO 0010000u
+#define LINUX_S_IFSOCK 0140000u
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100u
 #define LINUX_AT_REMOVEDIR 0x200u
 #define LINUX_AT_SYMLINK_FOLLOW 0x400u
@@ -585,6 +602,113 @@ static int32_t linux_chmodat(int directory_fd, const char *guest_path,
             sizeof(host_path)) != 0)
         return -(int32_t)linux_errno_number(errno);
     return linux_host_result(chmod(host_path, (mode_t)(mode & 07777u)));
+}
+
+static int32_t linux_fchmod(int descriptor, uint32_t mode)
+{
+    if (guest_fd_is_hidden(descriptor)) return -EBADF;
+    return linux_host_result(fchmod(descriptor, (mode_t)(mode & 07777u)));
+}
+
+/* Permission check against a status record, for the AT_EMPTY_PATH forms. */
+static int32_t access_from_status(const struct stat64 *status, uint32_t mode)
+{
+    uint32_t bits;
+    if (mode == 0 || geteuid() == 0) return 0;
+    if (status->st_uid == geteuid()) bits = (status->st_mode >> 6) & 7u;
+    else if (status->st_gid == getegid()) bits = (status->st_mode >> 3) & 7u;
+    else bits = status->st_mode & 7u;
+    return (mode & ~bits) == 0 ? 0 : -EACCES;
+}
+
+static int32_t linux_faccessat2(int directory_fd, const char *guest_path,
+    uint32_t mode, uint32_t flags)
+{
+    char host_path[PATH_MAX];
+    struct stat64 status;
+    if ((mode & ~7u) != 0 || (flags & ~(LINUX_AT_EACCESS |
+            LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH)) != 0)
+        return -EINVAL;
+    if (guest_path == 0) return -EFAULT;
+    if ((flags & LINUX_AT_EMPTY_PATH) != 0 && guest_path[0] == '\0') {
+        int32_t result = linux_host_stat_at(directory_fd, guest_path,
+            LINUX_AT_EMPTY_PATH, &status);
+        return result != 0 ? result : access_from_status(&status, mode);
+    }
+    if ((flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
+        /* A symbolic link itself is always accessible (mode 0777). */
+        int32_t result = linux_host_stat_at(directory_fd, guest_path,
+            LINUX_AT_SYMLINK_NOFOLLOW, &status);
+        if (result != 0) return result;
+        if (S_ISLNK(status.st_mode)) return 0;
+    }
+    if (resolve_at(directory_fd, guest_path, 0, 0, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(access(host_path, (int)mode));
+}
+
+int32_t linux_chown_at(int directory_fd, const char *guest_path,
+    uint32_t uid, uint32_t gid, uint32_t at_flags)
+{
+    char host_path[PATH_MAX];
+    int nofollow = (at_flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0;
+    if ((at_flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH)) != 0)
+        return -EINVAL;
+    if (guest_path == 0) return -EFAULT;
+    if ((at_flags & LINUX_AT_EMPTY_PATH) != 0 && guest_path[0] == '\0') {
+        if (directory_fd == LINUX_AT_FDCWD) {
+            if (resolve_at(directory_fd, ".", 0, 0, host_path,
+                    sizeof(host_path)) != 0)
+                return -(int32_t)linux_errno_number(errno);
+            return linux_host_result(chown(host_path, (uid_t)uid,
+                (gid_t)gid));
+        }
+        if (guest_fd_is_hidden(directory_fd)) return -EBADF;
+        return linux_host_result(fchown(directory_fd, (uid_t)uid,
+            (gid_t)gid));
+    }
+    if (resolve_at(directory_fd, guest_path, 0, nofollow, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    return linux_host_result(nofollow ?
+        lchown(host_path, (uid_t)uid, (gid_t)gid) :
+        chown(host_path, (uid_t)uid, (gid_t)gid));
+}
+
+static int32_t linux_fchown(int descriptor, uint32_t uid, uint32_t gid)
+{
+    if (guest_fd_is_hidden(descriptor)) return -EBADF;
+    return linux_host_result(fchown(descriptor, (uid_t)uid, (gid_t)gid));
+}
+
+int32_t linux_mknod_at(int directory_fd, const char *guest_path,
+    uint32_t mode, uint32_t device)
+{
+    char host_path[PATH_MAX];
+    uint32_t type = mode & LINUX_S_IFMT;
+    mode_t permissions = (mode_t)(mode & 07777u);
+    if (guest_path == 0) return -EFAULT;
+    if (type == LINUX_S_IFSOCK) {
+        const uint32_t args[6] = { (uint32_t)directory_fd,
+            (uint32_t)(uintptr_t)guest_path, mode, device, 0, 0 };
+        return linux_unsupported(LINUX_NR_MKNODAT, LINUX_EPERM,
+            "mknod-socket", args);
+    }
+    if (type == LINUX_S_IFCHR || type == LINUX_S_IFBLK) return -EPERM;
+    if (type != 0 && type != LINUX_S_IFREG && type != LINUX_S_IFIFO)
+        return -EINVAL;
+    if (resolve_at(directory_fd, guest_path, 1, 1, host_path,
+            sizeof(host_path)) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    if (type == LINUX_S_IFIFO)
+        return linux_host_result(mkfifo(host_path, permissions));
+    {
+        int fd = open(host_path, O_WRONLY | O_CREAT | O_EXCL, permissions);
+        if (fd < 0) return -(int32_t)linux_errno_number(errno);
+        close(fd);
+        return 0;
+    }
 }
 
 static int32_t linux_utimensat(int directory_fd, const char *guest_path,
@@ -1611,6 +1735,42 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_chmodat((int32_t)context->uc_mcontext.cpu.gpr[0],
             (const char *)context->uc_mcontext.cpu.gpr[1],
             context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_FCHMOD:
+        result = linux_fchmod((int32_t)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_FACCESSAT2:
+        result = linux_faccessat2((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_CHOWN32:
+    case LINUX_NR_LCHOWN32:
+        result = linux_chown_at(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1], context->uc_mcontext.cpu.gpr[2],
+            number == LINUX_NR_LCHOWN32 ? LINUX_AT_SYMLINK_NOFOLLOW : 0);
+        break;
+    case LINUX_NR_FCHOWN32:
+        result = linux_fchown((int32_t)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1], context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_FCHOWNAT:
+        result = linux_chown_at((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], context->uc_mcontext.cpu.gpr[3],
+            context->uc_mcontext.cpu.gpr[4]);
+        break;
+    case LINUX_NR_MKNOD:
+        result = linux_mknod_at(LINUX_AT_FDCWD,
+            (const char *)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1], context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_MKNODAT:
+        result = linux_mknod_at((int32_t)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], context->uc_mcontext.cpu.gpr[3]);
         break;
     case LINUX_NR_FACCESSAT:
         result = linux_faccessat((int32_t)context->uc_mcontext.cpu.gpr[0],

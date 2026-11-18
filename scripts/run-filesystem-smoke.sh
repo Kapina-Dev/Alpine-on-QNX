@@ -103,6 +103,7 @@ run_fd_guest fd-exhaust
 run_fd_guest file-vector-syscalls
 run_fd_guest fallocate-fcntl-syscalls
 run_fd_guest statx-syscalls
+run_fd_guest file-owner-syscalls
 run_fd_guest large-offset-syscalls
 
 echo "=== filesystem guest: sendfile-interrupt ==="
