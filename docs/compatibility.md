@@ -73,6 +73,8 @@ Limits of the Phase 2 calls:
   `RWF_NOAPPEND` (which musl's `pwrite` uses) is accepted for positioned
   writes; at the current position of an `O_APPEND` descriptor it is
   refused. `RWF_HIPRI`, `RWF_NOWAIT` and `RWF_APPEND` are refused.
+  `pwrite`/`pwritev` on an `O_APPEND` descriptor write at the given offset,
+  as QNX does; Linux appends instead.
 - Open-file-description locks (`F_OFD_*`) are per-process, not per open
   file. Two threads of one process don't exclude each other, and closing
   any descriptor of the file drops the locks.
@@ -86,8 +88,8 @@ Limits of the Phase 2 calls:
   `MREMAP_DONTUNMAP` return `EINVAL`. Memory that was ever patched is
   refused too.
 - Memory that a JIT flips to executable is scanned blindly for `svc #0` and
-  TPIDRURO words. Data words that match are rewritten, and about 4,000 flips
-  fill the patch table. The fix belongs with Phase 4.
+  TPIDRURO words. Data words that match are rewritten; the fix belongs with
+  Phase 4. Repeated flips of the same page no longer fill the patch table.
 - `statx` returns whole-second timestamps and no birth time. Device numbers
   are a synthetic major/minor split of the QNX device number.
 - `cacheflush` returns `EINVAL` when start equals end, and for a range
