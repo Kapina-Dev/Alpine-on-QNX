@@ -9,7 +9,7 @@
  *      instance a second read fails EAGAIN
  *   12 writes of 3 and 4, then one read returns 7 (sum, read resets);
  *      writev and readv split 4 + 4 move a value too
- *   13 reserved (blocking, Task 3)
+ *   13 reserved (blocking I/O is checked in eventfd-blocking.c)
  *   14 EFD_SEMAPHORE with initial 3: three reads return 1, the fourth
  *      (nonblocking) fails EAGAIN
  *   15 a 7-byte read and a 7-byte write fail EINVAL; writing

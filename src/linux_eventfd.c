@@ -150,16 +150,92 @@ static int add_counter(struct eventfd_data *data, uint64_t value)
     return 1;
 }
 
+/* Blocking waits.  Nothing is held while waiting: the counter is only
+   ever changed by a compare-and-swap, so a process killed while blocked
+   (or anywhere else) leaves nothing locked.  Each wait sleeps in poll()
+   with the thread's signal-wait fd beside it, so a guest signal ends the
+   wait with -EINTR; the trap's syscall-restart path then applies
+   SA_RESTART exactly as for an interrupted native read or write.
+
+   Returns 0 to re-check the counter, or a negative Linux errno. */
+static int32_t wait_for_change(struct eventfd_data *data, int read_fd,
+    uint64_t write_value, int timeout)
+{
+    struct pollfd entries[2];
+    int signal_wait_fd = guest_thread_signal_wait_begin(), count, result;
+    uint64_t counter;
+    if (signal_wait_fd < 0) return -(int32_t)linux_errno_number(errno);
+    /* A signal already pending (and unblocked) fills the wait fd now; one
+       arriving from here on writes to it from the host handler. */
+    guest_thread_signal_wait_arm();
+    /* The re-check after the wait fd exists: a change from here on either
+       raises the channel (read) or is seen by the next slice (write). */
+    counter = load64(&data->shared->counter);
+    if (write_value == 0 ? counter != 0 :
+            EVENTFD_COUNTER_MAX - counter >= write_value) {
+        guest_thread_signal_wait_end();
+        return 0;
+    }
+    count = 0;
+    if (write_value == 0) {
+        entries[count].fd = read_fd;
+        entries[count].events = POLLIN;
+        entries[count].revents = 0;
+        ++count;
+    }
+    entries[count].fd = signal_wait_fd;
+    entries[count].events = POLLIN;
+    entries[count].revents = 0;
+    ++count;
+    result = poll(entries, (nfds_t)count, timeout);
+    if ((result < 0 && errno == EINTR) ||
+            (result > 0 && entries[count - 1].revents != 0))
+        result = -(int32_t)linux_errno_number(EINTR);
+    else if (result < 0) result = -(int32_t)linux_errno_number(errno);
+    else result = 0;
+    guest_thread_signal_wait_end();
+    return result;
+}
+
+/* The read side sleeps until the channel holds a byte.  The 1 s slice is a
+   safety net only: a process killed between draining the channel and
+   re-raising it can leave the counter above 0 with an empty channel, and
+   the slice re-checks the counter then. */
+#define EVENTFD_READ_SLICE_MS 1000
+/* Nothing signals "the counter dropped", so a full write re-checks on a
+   ladder of sleeps (1, 2, 4 ... 64 ms).  Linux programs almost never fill
+   an eventfd, so this path is rare. */
+#define EVENTFD_WRITE_SLICE_MAX_MS 64
+
+/* After a wait: another thread may have closed the guest's fd number, and
+   the number may now be something else.  The channel drain reads through
+   that number, so stop (EBADF) rather than read a stranger's data.  Linux
+   would finish the read on the old file; this is the safe approximation. */
+static int still_attached(struct guest_fd_object *object, int fd)
+{
+    struct guest_fd_object *current = guest_fd_acquire(fd);
+    int same = current == object;
+    guest_fd_put(current);
+    return same;
+}
+
 static int32_t eventfd_read(struct guest_fd_object *object, int fd,
     void *buffer, size_t length)
 {
     struct eventfd_data *data = guest_fd_object_data(object);
     uint64_t value;
     if (length < sizeof(value)) return -(int32_t)linux_errno_number(EINVAL);
-    value = take_counter(data, fd);
-    /* Blocking reads wait in Task 3; until then an empty counter is
-       EAGAIN either way. */
-    if (value == 0) return -(int32_t)linux_errno_number(EAGAIN);
+    for (;;) {
+        int32_t waited;
+        value = take_counter(data, fd);
+        if (value != 0) break;
+        if (data->shared->nonblock)
+            return -(int32_t)linux_errno_number(EAGAIN);
+        waited = wait_for_change(data, fd, 0, EVENTFD_READ_SLICE_MS);
+        if (waited == 0 && !still_attached(object, fd))
+            waited = -(int32_t)linux_errno_number(EBADF);
+        if (waited != 0) return waited;
+    }
     memcpy(buffer, &value, sizeof(value));
     return (int32_t)sizeof(value);
 }
@@ -169,13 +245,22 @@ static int32_t eventfd_write(struct guest_fd_object *object, int fd,
 {
     struct eventfd_data *data = guest_fd_object_data(object);
     uint64_t value;
-    (void)fd;
+    int slice = 1;
     if (length < sizeof(value)) return -(int32_t)linux_errno_number(EINVAL);
     memcpy(&value, buffer, sizeof(value));
     if (value == 0xffffffffffffffffULL)
         return -(int32_t)linux_errno_number(EINVAL);
-    if (!add_counter(data, value))
-        return -(int32_t)linux_errno_number(EAGAIN);
+    while (!add_counter(data, value)) {
+        int32_t waited;
+        if (data->shared->nonblock)
+            return -(int32_t)linux_errno_number(EAGAIN);
+        /* value != 0 here: a write of 0 always succeeds. */
+        waited = wait_for_change(data, fd, value, slice);
+        if (waited == 0 && !still_attached(object, fd))
+            waited = -(int32_t)linux_errno_number(EBADF);
+        if (waited != 0) return waited;
+        if (slice < EVENTFD_WRITE_SLICE_MAX_MS) slice *= 2;
+    }
     return (int32_t)sizeof(value);
 }
 
@@ -223,12 +308,19 @@ static int eventfd_serialize(struct guest_fd_object *object, int fd,
     return length < 0 || (size_t)length >= size ? -1 : length;
 }
 
+/* From the shared counter, not the channel: POLLOUT below the maximum,
+   and POLLRDNORM (Linux POLLIN) whenever the counter is above 0, which
+   also covers a channel emptied by a process killed before it re-raised
+   it (every guest wait goes through here before sleeping). */
 static short eventfd_ready_now(struct guest_fd_object *object, int fd)
 {
     struct eventfd_data *data = guest_fd_object_data(object);
+    uint64_t counter = load64(&data->shared->counter);
+    short ready = 0;
     (void)fd;
-    return load64(&data->shared->counter) < EVENTFD_COUNTER_MAX ?
-        POLLOUT : 0;
+    if (counter < EVENTFD_COUNTER_MAX) ready |= POLLOUT;
+    if (counter != 0) ready |= POLLRDNORM;
+    return ready;
 }
 
 static const struct guest_fd_ops eventfd_ops = {

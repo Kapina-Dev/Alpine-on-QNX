@@ -128,6 +128,11 @@ int guest_fd_is_hidden(int fd);
 int guest_fd_admit(int fd);
 /* The native fd QNX poll()/select() should watch for guest fd. */
 int guest_fd_poll_target(int fd);
+/* -1 when fd has no ready_now op (native, or a type without one); else
+   the host poll bits ops->ready_now reports.  For such an fd the op is
+   authoritative for write readiness (POLLOUT, POLLWRBAND): poll and select
+   take those bits from it, not from the native poll target. */
+int guest_fd_ready_now(int fd);
 /* The guest's RLIMIT_NOFILE is virtual: it starts at the hidden base, a
    raise is clamped to the base, and the host limit is never changed.  A
    lowered limit is stored and reported but not enforced. */

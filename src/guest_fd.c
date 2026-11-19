@@ -632,6 +632,16 @@ int guest_fd_poll_target(int fd)
     return target;
 }
 
+int guest_fd_ready_now(int fd)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int ready = -1;
+    if (object != 0 && object->ops->ready_now != 0)
+        ready = (unsigned short)object->ops->ready_now(object, fd);
+    guest_fd_put(object);
+    return ready;
+}
+
 void guest_fd_nofile_get(uint64_t *soft, uint64_t *hard)
 {
     *soft = nofile_soft;

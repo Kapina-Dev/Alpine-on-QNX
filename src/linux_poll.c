@@ -65,24 +65,43 @@ static int timespec_timeout(const void *address, int time64, int *milliseconds)
     return 0;
 }
 
+/* Host write bits a typed fd's ready_now decides instead of the native
+   poll target. */
+#define READY_NOW_WRITE_BITS (POLLOUT | POLLWRBAND)
+
 static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     int signal_wait_fd, int *signal_interrupted)
 {
     struct pollfd *host;
+    short *ready;
     uint32_t host_count = count + (signal_wait_fd >= 0 ? 1u : 0u);
     uint32_t i;
     int result;
     if (count > 65536u) return -EINVAL;
-    host = host_count == 0 ? 0 : calloc(host_count, sizeof(*host));
+    /* One allocation: the host array, then the ready_now bits per entry. */
+    host = host_count == 0 ? 0 : calloc(1,
+        host_count * sizeof(*host) + count * sizeof(*ready));
     if (host_count != 0 && host == 0) return -ENOMEM;
+    ready = host == 0 ? 0 : (short *)(void *)(host + host_count);
     for (i = 0; i != count; ++i)
         if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd)) timeout = 0;
     for (i = 0; i != count; ++i) {
+        short events = poll_events_to_host(guest[i].events);
+        int now = guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd) ? -1 :
+            guest_fd_ready_now(guest[i].fd);
         /* Hidden numbers are not the guest's: QNX skips a negative fd and
            the guest sees POLLNVAL, as Linux reports for a closed one. */
         host[i].fd = guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd) ? -1 :
             guest_fd_poll_target(guest[i].fd);
-        host[i].events = poll_events_to_host(guest[i].events);
+        host[i].events = events;
+        if (now >= 0) {
+            /* Readiness the native target can't show (an eventfd's
+               POLLOUT, its counter): reported as is, and nothing to wait
+               for when it meets the request. */
+            ready[i] = (short)(now & events);
+            host[i].events = (short)(events & ~READY_NOW_WRITE_BITS);
+            if (ready[i] != 0) timeout = 0;
+        }
     }
     if (signal_wait_fd >= 0) {
         host[count].fd = signal_wait_fd;
@@ -96,14 +115,16 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
         result = -1;
         errno = EINTR;
     }
-    if (result >= 0)
+    if (result >= 0) {
+        result = 0;
         for (i = 0; i != count; ++i) {
-            guest[i].revents = poll_events_to_linux(host[i].revents);
-            if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd)) {
+            guest[i].revents = poll_events_to_linux(
+                (short)(host[i].revents | ready[i]));
+            if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd))
                 guest[i].revents = 0x20;
-                ++result;
-            }
+            if (guest[i].revents != 0) ++result;
         }
+    }
     free(host);
     return result < 0 ? -(int32_t)linux_errno_number(errno) : result;
 }
@@ -132,8 +153,9 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
     uint32_t *guest_read = (uint32_t *)arguments[1];
     uint32_t *guest_write = (uint32_t *)arguments[2];
     uint32_t *guest_except = (uint32_t *)arguments[3];
-    fd_set read_set, write_set, except_set;
-    struct timeval timeout, *timeout_pointer = 0;
+    fd_set read_set, write_set, except_set, ready_read, ready_write;
+    struct timeval timeout, *timeout_pointer = 0, no_wait = { 0, 0 };
+    int ready_any = 0;
     sigset_t requested, old;
     uint32_t requested_words[2], old_words[2];
     int replace_mask = 0;
@@ -154,6 +176,32 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
     fdset_to_host(guest_read, count, &read_set);
     fdset_to_host(guest_write, count, &write_set);
     fdset_to_host(guest_except, count, &except_set);
+    FD_ZERO(&ready_read);
+    FD_ZERO(&ready_write);
+    {
+        /* Typed fds with ready_now: their write readiness comes from the
+           op (the native target leaves the write set), and readiness
+           reported here means select doesn't wait. */
+        int fd;
+        for (fd = 0; fd < count; ++fd) {
+            int now;
+            if (!FD_ISSET(fd, &read_set) && !FD_ISSET(fd, &write_set))
+                continue;
+            now = guest_fd_ready_now(fd);
+            if (now < 0) continue;
+            if (FD_ISSET(fd, &write_set)) {
+                FD_CLR(fd, &write_set);
+                if ((now & POLLOUT) != 0) {
+                    FD_SET(fd, &ready_write);
+                    ready_any = 1;
+                }
+            }
+            if (FD_ISSET(fd, &read_set) && (now & POLLRDNORM) != 0) {
+                FD_SET(fd, &ready_read);
+                ready_any = 1;
+            }
+        }
+    }
     if (arguments[4] != 0) {
         int64_t seconds, fraction;
         if (time64) {
@@ -200,7 +248,7 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
     result = select(host_count, (guest_read || signal_wait_fd >= 0) ?
         &read_set : 0,
         guest_write ? &write_set : 0, guest_except ? &except_set : 0,
-        timeout_pointer);
+        ready_any ? &no_wait : timeout_pointer);
     signal_interrupted = result < 0 && errno == EINTR;
     if (result > 0 && signal_wait_fd >= 0 &&
         FD_ISSET(signal_wait_fd, &read_set)) {
@@ -218,6 +266,17 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
         errno = saved_errno;
     }
     if (result < 0) return -(int32_t)linux_errno_number(errno);
+    if (ready_any) {
+        int fd;
+        result = 0;
+        for (fd = 0; fd < count; ++fd) {
+            if (FD_ISSET(fd, &ready_read)) FD_SET(fd, &read_set);
+            if (FD_ISSET(fd, &ready_write)) FD_SET(fd, &write_set);
+            if (guest_read != 0 && FD_ISSET(fd, &read_set)) ++result;
+            if (guest_write != 0 && FD_ISSET(fd, &write_set)) ++result;
+            if (guest_except != 0 && FD_ISSET(fd, &except_set)) ++result;
+        }
+    }
     fdset_to_guest(guest_read, count, &read_set);
     fdset_to_guest(guest_write, count, &write_set);
     fdset_to_guest(guest_except, count, &except_set);
