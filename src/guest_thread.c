@@ -464,8 +464,22 @@ int guest_thread_signal_wait_begin(void)
     struct guest_thread_state *state = current_thread();
     int descriptors[2];
     int flags;
+    int i;
     if (state == 0) { errno = EINVAL; return -1; }
     if (pipe(descriptors) != 0) return -1;
+    /* Emulator-owned: both ends move to the hidden range (close-on-exec),
+       so the guest's fd numbering never sees them.  No hidden number
+       free means the process is out of fds. */
+    for (i = 0; i != 2; ++i) {
+        int hidden = guest_fd_hide(descriptors[i]);
+        if (hidden < 0) {
+            int saved_errno = errno == EINVAL ? EMFILE : errno;
+            close(descriptors[0]); close(descriptors[1]);
+            errno = saved_errno;
+            return -1;
+        }
+        descriptors[i] = hidden;
+    }
     flags = fcntl(descriptors[0], F_GETFL, 0);
     if (flags < 0 || fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) != 0) {
         close(descriptors[0]); close(descriptors[1]); return -1;

@@ -136,6 +136,12 @@
 #define LINUX_NR_FCHMODAT 333
 #define LINUX_NR_FACCESSAT 334
 #define LINUX_NR_UTIMENSAT 348
+#define LINUX_NR_EPOLL_CREATE 250
+#define LINUX_NR_EPOLL_CTL 251
+#define LINUX_NR_EPOLL_WAIT 252
+#define LINUX_NR_EPOLL_PWAIT 346
+#define LINUX_NR_EPOLL_CREATE1 357
+#define LINUX_NR_EPOLL_PWAIT2 441
 #define LINUX_NR_EVENTFD 351
 #define LINUX_NR_EVENTFD2 356
 #define LINUX_NR_PSELECT6 335
@@ -2104,6 +2110,45 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_eventfd_create(context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);
         break;
+    case LINUX_NR_EPOLL_CREATE:
+        result = (int32_t)context->uc_mcontext.cpu.gpr[0] <= 0 ? -LINUX_EINVAL :
+            linux_epoll_create(0);
+        break;
+    case LINUX_NR_EPOLL_CREATE1:
+        result = linux_epoll_create(context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_EPOLL_CTL:
+        result = linux_epoll_ctl((int)context->uc_mcontext.cpu.gpr[0],
+            (int)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2],
+            (const void *)context->uc_mcontext.cpu.gpr[3]);
+        break;
+    case LINUX_NR_EPOLL_WAIT:
+        result = linux_epoll_wait((int)context->uc_mcontext.cpu.gpr[0],
+            (void *)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2],
+            (int)context->uc_mcontext.cpu.gpr[3], 0, 0);
+        break;
+    case LINUX_NR_EPOLL_PWAIT:
+        result = linux_epoll_wait((int)context->uc_mcontext.cpu.gpr[0],
+            (void *)context->uc_mcontext.cpu.gpr[1],
+            (int)context->uc_mcontext.cpu.gpr[2],
+            (int)context->uc_mcontext.cpu.gpr[3],
+            (const void *)context->uc_mcontext.cpu.gpr[4],
+            context->uc_mcontext.cpu.gpr[5]);
+        break;
+    case LINUX_NR_EPOLL_PWAIT2: {
+        int timeout;
+        result = linux_poll_timespec_timeout(
+            (const void *)context->uc_mcontext.cpu.gpr[3], 1, &timeout);
+        if (result == 0)
+            result = linux_epoll_wait((int)context->uc_mcontext.cpu.gpr[0],
+                (void *)context->uc_mcontext.cpu.gpr[1],
+                (int)context->uc_mcontext.cpu.gpr[2], timeout,
+                (const void *)context->uc_mcontext.cpu.gpr[4],
+                context->uc_mcontext.cpu.gpr[5]);
+        break;
+    }
     case LINUX_NR_PIPE2:
         result = linux_pipe((void *)context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);

@@ -173,6 +173,31 @@ extern void linuxemu_rt_signal_return_trampoline(void);
 
 int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6]);
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6]);
+/* Linux poll bits (also the low epoll bits) to host poll bits and back. */
+short linux_poll_events_to_host(short value);
+short linux_poll_events_to_linux(short value);
+/* A guest timespec (NULL: -1, wait forever) to milliseconds, nanoseconds
+   rounded up; 0 or -EINVAL. */
+int linux_poll_timespec_timeout(const void *address, int time64,
+    int *milliseconds);
+/* Fills entry for guest fd (not hidden) watching host events: the native
+   poll target, minus the write bits a typed fd's ready_now decides.
+   Returns the host bits ready_now reports ready now (0 when none). */
+struct pollfd;
+short linux_poll_target_entry(int fd, short events, struct pollfd *entry);
+/* The ppoll/epoll_pwait signal-mask protocol: begin swaps in the guest's
+   mask and opens the thread's signal-wait fd (signal_wait_fd, to poll
+   beside the guest's fds); end restores the mask, as after an interrupted
+   wait when interrupted is set.  begin returns 0 or a negative Linux
+   errno; end does nothing when begin was not called or failed. */
+struct linux_poll_mask {
+    sigset_t old;
+    uint32_t old_words[2];
+    int signal_wait_fd;
+};
+int32_t linux_poll_mask_begin(const void *guest_set, uint32_t size,
+    struct linux_poll_mask *mask);
+void linux_poll_mask_end(struct linux_poll_mask *mask, int interrupted);
 int32_t linux_resource_syscall(uint32_t number, uint32_t args[6]);
 void linux_resource_note_exec(const uint32_t args[6]);
 void linux_resource_after_fork(void);
@@ -238,6 +263,14 @@ int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags);
 /* Registers the eventfd exec restore (called by
    linux_syscall_register_fd_types). */
 void linux_eventfd_register(void);
+/* epoll_create (250) passes 0 after checking size > 0; epoll_create1
+   (357) passes its flags.  The guest fd or a negative Linux errno. */
+int32_t linux_epoll_create(uint32_t linux_flags);
+int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event);
+/* epoll_wait (252), epoll_pwait (346) and epoll_pwait2 (441, timespec
+   converted by the caller); sigmask 0 means none. */
+int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
+    int timeout_ms, const void *sigmask, uint32_t sigsetsize);
 int install_guest_traps(void);
 
 #endif

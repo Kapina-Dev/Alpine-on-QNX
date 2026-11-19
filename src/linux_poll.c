@@ -1,3 +1,9 @@
+/* Host fd_sets cover every fd number (guest and hidden, GUEST_FD_SLOTS in
+   guest_fd.c): pselect6 watches the thread's signal-wait fd, which lives
+   in the hidden range above QNX's default 256.  QNX select() takes sets of
+   any size (measured on the device: a pipe at fd 800 is reported). */
+#define FD_SETSIZE 4096
+
 #include "linuxemu.h"
 #include "guest_fd.h"
 
@@ -19,7 +25,7 @@
 
 struct linux_pollfd { int32_t fd; int16_t events; int16_t revents; };
 
-static short poll_events_to_host(short value)
+short linux_poll_events_to_host(short value)
 {
     short result = 0;
     if (value & (0x001 | 0x040)) result |= POLLRDNORM;
@@ -30,7 +36,7 @@ static short poll_events_to_host(short value)
     return result;
 }
 
-static short poll_events_to_linux(short value)
+short linux_poll_events_to_linux(short value)
 {
     short result = 0;
     if (value & POLLRDNORM) result |= 0x001 | 0x040;
@@ -44,7 +50,8 @@ static short poll_events_to_linux(short value)
     return result;
 }
 
-static int timespec_timeout(const void *address, int time64, int *milliseconds)
+int linux_poll_timespec_timeout(const void *address, int time64,
+    int *milliseconds)
 {
     int64_t seconds;
     int64_t nanoseconds;
@@ -69,6 +76,58 @@ static int timespec_timeout(const void *address, int time64, int *milliseconds)
    poll target. */
 #define READY_NOW_WRITE_BITS (POLLOUT | POLLWRBAND)
 
+short linux_poll_target_entry(int fd, short events, struct pollfd *entry)
+{
+    int now = guest_fd_ready_now(fd);
+    entry->fd = guest_fd_poll_target(fd);
+    entry->events = events;
+    entry->revents = 0;
+    if (now < 0) return 0;
+    /* Readiness the native target can't show (an eventfd's POLLOUT, its
+       counter): reported as is, and nothing to wait for when it meets the
+       request. */
+    entry->events = (short)(events & ~READY_NOW_WRITE_BITS);
+    return (short)(now & events);
+}
+
+int32_t linux_poll_mask_begin(const void *guest_set, uint32_t size,
+    struct linux_poll_mask *mask)
+{
+    sigset_t requested;
+    uint32_t requested_words[2];
+    int result = guest_signal_host_mask(guest_set, size, &requested);
+    mask->signal_wait_fd = -1;
+    if (result != 0) return result;
+    memcpy(requested_words, guest_set, sizeof(requested_words));
+    /* SIGKILL and SIGSTOP can't be blocked. */
+    requested_words[0] &= ~((1u << (9 - 1)) | (1u << (19 - 1)));
+    guest_thread_signal_mask_get(mask->old_words);
+    mask->signal_wait_fd = guest_thread_signal_wait_begin();
+    if (mask->signal_wait_fd < 0)
+        return -(int32_t)linux_errno_number(errno);
+    if (sigprocmask(SIG_SETMASK, &requested, &mask->old) != 0) {
+        int saved_errno = errno;
+        guest_thread_signal_wait_end();
+        mask->signal_wait_fd = -1;
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    guest_thread_signal_mask_set(requested_words);
+    guest_thread_signal_wait_arm();
+    return 0;
+}
+
+void linux_poll_mask_end(struct linux_poll_mask *mask, int interrupted)
+{
+    int saved_errno = errno;
+    if (mask->signal_wait_fd < 0) return;
+    if (interrupted) guest_thread_signal_wait_interrupted(mask->old_words);
+    else guest_thread_signal_wait_complete(mask->old_words);
+    sigprocmask(SIG_SETMASK, &mask->old, 0);
+    guest_thread_signal_wait_end();
+    mask->signal_wait_fd = -1;
+    errno = saved_errno;
+}
+
 static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     int signal_wait_fd, int *signal_interrupted)
 {
@@ -86,22 +145,16 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     for (i = 0; i != count; ++i)
         if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd)) timeout = 0;
     for (i = 0; i != count; ++i) {
-        short events = poll_events_to_host(guest[i].events);
-        int now = guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd) ? -1 :
-            guest_fd_ready_now(guest[i].fd);
+        short events = linux_poll_events_to_host(guest[i].events);
         /* Hidden numbers are not the guest's: QNX skips a negative fd and
            the guest sees POLLNVAL, as Linux reports for a closed one. */
-        host[i].fd = guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd) ? -1 :
-            guest_fd_poll_target(guest[i].fd);
-        host[i].events = events;
-        if (now >= 0) {
-            /* Readiness the native target can't show (an eventfd's
-               POLLOUT, its counter): reported as is, and nothing to wait
-               for when it meets the request. */
-            ready[i] = (short)(now & events);
-            host[i].events = (short)(events & ~READY_NOW_WRITE_BITS);
-            if (ready[i] != 0) timeout = 0;
+        if (guest[i].fd < 0 || guest_fd_is_hidden(guest[i].fd)) {
+            host[i].fd = -1;
+            host[i].events = events;
+            continue;
         }
+        ready[i] = linux_poll_target_entry(guest[i].fd, events, &host[i]);
+        if (ready[i] != 0) timeout = 0;
     }
     if (signal_wait_fd >= 0) {
         host[count].fd = signal_wait_fd;
@@ -118,7 +171,7 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     if (result >= 0) {
         result = 0;
         for (i = 0; i != count; ++i) {
-            guest[i].revents = poll_events_to_linux(
+            guest[i].revents = linux_poll_events_to_linux(
                 (short)(host[i].revents | ready[i]));
             if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd))
                 guest[i].revents = 0x20;
@@ -295,47 +348,20 @@ int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6])
             (int)arguments[2], -1, 0);
     if (number == LINUX_NR_PPOLL || number == LINUX_NR_PPOLL_TIME64) {
         int timeout;
-        int result = timespec_timeout((void *)arguments[2],
+        int result = linux_poll_timespec_timeout((void *)arguments[2],
             number == LINUX_NR_PPOLL_TIME64, &timeout);
-        sigset_t requested, old;
-        uint32_t requested_words[2], old_words[2];
-        int replace_mask = 0;
-        int signal_wait_fd = -1;
+        struct linux_poll_mask mask;
         int signal_interrupted = 0;
         if (result != 0) return result;
+        mask.signal_wait_fd = -1;
         if (arguments[3] != 0) {
-            result = guest_signal_host_mask((void *)arguments[3], arguments[4],
-                &requested);
+            result = linux_poll_mask_begin((void *)arguments[3], arguments[4],
+                &mask);
             if (result != 0) return result;
-            memcpy(requested_words, (void *)arguments[3],
-                sizeof(requested_words));
-            requested_words[0] &=
-                ~((1u << (9 - 1)) | (1u << (19 - 1)));
-            guest_thread_signal_mask_get(old_words);
-            signal_wait_fd = guest_thread_signal_wait_begin();
-            if (signal_wait_fd < 0)
-                return -(int32_t)linux_errno_number(errno);
-            if (sigprocmask(SIG_SETMASK, &requested, &old) != 0)
-                {
-                    int saved_errno = errno;
-                    guest_thread_signal_wait_end();
-                    return -(int32_t)linux_errno_number(saved_errno);
-                }
-            guest_thread_signal_mask_set(requested_words);
-            guest_thread_signal_wait_arm();
-            replace_mask = 1;
         }
         result = do_poll((struct linux_pollfd *)arguments[0], arguments[1],
-            timeout, signal_wait_fd, &signal_interrupted);
-        if (replace_mask) {
-            int saved_errno = errno;
-            if (signal_interrupted)
-                guest_thread_signal_wait_interrupted(old_words);
-            else guest_thread_signal_wait_complete(old_words);
-            sigprocmask(SIG_SETMASK, &old, 0);
-            guest_thread_signal_wait_end();
-            errno = saved_errno;
-        }
+            timeout, mask.signal_wait_fd, &signal_interrupted);
+        linux_poll_mask_end(&mask, signal_interrupted);
         return result;
     }
     if (number == LINUX_NR_SELECT) {
