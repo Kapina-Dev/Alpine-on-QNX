@@ -151,9 +151,20 @@ Limits of the Phase 3 part 1 calls (eventfd and epoll):
 
 - **Capacity.** Each process keeps 256 host descriptors hidden for the
   emulator, so the guest's `RLIMIT_NOFILE` is 744 on the Passport (936
-  before). An eventfd uses two hidden descriptors and an epoll one, so a
-  process holds about 128 eventfds (fewer with epolls, signal-wait pipes
-  and other hidden descriptors). Running out returns `EMFILE`.
+  before). An eventfd uses two hidden descriptors and an epoll two (its
+  wake channel's write end and a private duplicate of its read end, so a
+  wait never depends on the guest's epoll fd number staying open), so a
+  process holds about 128 eventfds, fewer with epolls and other hidden
+  descriptors. Running out returns `EMFILE`.
+- **Signal-wait channels.** A thread that blocks in an eventfd `read` or
+  `write`, or in `ppoll`, `pselect6` or `epoll_pwait` with a signal mask,
+  gets one signal-wait channel on its first such wait and keeps it until
+  it exits: a loopback UDP socket connected to itself (one hidden
+  descriptor), or a pipe (two) if the socket can't be made. About 250
+  threads can therefore be blocked at once (200 are tested); before this a
+  fresh two-descriptor pipe per wait ran out at 127. Threads that waited
+  once keep their descriptor while idle, so very many such threads still
+  reach `EMFILE`.
 - **Fork copies an epoll.** Linux shares one epoll between parent and
   child; here the child gets an independent copy of the interest list, and
   a change in one process isn't seen by the other. nginx, Redis and
@@ -210,11 +221,19 @@ Limits of the Phase 3 part 1 calls (eventfd and epoll):
   - More than 253 guest fds in one message returns `EINVAL`, as on Linux.
     Each eventfd adds two hidden descriptors to the host message; how many
     descriptors QNX accepts in one message isn't measured.
+  - The `LXRIGHT1` descriptor map that carries the hidden fds is ordinary
+    message data, so a guest can forge one. A forged map affects only that
+    guest's own message.
 - **Nesting and exec.** A process holds at most 256 nested epoll
   registrations (an epoll inside another); more returns `ENOMEM` and is
   reported as `epoll-nest-table-full`. An epoll kept across `execve` (no
   `EPOLL_CLOEXEC`) carries about 21 to 30 items; a longer list arrives
   empty and is reported as `epoll-exec-list-too-long`.
+- **Exec records.** Descriptor records travel to the new image in a 32 KB
+  environment entry. A record that doesn't fit is left out on its own and
+  reported as `exec-fd-record-dropped` (its fd survives `execve` as a plain
+  native fd); the other records still travel. Before, one oversized record
+  dropped them all.
 - `select` and `pselect6` accept descriptor numbers up to 4096 (QNX's own
   `FD_SETSIZE` is 256); Linux bounds them only by `RLIMIT_NOFILE`.
 

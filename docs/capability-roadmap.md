@@ -419,6 +419,21 @@ Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
   full) are now reported in `LINUXEMU_DIAGNOSTICS`.
 - `sendmsg` with more than 253 fds returns `EINVAL`, as Linux's
   `SCM_MAX_FD`.
+- Final review fixes:
+  - An epoll waiter polled and drained the guest's own epoll fd number. If
+    another thread closed it, a later wake write raised `SIGPIPE`, and a
+    reused number had its data eaten by the drain. The wait now uses a
+    hidden duplicate of the wake read end (epoll-concurrent check 34).
+  - Each blocking eventfd op and masked `ppoll`/`pselect6`/`epoll_pwait`
+    made and closed a two-fd pipe, so 127 blocked threads exhausted the
+    hidden reserve (`EMFILE` from `read`). Each thread now keeps one
+    signal-wait channel (a self-connected loopback UDP socket, one fd;
+    pipe fallback), drained at each wait and closed only at thread exit
+    (numbers withdrawn before the close) and in the fork child
+    (eventfd-blocking check 18, 200 threads).
+  - Exec records: one oversized record dropped every record; now only that
+    record is dropped, with an `exec-fd-record-dropped` diagnostic.
+  - The diagnostics errno table names `E2BIG`.
 
 **Gate results.**
 
@@ -455,12 +470,20 @@ Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
   proves a page mapped, not writable.
 - `readv`/`writev` don't refuse hidden descriptors (pre-existing; matters
   more with eventfd's hidden fds).
-- The signal-wait pipe briefly holds the two lowest free guest fd numbers
-  while it is moved into the hidden range.
+- A thread's signal-wait channel is made once (socket or pipe) and briefly
+  holds the lowest free guest fd numbers while it is moved into the hidden
+  range. Threads that ever waited keep one hidden fd while idle.
 - Every `epoll_ctl` takes the process-wide `fd_replace_lock`, a throughput
   cost for Looper/Binder-style `ctl` churn.
-- The diagnostics errno table has no `E2BIG`, so `epoll-exec-list-too-long`
-  prints `error=E7`.
+- M4 (review): `guest_fd_acquire`'s stale-record drop can release the
+  last reference under an epoll instance lock; if that were an epoll
+  object its release would take the registry lock against the lock order.
+  No path reaches it today (it needs an epoll number closed natively
+  without `guest_fd_clear`); a guard comment marks it in `guest_fd.c`.
+- M5 (review): `fork` while another thread is mid-way through an epoll
+  instance edit (`ctl`, close hook) can hand the child a half-updated
+  interest list; the child re-initialises the locks but doesn't repair the
+  list.
 - Smaller items from the reviews: an eventfd `F_SETFL` keeps
   only `O_NONBLOCK`; a failed exec restore leaks two carried hidden fds;
   a current-generation waiter can loop briefly while a wake byte remains;
