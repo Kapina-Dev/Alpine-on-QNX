@@ -1,5 +1,5 @@
 #!/bin/sh
-# Phase 3 event objects: eventfd and epoll guest fixtures.
+# Phase 3 event objects: eventfd, epoll and timerfd guest fixtures.
 set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -49,6 +49,7 @@ run_rootfs_fixture epoll-concurrent
 run_rootfs_fixture epoll-modes
 run_rootfs_fixture epoll-nesting
 run_rootfs_fixture looper-pattern
+run_rootfs_fixture timerfd-basic
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"

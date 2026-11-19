@@ -128,6 +128,8 @@ int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
     int value;
     struct winsize window;
     switch (request) {
+    case LINUX_TFD_IOC_SET_TICKS:
+        return linux_timerfd_set_ticks(fd, guest_argument);
     case LINUX_TCGETS: return termios_get(fd, guest_argument);
     case LINUX_TCSETS:
     case LINUX_TCSETSW:

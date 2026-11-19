@@ -12,7 +12,7 @@
  * No lock.  QNX has no robust mutexes, and a process-shared mutex whose
  * owner dies stays locked forever (FINDINGS 2026-11-19), so the counter is
  * updated only by a 64-bit compare-and-swap and the channel byte is a hint
- * kept by the rules in raise_channel() and settle_channel().
+ * kept by the rules in eventfd_channel_raise() and eventfd_channel_settle().
  */
 #include "linuxemu.h"
 #include "guest_fd.h"
@@ -31,14 +31,6 @@
 #define LINUX_EFD_NONBLOCK 0x00000800u
 #define LINUX_EFD_CLOEXEC 0x00080000u
 #define EVENTFD_COUNTER_MAX 0xfffffffffffffffeULL
-#define EVENTFD_PAGE 4096
-
-struct eventfd_shared {
-    uint64_t counter;
-    uint32_t channel_full;
-    uint32_t nonblock;
-    uint32_t semaphore;
-};
 
 /* Per process: the mapping and the hidden fds.  The guest's fd (a dup of
    the pipe read end) is passed to every op. */
@@ -88,16 +80,21 @@ static uint64_t cas64(volatile uint64_t *pointer, uint64_t expected,
 /* The readiness channel.  Invariant once operations settle: counter > 0
    implies channel_full == 1 implies the pipe holds a byte.  A byte with
    counter 0 can remain after a race; the next read that finds the counter
-   empty removes it (settle_channel), and until then a nonblocking read
+   empty removes it (eventfd_channel_settle), and until then a nonblocking read
    returns EAGAIN, as a spurious wakeup does on Linux. */
+
+/* The protocol is exported (linuxemu.h) for the other counter-backed
+   objects (timerfd, signalfd): each passes its page's struct
+   eventfd_shared, its hidden channel write end, and the guest's fd (the
+   channel read end) where the channel may be drained. */
 
 /* After moving the counter from 0 to non-zero, or finding it non-zero
    after a settle: the winner of channel_full 0 -> 1 writes the byte. */
-static void raise_channel(struct eventfd_data *data)
+void eventfd_channel_raise(struct eventfd_shared *shared, int write_fd)
 {
     static const char byte = 1;
-    if (__sync_val_compare_and_swap(&data->shared->channel_full, 0, 1) == 0)
-        (void)write(data->write_fd, &byte, 1);
+    if (__sync_val_compare_and_swap(&shared->channel_full, 0, 1) == 0)
+        (void)write(write_fd, &byte, 1);
 }
 
 /* After moving the counter to 0, or finding it 0: empty the pipe, then
@@ -105,39 +102,47 @@ static void raise_channel(struct eventfd_data *data)
    clear matters: a writer that raised in between keeps channel_full at 1
    until our clear, and our re-check then sees its count and raises again,
    so a drained byte is always replaced. */
-static void settle_channel(struct eventfd_data *data, int read_fd)
+void eventfd_channel_settle(struct eventfd_shared *shared, int write_fd,
+    int read_fd)
 {
     char sink[64];
     while (read(read_fd, sink, sizeof(sink)) > 0) {}
-    (void)__sync_lock_test_and_set(&data->shared->channel_full, 0);
+    (void)__sync_lock_test_and_set(&shared->channel_full, 0);
     __sync_synchronize();
-    if (load64(&data->shared->counter) != 0) raise_channel(data);
+    if (load64(&shared->counter) != 0) eventfd_channel_raise(shared, write_fd);
+}
+
+uint64_t eventfd_counter_load(struct eventfd_shared *shared)
+{
+    return load64(&shared->counter);
 }
 
 /* Takes what a read returns: the whole counter, or 1 in semaphore mode.
    0 when the counter is empty. */
-static uint64_t take_counter(struct eventfd_data *data, int read_fd)
+uint64_t eventfd_counter_take(struct eventfd_shared *shared, int write_fd,
+    int read_fd)
 {
-    volatile uint64_t *counter = &data->shared->counter;
+    volatile uint64_t *counter = &shared->counter;
     uint64_t seen = load64(counter);
     for (;;) {
         uint64_t taken, after, swapped;
         if (seen == 0) break;
-        taken = data->shared->semaphore ? 1 : seen;
+        taken = shared->semaphore ? 1 : seen;
         after = seen - taken;
         swapped = cas64(counter, seen, after);
         if (swapped != seen) { seen = swapped; continue; }
-        if (after == 0) settle_channel(data, read_fd);
+        if (after == 0) eventfd_channel_settle(shared, write_fd, read_fd);
         return taken;
     }
-    settle_channel(data, read_fd);
+    eventfd_channel_settle(shared, write_fd, read_fd);
     return 0;
 }
 
 /* Adds value; 0 when it would pass the maximum. */
-static int add_counter(struct eventfd_data *data, uint64_t value)
+int eventfd_counter_add(struct eventfd_shared *shared, int write_fd,
+    uint64_t value)
 {
-    volatile uint64_t *counter = &data->shared->counter;
+    volatile uint64_t *counter = &shared->counter;
     uint64_t seen = load64(counter);
     if (value == 0) return 1;
     for (;;) {
@@ -147,8 +152,20 @@ static int add_counter(struct eventfd_data *data, uint64_t value)
         if (swapped == seen) break;
         seen = swapped;
     }
-    if (seen == 0) raise_channel(data);
+    if (seen == 0) eventfd_channel_raise(shared, write_fd);
     return 1;
+}
+
+/* Replaces the counter (timerfd re-arm and TFD_IOC_SET_TICKS), then
+   raises or settles the channel to match. */
+void eventfd_counter_set(struct eventfd_shared *shared, int write_fd,
+    int read_fd, uint64_t value)
+{
+    volatile uint64_t *counter = &shared->counter;
+    uint64_t seen = load64(counter), swapped;
+    while ((swapped = cas64(counter, seen, value)) != seen) seen = swapped;
+    if (value != 0) eventfd_channel_raise(shared, write_fd);
+    else eventfd_channel_settle(shared, write_fd, read_fd);
 }
 
 /* Blocking waits.  Nothing is held while waiting: the counter is only
@@ -228,7 +245,7 @@ static int32_t eventfd_read(struct guest_fd_object *object, int fd,
     if (length < sizeof(value)) return -(int32_t)linux_errno_number(EINVAL);
     for (;;) {
         int32_t waited;
-        value = take_counter(data, fd);
+        value = eventfd_counter_take(data->shared, data->write_fd, fd);
         if (value != 0) break;
         if (data->shared->nonblock)
             return -(int32_t)linux_errno_number(EAGAIN);
@@ -251,7 +268,7 @@ static int32_t eventfd_write(struct guest_fd_object *object, int fd,
     memcpy(&value, buffer, sizeof(value));
     if (value == 0xffffffffffffffffULL)
         return -(int32_t)linux_errno_number(EINVAL);
-    while (!add_counter(data, value)) {
+    while (!eventfd_counter_add(data->shared, data->write_fd, value)) {
         int32_t waited;
         if (data->shared->nonblock)
             return -(int32_t)linux_errno_number(EAGAIN);
@@ -393,9 +410,9 @@ static int hide(int fd)
 }
 
 /* A fresh unnamed shm page, hidden. */
-static int create_page(void)
+static int create_page(const char *prefix)
 {
-    int fd = guest_fd_unnamed_shm("/linuxemu-eventfd-", EVENTFD_PAGE), hidden;
+    int fd = guest_fd_unnamed_shm(prefix, EVENTFD_PAGE), hidden;
     if (fd < 0) return -1;
     hidden = hide(fd);
     if (hidden < 0) {
@@ -412,34 +429,58 @@ static int set_status_flag(int fd, int flag)
     return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | flag);
 }
 
-int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags)
+int eventfd_channel_open(const char *shm_prefix, int cloexec, int fds[3],
+    void **page)
 {
     int channel[2] = { -1, -1 }, shm_fd = -1, saved_errno;
-    struct eventfd_shared *shared;
-
-    if ((linux_flags & ~(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK |
-            LINUX_EFD_CLOEXEC)) != 0)
-        return -(int32_t)linux_errno_number(EINVAL);
-    if (pipe(channel) != 0) return -(int32_t)linux_errno_number(errno);
+    void *mapped;
+    if (pipe(channel) != 0) return -1;
     if (guest_fd_admit(channel[0]) < 0) {
         saved_errno = errno;
         close(channel[1]);
-        return -(int32_t)linux_errno_number(saved_errno);
+        errno = saved_errno;
+        return -1;
     }
     if (set_status_flag(channel[0], O_NONBLOCK) != 0 ||
             set_status_flag(channel[1], O_NONBLOCK) != 0 ||
-            ((linux_flags & LINUX_EFD_CLOEXEC) != 0 &&
-            fcntl(channel[0], F_SETFD, FD_CLOEXEC) != 0))
+            (cloexec && fcntl(channel[0], F_SETFD, FD_CLOEXEC) != 0))
         goto fail;
     {
         int hidden = hide(channel[1]);
         if (hidden < 0) goto fail;
         channel[1] = hidden;
     }
-    shm_fd = create_page();
+    shm_fd = create_page(shm_prefix);
     if (shm_fd < 0) goto fail;
-    shared = map_page(shm_fd);
-    if (shared == 0) goto fail;
+    mapped = map_page(shm_fd);
+    if (mapped == 0) goto fail;
+    fds[0] = channel[0];
+    fds[1] = channel[1];
+    fds[2] = shm_fd;
+    *page = mapped;
+    return 0;
+fail:
+    saved_errno = errno;
+    close(channel[0]);
+    if (channel[1] >= 0) close(channel[1]);
+    if (shm_fd >= 0) close(shm_fd);
+    errno = saved_errno;
+    return -1;
+}
+
+int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags)
+{
+    int fds[3], saved_errno;
+    void *page;
+    struct eventfd_shared *shared;
+
+    if ((linux_flags & ~(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK |
+            LINUX_EFD_CLOEXEC)) != 0)
+        return -(int32_t)linux_errno_number(EINVAL);
+    if (eventfd_channel_open("/linuxemu-eventfd-",
+            (linux_flags & LINUX_EFD_CLOEXEC) != 0, fds, &page) != 0)
+        return -(int32_t)linux_errno_number(errno);
+    shared = page;
     /* The page is fresh (zero) and nobody else sees it yet. */
     shared->semaphore = (linux_flags & LINUX_EFD_SEMAPHORE) != 0;
     shared->nonblock = (linux_flags & LINUX_EFD_NONBLOCK) != 0;
@@ -447,7 +488,7 @@ int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags)
         static const char byte = 1;
         shared->counter = initial;
         shared->channel_full = 1;
-        if (write(channel[1], &byte, 1) != 1) {
+        if (write(fds[1], &byte, 1) != 1) {
             saved_errno = errno;
             munmap(shared, EVENTFD_PAGE);
             errno = saved_errno;
@@ -455,13 +496,13 @@ int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags)
         }
     }
     __sync_synchronize();
-    if (attach_object(channel[0], channel[1], shm_fd, shared) != 0) goto fail;
-    return channel[0];
+    if (attach_object(fds[0], fds[1], fds[2], shared) != 0) goto fail;
+    return fds[0];
 fail:
     saved_errno = errno;
-    close(channel[0]);
-    if (channel[1] >= 0) close(channel[1]);
-    if (shm_fd >= 0) close(shm_fd);
+    close(fds[0]);
+    close(fds[1]);
+    close(fds[2]);
     return -(int32_t)linux_errno_number(saved_errno);
 }
 

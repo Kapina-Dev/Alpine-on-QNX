@@ -268,6 +268,52 @@ int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags);
 /* Registers the eventfd exec restore (called by
    linux_syscall_register_fd_types). */
 void linux_eventfd_register(void);
+/* eventfd's lock-free counter and readiness channel, shared by the other
+   counter-backed objects (timerfd, signalfd).  The state lives at the
+   start of one unnamed shm page; the guest's fd is a pipe read end that
+   holds a byte while the counter is non-zero.  write_fd is the hidden
+   channel write end, read_fd the guest's fd (drained by a settle). */
+#define EVENTFD_PAGE 4096
+struct eventfd_shared {
+    uint64_t counter;
+    uint32_t channel_full;
+    uint32_t nonblock;
+    uint32_t semaphore;
+};
+/* Adds value (raising the channel on 0 -> non-zero); 0 when the counter
+   would pass 0xfffffffffffffffe. */
+int eventfd_counter_add(struct eventfd_shared *shared, int write_fd,
+    uint64_t value);
+/* Takes the whole counter (1 in semaphore mode) and settles the channel
+   when it reaches 0; returns 0 when empty. */
+uint64_t eventfd_counter_take(struct eventfd_shared *shared, int write_fd,
+    int read_fd);
+/* Replaces the counter, then raises (non-zero) or settles (zero). */
+void eventfd_counter_set(struct eventfd_shared *shared, int write_fd,
+    int read_fd, uint64_t value);
+uint64_t eventfd_counter_load(struct eventfd_shared *shared);
+void eventfd_channel_raise(struct eventfd_shared *shared, int write_fd);
+/* Drain, clear channel_full, re-check the counter (and re-raise). */
+void eventfd_channel_settle(struct eventfd_shared *shared, int write_fd,
+    int read_fd);
+/* A new channel: fds[0] the guest's pipe read end (admitted, nonblocking,
+   FD_CLOEXEC when cloexec), fds[1] the hidden nonblocking write end,
+   fds[2] a hidden zeroed shm page of EVENTFD_PAGE bytes mapped at *page.
+   0, or -1 with errno and nothing left open. */
+int eventfd_channel_open(const char *shm_prefix, int cloexec, int fds[3],
+    void **page);
+/* timerfd (linux_timerfd.c): timerfd_create (350), timerfd_settime (353,
+   time64 411) and timerfd_gettime (354, time64 410).  time64 selects the
+   guest itimerspec layout (two 16-byte timespecs instead of two 8-byte
+   ones).  Each returns 0, the guest fd, or a negative Linux errno. */
+int32_t linux_timerfd_create(int32_t clock, uint32_t flags);
+int32_t linux_timerfd_settime(int fd, uint32_t flags, const void *new_spec,
+    void *old_spec, int time64);
+int32_t linux_timerfd_gettime(int fd, void *spec, int time64);
+/* TFD_IOC_SET_TICKS (0x40085400): 0, or -ENOTTY when fd is no timerfd. */
+#define LINUX_TFD_IOC_SET_TICKS 0x40085400u
+int32_t linux_timerfd_set_ticks(int fd, const void *guest_ticks);
+void linux_timerfd_after_fork(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);

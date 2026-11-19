@@ -143,6 +143,11 @@
 #define LINUX_NR_EPOLL_CREATE1 357
 #define LINUX_NR_EPOLL_PWAIT2 441
 #define LINUX_NR_EVENTFD 351
+#define LINUX_NR_TIMERFD_CREATE 350
+#define LINUX_NR_TIMERFD_SETTIME 353
+#define LINUX_NR_TIMERFD_GETTIME 354
+#define LINUX_NR_TIMERFD_GETTIME64 410
+#define LINUX_NR_TIMERFD_SETTIME64 411
 #define LINUX_NR_EVENTFD2 356
 #define LINUX_NR_PSELECT6 335
 #define LINUX_NR_PPOLL 336
@@ -2135,6 +2140,24 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_EVENTFD2:
         result = linux_eventfd_create(context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_TIMERFD_CREATE:
+        result = linux_timerfd_create((int32_t)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_TIMERFD_SETTIME:
+    case LINUX_NR_TIMERFD_SETTIME64:
+        result = linux_timerfd_settime((int)context->uc_mcontext.cpu.gpr[0],
+            context->uc_mcontext.cpu.gpr[1],
+            (const void *)context->uc_mcontext.cpu.gpr[2],
+            (void *)context->uc_mcontext.cpu.gpr[3],
+            number == LINUX_NR_TIMERFD_SETTIME64);
+        break;
+    case LINUX_NR_TIMERFD_GETTIME:
+    case LINUX_NR_TIMERFD_GETTIME64:
+        result = linux_timerfd_gettime((int)context->uc_mcontext.cpu.gpr[0],
+            (void *)context->uc_mcontext.cpu.gpr[1],
+            number == LINUX_NR_TIMERFD_GETTIME64);
         break;
     case LINUX_NR_EPOLL_CREATE:
         result = (int32_t)context->uc_mcontext.cpu.gpr[0] <= 0 ? -LINUX_EINVAL :
