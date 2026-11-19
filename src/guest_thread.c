@@ -759,6 +759,22 @@ int guest_thread_route_signal(int linux_signal, const siginfo_t *information,
     return routed;
 }
 
+/* After the collector queued linux_signal in the process queue: pokes
+   every guest thread whose (maybe temporary) mask lets it in, so one that
+   unblocked it after the routing check still takes it (its poke handler
+   delivers it in guest code, or wakes its wait in a syscall).  Under the
+   registry lock, so every poked thread exists. */
+void guest_thread_poke_unblocked(int linux_signal, int poke_host_signal)
+{
+    struct guest_thread_state *state;
+    if (linux_signal <= 0 || linux_signal > 64) return;
+    pthread_mutex_lock(&thread_registry_lock);
+    for (state = thread_registry; state != 0; state = state->next)
+        if (!mask_has(state->signal_mask, linux_signal))
+            (void)pthread_kill(state->host_thread, poke_host_signal);
+    pthread_mutex_unlock(&thread_registry_lock);
+}
+
 void guest_thread_signal_mask_get(uint32_t words[2])
 {
     struct guest_thread_state *state = current_thread();
@@ -780,6 +796,18 @@ void guest_thread_signal_suspend_restore(const uint32_t words[2])
         memcpy(state->suspend_restore_mask, words,
             sizeof(state->suspend_restore_mask));
         state->suspend_restore_valid = 1;
+    }
+}
+
+/* A masked wait returned EINTR but nothing was delivered: the thread goes
+   back to the mask it had before the wait. */
+void guest_thread_signal_suspend_cancel(void)
+{
+    struct guest_thread_state *state = current_thread();
+    if (state != 0 && state->suspend_restore_valid) {
+        memcpy(state->signal_mask, state->suspend_restore_mask,
+            sizeof(state->signal_mask));
+        state->suspend_restore_valid = 0;
     }
 }
 
@@ -850,39 +878,57 @@ int guest_thread_signal_wait_begin(void)
     return state->signal_wait_read_fd;
 }
 
+/* A signal this thread would act on now under its current (maybe
+   temporary) mask: one in its own queue, or one in the process queue (the
+   collector routed it here, or the mask now lets it in) whose action does
+   something (guest_signal_acting_mask: a handler, or a default that ends
+   or stops the process; ignored ones only get discarded). */
+static int signal_ready(struct guest_thread_state *state)
+{
+    int signal_number;
+    uint32_t process[2], acting[2];
+    guest_process_pending_mask(process, 1);
+    if ((process[0] | process[1]) != 0) {
+        guest_signal_acting_mask(acting);
+        if ((process[0] & acting[0] & ~state->signal_mask[0]) != 0 ||
+                (process[1] & acting[1] & ~state->signal_mask[1]) != 0)
+            return 1;
+    }
+    if ((state->pending_signals[0] & ~state->signal_mask[0] & 0x7fffffffu)
+            != 0)
+        return 1;
+    for (signal_number = LINUX_FIRST_REALTIME_SIGNAL;
+        signal_number <= LINUX_LAST_REALTIME_SIGNAL; ++signal_number) {
+        int index = signal_number - LINUX_FIRST_REALTIME_SIGNAL;
+        if (!mask_has(state->signal_mask, signal_number) &&
+                state->realtime_head[index] != state->realtime_tail[index])
+            return 1;
+    }
+    return 0;
+}
+
+int guest_thread_signal_ready(void)
+{
+    struct guest_thread_state *state = current_thread();
+    return state != 0 && signal_ready(state);
+}
+
+/* Every masked wait (ppoll, pselect6, epoll_pwait, rt_sigsuspend) runs
+   this after taking its temporary mask: a signal already queued that the
+   mask lets in posts the wait byte, so the wait returns EINTR at once and
+   the trap's return delivers it.  Queued signals the mask lets in whose
+   action ignores them are dropped first, as Linux discards them. */
 void guest_thread_signal_wait_arm(void)
 {
     struct guest_thread_state *state = current_thread();
     unsigned char byte = 1;
-    int signal_number;
-    uint32_t process[2], handled[2];
+    uint32_t unblocked[2];
     if (state == 0 || state->signal_wait_write_fd < 0) return;
-    /* A signal in the process queue this thread would take now: one the
-       collector routed to it, or one its (temporary) mask now lets in.
-       Default and ignored actions are left to delivery (Task 5). */
-    guest_process_pending_mask(process, 1);
-    if ((process[0] | process[1]) != 0) {
-        guest_signal_handled_mask(handled);
-        if ((process[0] & handled[0] & ~state->signal_mask[0]) != 0 ||
-                (process[1] & handled[1] & ~state->signal_mask[1]) != 0) {
-            write(state->signal_wait_write_fd, &byte, sizeof(byte));
-            return;
-        }
-    }
-    if ((state->pending_signals[0] & ~state->signal_mask[0]) != 0) {
+    unblocked[0] = ~state->signal_mask[0];
+    unblocked[1] = ~state->signal_mask[1];
+    guest_signal_drop_ignored(unblocked);
+    if (signal_ready(state))
         write(state->signal_wait_write_fd, &byte, sizeof(byte));
-        return;
-    }
-    for (signal_number = LINUX_FIRST_REALTIME_SIGNAL;
-        signal_number <= LINUX_LAST_REALTIME_SIGNAL; ++signal_number) {
-        int index = signal_number - LINUX_FIRST_REALTIME_SIGNAL;
-        if ((state->signal_mask[(signal_number - 1) / 32] &
-                (1u << ((signal_number - 1) % 32))) == 0 &&
-            state->realtime_head[index] != state->realtime_tail[index]) {
-            write(state->signal_wait_write_fd, &byte, sizeof(byte));
-            return;
-        }
-    }
 }
 
 void guest_thread_signal_wait_interrupted(const uint32_t old_words[2])

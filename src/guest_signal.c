@@ -1,8 +1,11 @@
 #include "linuxemu.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -302,28 +305,125 @@ void guest_signal_handled_mask(uint32_t words[2])
                 1u << ((linux_signal - 1) % 32);
 }
 
+static int default_action_terminates(int linux_signal);
+static void default_host_action(int linux_signal, struct sigaction *action);
+
+/* SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU: the default action stops. */
+static int default_action_stops(int linux_signal)
+{
+    return linux_signal >= 19 && linux_signal <= 22;
+}
+
+/* Signals whose delivery does something now: a guest handler, or a
+   default action that ends or stops the process.  The rest (ignored, or
+   a default that ignores: SIGCHLD, SIGCONT, SIGURG, SIGWINCH) are only
+   discarded, and a wait isn't interrupted for them. */
+void guest_signal_acting_mask(uint32_t words[2])
+{
+    int linux_signal;
+    words[0] = words[1] = 0;
+    for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        uint32_t handler = guest_actions[linux_signal].handler;
+        if (handler > 1u || (handler == 0 &&
+                (default_action_terminates(linux_signal) ||
+                    default_action_stops(linux_signal))))
+            words[(linux_signal - 1) / 32] |=
+                1u << ((linux_signal - 1) % 32);
+    }
+}
+
+/*
+ * The default action of a signal Linuxemu took itself (signalfd's
+ * collector, or a per-thread queue whose handler was reset since), now
+ * that the guest lets it in.  An ignoring default discards it.  A default
+ * that ends or stops the process is carried out the way the self-signal
+ * path does it: write the diagnostics report, put the host default back
+ * and raise the signal at this thread with it unblocked, so the kernel
+ * applies exactly that action (the collector may be waiting for the same
+ * signal, so it is thread-directed).  The sender's details are lost,
+ * which only matters to a process that is ending.  After a stop the
+ * thread's host mask and the host action are put back.  from_handler: a
+ * host signal handler that interrupted guest code (only the
+ * async-signal-safe report is written).
+ */
+static void apply_default_action(int linux_signal, int from_handler)
+{
+    struct sigaction default_action, restore;
+    sigset_t only, old;
+    int host_signal = linux_signal_to_host(linux_signal);
+    if (host_signal == 0 || (!default_action_terminates(linux_signal) &&
+            !default_action_stops(linux_signal))) return;
+    if (default_action_terminates(linux_signal)) {
+        if (from_handler) linux_diag_flush_final();
+        else linux_diag_flush();
+    }
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    sigaction(host_signal, &default_action, 0);
+    sigemptyset(&only);
+    sigaddset(&only, host_signal);
+    pthread_sigmask(SIG_UNBLOCK, &only, &old);
+    pthread_kill(pthread_self(), host_signal);
+    /* Still here: the process was stopped and continued. */
+    pthread_sigmask(SIG_SETMASK, &old, 0);
+    memset(&restore, 0, sizeof(restore));
+    sigemptyset(&restore.sa_mask);
+    if (guest_actions[linux_signal].handler == 0) {
+        default_host_action(linux_signal, &restore);
+        sigaction(host_signal, &restore, 0);
+    }
+}
+
 /* The next signal this thread takes now: its own queue first, then the
    process queue (signals the collector took), as Linux takes private
-   pending signals before shared ones.  From the process queue only
-   signals the thread doesn't block and that have a guest handler; the
-   default and ignore actions of collected signals stay queued (Task 5
-   applies them here). */
-static int take_deliverable(siginfo_t *information, int *has_information)
+   pending signals before shared ones, among the signals the thread
+   doesn't block.  A taken signal without a guest handler gets its
+   default or ignore action here (apply_default_action) and the search
+   goes on; only a signal with a handler is returned. */
+static int take_deliverable(siginfo_t *information, int *has_information,
+    int from_handler)
 {
-    uint32_t pending[2], mask[2], allowed[2];
-    int linux_signal = guest_thread_take_pending(information,
-        has_information);
-    if (linux_signal != 0) return linux_signal;
+    for (;;) {
+        uint32_t pending[2], mask[2], allowed[2];
+        int linux_signal = guest_thread_take_pending(information,
+            has_information);
+        if (linux_signal == 0) {
+            guest_process_pending_mask(pending, 1);
+            if ((pending[0] | pending[1]) == 0) return 0;
+            guest_thread_signal_mask_get(mask);
+            allowed[0] = ~mask[0] & pending[0];
+            allowed[1] = ~mask[1] & pending[1];
+            if ((allowed[0] | allowed[1]) == 0) return 0;
+            linux_signal = guest_process_take_pending(allowed, information);
+            *has_information = linux_signal != 0;
+            if (linux_signal == 0) return 0;
+        }
+        /* SIGILL and SIGSEGV queued per thread keep their old path. */
+        if (guest_actions[linux_signal].handler > 1u || linux_signal == 4 ||
+                linux_signal == 11)
+            return linux_signal;
+        if (guest_actions[linux_signal].handler == 0)
+            apply_default_action(linux_signal, from_handler);
+    }
+}
+
+/* Process-queue entries in unblocked whose action ignores them: taken
+   and dropped (Linux discards an ignored signal once it is unblocked).
+   Run by a masked wait before it sleeps, so such a signal neither wakes
+   it nor stays queued. */
+void guest_signal_drop_ignored(const uint32_t unblocked[2])
+{
+    uint32_t acting[2], pending[2], drop[2];
+    siginfo_t information;
     guest_process_pending_mask(pending, 1);
-    if ((pending[0] | pending[1]) == 0) return 0;
-    guest_thread_signal_mask_get(mask);
-    guest_signal_handled_mask(allowed);
-    allowed[0] &= ~mask[0] & pending[0];
-    allowed[1] &= ~mask[1] & pending[1];
-    if ((allowed[0] | allowed[1]) == 0) return 0;
-    linux_signal = guest_process_take_pending(allowed, information);
-    *has_information = linux_signal != 0;
-    return linux_signal;
+    if (((pending[0] & unblocked[0]) | (pending[1] & unblocked[1])) == 0)
+        return;
+    guest_signal_acting_mask(acting);
+    drop[0] = pending[0] & unblocked[0] & ~acting[0];
+    drop[1] = pending[1] & unblocked[1] & ~acting[1];
+    if ((drop[0] | drop[1]) == 0) return;
+    while (guest_process_take_pending(drop, &information) != 0) {}
 }
 
 int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
@@ -331,8 +431,13 @@ int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
 {
     siginfo_t information;
     int has_information;
-    int linux_signal = take_deliverable(&information, &has_information);
-    if (linux_signal == 0) return 0;
+    int linux_signal = take_deliverable(&information, &has_information, 0);
+    if (linux_signal == 0) {
+        /* A masked wait that ended with nothing to deliver goes back to
+           the guest's own mask. */
+        guest_thread_signal_suspend_cancel();
+        return 0;
+    }
     if (context->uc_mcontext.cpu.gpr[0] == (uint32_t)-EINTR &&
         (guest_actions[linux_signal].flags & LINUX_SA_RESTART) != 0 &&
         restartable_syscall(syscall_number)) {
@@ -438,7 +543,7 @@ static void poke_handler(int host_signal, siginfo_t *information,
         guest_thread_signal_wake();
         return;
     }
-    linux_signal = take_deliverable(&pending, &has_information);
+    linux_signal = take_deliverable(&pending, &has_information, 1);
     if (linux_signal == 0 ||
             guest_signal_deliver(context, linux_signal,
                 has_information ? &pending : 0) != 0) return;
@@ -477,6 +582,18 @@ int guest_signal_collected(int host_signal, const siginfo_t *information)
             GUEST_SIGNAL_POKE))
         return 0;
     guest_process_signal_queue(linux_signal, information);
+    /* A thread that unblocked the signal (a masked wait starting, a
+       sigprocmask) after the routing check above but before its own
+       look at the process queue would miss the entry: poke every thread
+       that lets it in now.  Delivery then takes it like a routed one.
+       An ignored one isn't worth interrupting anybody for. */
+    {
+        uint32_t acting[2];
+        guest_signal_acting_mask(acting);
+        if ((acting[(linux_signal - 1) / 32] &
+                (1u << ((linux_signal - 1) % 32))) != 0)
+            guest_thread_poke_unblocked(linux_signal, GUEST_SIGNAL_POKE);
+    }
     return linux_signal;
 }
 
@@ -889,9 +1006,11 @@ int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
  * reported in LINUXEMU_DIAGNOSTICS.
  */
 #define FRAME_MASK_OFFSET (sizeof(siginfo_t) + 2 * sizeof(void *))
-/* The signal the probe adds through the slot. */
+/* The signal the probe adds through the slot (the first choice; another
+   when the saved mask already holds it). */
 #define FRAME_PROBE_ADDED SIGUSR2
 static int frame_mask_ok;
+static volatile int frame_probe_added;
 static volatile int frame_probe_matched;
 static sigset_t frame_probe_expected;
 
@@ -917,7 +1036,7 @@ static void frame_probe_handler(int host_signal, siginfo_t *information,
     memcpy(&saved, slot, sizeof(saved));
     frame_probe_matched = same_signals(&saved, &frame_probe_expected);
     /* Only write where the layout matched. */
-    if (frame_probe_matched) sigaddset(slot, FRAME_PROBE_ADDED);
+    if (frame_probe_matched) sigaddset(slot, frame_probe_added);
 }
 
 void guest_signal_frame_probe(void)
@@ -930,23 +1049,46 @@ void guest_signal_frame_probe(void)
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGEMT, &action, &old_action) != 0) return;
     pthread_sigmask(SIG_SETMASK, 0, &old_mask);
-    /* A distinctive saved mask: SIGHUP, SIGQUIT, SIGPIPE, SIGTTOU. */
-    sigemptyset(&frame_probe_expected);
+    /* A distinctive saved mask: the mask Linuxemu started with plus
+       SIGHUP, SIGQUIT, SIGPIPE and SIGTTOU, without the probe's SIGEMT.
+       Nothing blocked at start-up is unblocked even briefly: an execve
+       hands the old image's blocked set over, and a signal it holds
+       pending (re-raised by guest_signal_restore_pending) must stay
+       pending, as on Linux, not meet its default action here. */
+    frame_probe_expected = old_mask;
     sigaddset(&frame_probe_expected, SIGHUP);
     sigaddset(&frame_probe_expected, SIGQUIT);
     sigaddset(&frame_probe_expected, SIGPIPE);
     sigaddset(&frame_probe_expected, SIGTTOU);
-    pthread_sigmask(SIG_SETMASK, &frame_probe_expected, 0);
+    sigdelset(&frame_probe_expected, SIGEMT);
+    /* The written signal must be one the saved mask doesn't hold, or the
+       probe proves nothing. */
+    frame_probe_added = 0;
+    {
+        static const int candidates[] = { FRAME_PROBE_ADDED, SIGUSR1,
+            SIGALRM, SIGWINCH, SIGURG, SIGPROF };
+        size_t index;
+        for (index = 0; index < sizeof(candidates) / sizeof(candidates[0]);
+                ++index)
+            if (sigismember(&frame_probe_expected, candidates[index]) != 1) {
+                frame_probe_added = candidates[index];
+                break;
+            }
+    }
     frame_probe_matched = 0;
-    pthread_kill(pthread_self(), SIGEMT);
-    pthread_sigmask(SIG_SETMASK, 0, &after);
-    pthread_sigmask(SIG_SETMASK, &old_mask, 0);
+    if (frame_probe_added != 0) {
+        pthread_sigmask(SIG_SETMASK, &frame_probe_expected, 0);
+        pthread_kill(pthread_self(), SIGEMT);
+        pthread_sigmask(SIG_SETMASK, 0, &after);
+        pthread_sigmask(SIG_SETMASK, &old_mask, 0);
+    }
     sigaction(SIGEMT, &old_action, 0);
     /* After return: the saved mask plus the signal written into the
        slot, proving the write is what SignalReturn restores. */
     wanted = frame_probe_expected;
-    sigaddset(&wanted, FRAME_PROBE_ADDED);
-    frame_mask_ok = frame_probe_matched && same_signals(&after, &wanted);
+    if (frame_probe_added != 0) sigaddset(&wanted, frame_probe_added);
+    frame_mask_ok = frame_probe_added != 0 && frame_probe_matched &&
+        same_signals(&after, &wanted);
     if (!frame_mask_ok) {
         uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
         args[0] = (uint32_t)frame_probe_matched;
@@ -978,25 +1120,119 @@ void guest_signal_apply_frame_mask(siginfo_t *trap_information)
     }
 }
 
+/*
+ * Pending signals across execve.  Linux keeps the pending set (the
+ * calling thread's and the process's) across exec; QNX drops it (a
+ * native probe: a blocked SIGUSR1, pending before execve, was gone in the
+ * new image whether sent with kill or pthread_kill; FINDINGS 2026-11-20).
+ * So the exec carries the Linux numbers of every signal pending for the
+ * calling thread (the host's own pending set, its queue, the process
+ * queue) in LINUXEMU_GUEST_PENDING, and the new image raises each one
+ * again at start-up, after the frame probe, while the inherited blocked
+ * set still holds it.  One instance each: sender details, sigqueue
+ * values and real-time counts are lost (documented).
+ */
+#define PENDING_VARIABLE "LINUXEMU_GUEST_PENDING="
+
+int guest_signal_exec_pending(char *buffer, size_t size)
+{
+    sigset_t host;
+    uint32_t words[2] = { 0, 0 }, queued[2];
+    int host_signal;
+    if (sigpending(&host) == 0)
+        for (host_signal = 1; host_signal <= SIGRTMAX; ++host_signal) {
+            int linux_signal;
+            if (sigismember(&host, host_signal) != 1) continue;
+            linux_signal = guest_signal_from_host(host_signal);
+            if (linux_signal > 0 && linux_signal <= LINUX_SIGNAL_COUNT)
+                words[(linux_signal - 1) / 32] |=
+                    1u << ((linux_signal - 1) % 32);
+        }
+    guest_thread_pending_mask(queued);
+    words[0] |= queued[0];
+    words[1] |= queued[1];
+    guest_process_pending_mask(queued, 1);
+    words[0] |= queued[0];
+    words[1] |= queued[1];
+    /* Never SIGILL, SIGKILL, SIGSEGV or SIGSTOP. */
+    words[0] &= ~((1u << 3) | (1u << 8) | (1u << 10) | (1u << 18));
+    if ((words[0] | words[1]) == 0) return 0;
+    snprintf(buffer, size, PENDING_VARIABLE "%08x,%08x", (unsigned)words[0],
+        (unsigned)words[1]);
+    return 1;
+}
+
+void guest_signal_restore_pending(const char *value)
+{
+    uint32_t words[2];
+    char *end;
+    int linux_signal;
+    if (value == 0 || value[0] == '\0') return;
+    words[0] = (uint32_t)strtoul(value, &end, 16);
+    if (*end != ',') return;
+    words[1] = (uint32_t)strtoul(end + 1, &end, 16);
+    if (*end != '\0') return;
+    words[0] &= ~((1u << 3) | (1u << 8) | (1u << 10) | (1u << 18));
+    for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        int host_signal;
+        if ((words[(linux_signal - 1) / 32] &
+                (1u << ((linux_signal - 1) % 32))) == 0) continue;
+        host_signal = linux_signal_to_host(linux_signal);
+        if (host_signal != 0) (void)pthread_kill(pthread_self(), host_signal);
+    }
+}
+
+/*
+ * rt_sigsuspend on the signal-wait channel, like ppoll's temporary mask:
+ * the host thread takes the temporary mask, the guest view too, and the
+ * thread sleeps in poll on its channel.  Every way a signal can reach it
+ * posts there: a host handler queueing a direct signal, the poke for one
+ * the collector routed or queued, and guest_thread_signal_wait_arm for one
+ * already in a queue (the process queue included) that the temporary mask
+ * lets in.  It returns EINTR only once a signal is there to deliver (the
+ * trap's return delivers it with the old mask in the frame, as Linux
+ * does); a wake for nothing (a poke whose signal another thread took)
+ * sleeps again.  A signal whose default action ends the process ends it
+ * in the kernel, as before.
+ */
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size)
 {
-    sigset_t host_set;
+    sigset_t host_set, host_old;
     uint32_t words[2];
     uint32_t old_words[2];
-    int saved_errno;
+    int wait_fd, saved_errno;
     if (guest_set == 0 || signal_set_size != 8) return -EINVAL;
     memcpy(words, guest_set, sizeof(words));
     words[0] &= ~((1u << (9 - 1)) | (1u << (19 - 1)));
     linux_set_to_host(words, &host_set);
     guest_thread_signal_mask_get(old_words);
-    guest_thread_signal_mask_set(words);
-    if (sigsuspend(&host_set) != 0) {
+    wait_fd = guest_thread_signal_wait_begin();
+    if (wait_fd < 0) return -(int32_t)linux_errno_number(errno);
+    if (pthread_sigmask(SIG_SETMASK, &host_set, &host_old) != 0) {
         saved_errno = errno;
-        if (saved_errno == EINTR)
-            guest_thread_signal_suspend_restore(old_words);
-        else guest_thread_signal_mask_set(old_words);
+        guest_thread_signal_wait_end();
         return -(int32_t)linux_errno_number(saved_errno);
     }
-    guest_thread_signal_mask_set(old_words);
-    return 0;
+    guest_thread_signal_mask_set(words);
+    for (;;) {
+        struct pollfd entry;
+        guest_thread_signal_wait_arm();
+        entry.fd = wait_fd;
+        entry.events = POLLIN;
+        entry.revents = 0;
+        if (poll(&entry, 1, -1) < 0 && errno != EINTR) {
+            saved_errno = errno;
+            guest_thread_signal_mask_set(old_words);
+            pthread_sigmask(SIG_SETMASK, &host_old, 0);
+            guest_thread_signal_wait_end();
+            return -(int32_t)linux_errno_number(saved_errno);
+        }
+        if (guest_thread_signal_ready()) break;
+        /* Nothing to deliver: drain and wait again. */
+        (void)guest_thread_signal_wait_begin();
+    }
+    guest_thread_signal_suspend_restore(old_words);
+    pthread_sigmask(SIG_SETMASK, &host_old, 0);
+    guest_thread_signal_wait_end();
+    return -EINTR;
 }

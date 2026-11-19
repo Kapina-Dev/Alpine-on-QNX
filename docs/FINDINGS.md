@@ -1020,3 +1020,23 @@ programs).
   and `pthread_kill(thread, SIGRTMAX + 8)` (one of the top eight,
   always masked) wakes it with 64. signalfd's collector uses that signal
   to re-arm.
+
+## 2026-11-20 — Phase 3 part 2: QNX drops pending signals at execve
+
+- **Probe (native, Passport):** a process blocks SIGUSR1, forks; the child
+  makes SIGUSR1 pending (`sigpending` shows it), then `execl`s itself. In
+  the new image `sigpending` no longer holds SIGUSR1, whether it was sent
+  with `kill(getpid())` or `pthread_kill(pthread_self())`. Linux keeps the
+  pending set across `execve` (the calling thread's and the process's).
+- **Consequence:** the design's plan for `exec` (re-raise the process queue
+  just before the host `execve`, so the signals wait in the QNX kernel)
+  cannot work, and every guest signal pending at `execve` was lost. Seen
+  through Linuxemu too: `signalfd-semantics` check 32 got exit 1 (no
+  handler run in the new image) on the Task 4 core.
+- **Fix (Task 5):** the exec carries the Linux numbers of the signals
+  pending for the caller (host `sigpending`, the thread's queue, the
+  process queue) in `LINUXEMU_GUEST_PENDING`; the new image raises each
+  again at start-up under the inherited blocked set, before the frame
+  probe, which no longer unblocks anything Linuxemu started with. One
+  instance each: sender details, `sigqueue` values and real-time counts
+  are lost.

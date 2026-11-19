@@ -14,12 +14,13 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 9];
+static char *host_environment[MAX_EXEC_VECTOR + 10];
 /* Fd records carried into the new image (guest_fd_exec_records). */
 static char fd_records_variable[32768];
 static char personality_variable[48];
 static char comm_variable[48];
 static char nice_variable[48];
+static char pending_variable[64];
 static char diagnostics_variable[PATH_MAX + 32];
 static char executable_variable[PATH_MAX + 32];
 static char guest_executable_path[PATH_MAX];
@@ -258,6 +259,10 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     if (guest_fd_exec_records(fd_records_variable,
             sizeof(fd_records_variable)) > 0)
         host_environment[environment_count++] = fd_records_variable;
+    /* QNX drops pending signals at exec; Linux keeps them. */
+    if (guest_signal_exec_pending(pending_variable,
+            sizeof(pending_variable)) > 0)
+        host_environment[environment_count++] = pending_variable;
     host_environment[environment_count] = 0;
 
     host_arguments[0] = emulator_path;

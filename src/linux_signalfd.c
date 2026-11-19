@@ -72,11 +72,18 @@
  * raise readiness, never together with thread_registry_lock or the
  * process queue's lock.
  *
- * Not yet (later tasks): applying default and ignore actions of collected
- * signals on delivery, the masked waits' process-queue checks and the
- * collector's wake-ups of waiting threads (Task 5); fork restart, exec
- * records and SCM_RIGHTS (Task 6; until then a signalfd crosses exec and
- * SCM_RIGHTS as a plain pipe).
+ * Delivery of collected signals (guest_signal.c): once a thread lets a
+ * queued signal in, delivery takes it whatever its action: a handler runs,
+ * an ignoring action discards it, and a default that ends or stops the
+ * process is raised again at that thread under the host default.  Every
+ * masked wait (ppoll, pselect6, epoll_pwait, rt_sigsuspend, all on the
+ * thread's signal-wait channel) checks the queues against its temporary
+ * mask before sleeping, and after queueing a signal the collector pokes
+ * every thread that has it unblocked, so none sleeps through a signal
+ * Linux would deliver.
+ *
+ * Not yet (Task 6): fork restart, exec records and SCM_RIGHTS (until then
+ * a signalfd crosses exec and SCM_RIGHTS as a plain pipe).
  */
 #include "linuxemu.h"
 #include "guest_fd.h"

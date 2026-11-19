@@ -183,6 +183,16 @@ int32_t guest_signal_queue_process(pid_t process, int linux_signal,
     const void *guest_information, uint32_t number, const uint32_t *args);
 /* Linux signals that have a guest handler (action above SIG_IGN). */
 void guest_signal_handled_mask(uint32_t words[2]);
+/* Linux signals whose delivery acts: a guest handler, or a default that
+   ends or stops the process (not ignored ones). */
+void guest_signal_acting_mask(uint32_t words[2]);
+/* Takes and discards process-queue entries in unblocked whose action
+   ignores them. */
+void guest_signal_drop_ignored(const uint32_t unblocked[2]);
+/* execve: writes LINUXEMU_GUEST_PENDING=... for the signals pending now
+   (1), or nothing (0); the new image raises them again at start-up. */
+int guest_signal_exec_pending(char *buffer, size_t size);
+void guest_signal_restore_pending(const char *value);
 /* Installs the handler of the host signal the collector pokes a guest
    thread with after routing it a signal (0 or -1). */
 int guest_signal_poke_install(void);
@@ -281,8 +291,12 @@ void guest_thread_signal_mask_get(uint32_t words[2]);
 void guest_thread_signal_mask_set(const uint32_t words[2]);
 void guest_thread_signal_suspend_restore(const uint32_t words[2]);
 void guest_thread_signal_delivery_mask(uint32_t words[2]);
+void guest_thread_signal_suspend_cancel(void);
 int guest_thread_signal_wait_begin(void);
 void guest_thread_signal_wait_arm(void);
+/* A queued signal the thread's current mask lets in and that acts. */
+int guest_thread_signal_ready(void);
+void guest_thread_poke_unblocked(int linux_signal, int poke_host_signal);
 void guest_thread_signal_wait_interrupted(const uint32_t old_words[2]);
 void guest_thread_signal_wait_complete(const uint32_t old_words[2]);
 void guest_thread_signal_wait_end(void);

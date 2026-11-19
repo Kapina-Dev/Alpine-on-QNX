@@ -93,6 +93,9 @@ int main(int argc, char **argv)
         linux_diag_runtime_initialize();
         if (enabled) guest_signal_diagnostics_initialize();
     }
+    /* Signals pending at the old image's execve, pending again under the
+       inherited blocked set; the probe below must not unblock them. */
+    guest_signal_restore_pending(getenv("LINUXEMU_GUEST_PENDING"));
     /* After the diagnostics start: a failed frame probe is reported. */
     guest_signal_frame_probe();
     guest_signal_queue_defaults();
@@ -110,6 +113,9 @@ int main(int argc, char **argv)
         perror("linuxemu load");
         return 1;
     }
+    /* Kept until the load succeeded: a load retry re-execs, which drops
+       the re-raised signals again. */
+    unsetenv("LINUXEMU_GUEST_PENDING");
     stack_pointer = create_guest_stack(guest_argc, guest_argv, &image);
     if (stack_pointer == 0) {
         perror("linuxemu stack");
