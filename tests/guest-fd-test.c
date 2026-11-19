@@ -14,6 +14,24 @@
 static int failures;
 static int releases;
 
+/* Stubs for what guest_fd.c calls in the rest of the emulator. */
+static int reports;
+static char last_report[64];
+
+void linux_epoll_note_close(int fd)
+{
+    (void)fd;
+}
+
+int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
+    const char *detail, const uint32_t *args)
+{
+    (void)number; (void)args;
+    ++reports;
+    snprintf(last_report, sizeof(last_report), "%s", detail);
+    return -linux_error;
+}
+
 #define CHECK(name, condition) do { \
     if (!(condition)) { \
         printf("FAIL %s: %s (line %d)\n", name, #condition, __LINE__); \
@@ -412,6 +430,34 @@ static void exec_records_carry_limit(void)
     guest_fd_nofile_set(base, base);
 }
 
+/* A record too long for the buffer is left out alone, with a diagnostic;
+   the records after it still travel. */
+static void exec_records_skip_oversized(void)
+{
+    char records[160], long_path[120], expected[32];
+    int big = open("/", O_RDONLY), small = open("/", O_RDONLY);
+    if (big < 0 || small < 0 || big > small) { ++failures; return; }
+    memset(long_path, 'a', sizeof(long_path) - 1);
+    long_path[0] = '/';
+    long_path[sizeof(long_path) - 1] = '\0';
+    guest_fd_record_path(big, long_path);
+    guest_fd_record_path(small, "/");
+    reports = 0;
+    CHECK("exec_records_skip_oversized",
+        guest_fd_exec_records(records, sizeof(records)) > 0);
+    snprintf(expected, sizeof(expected), ";%d:%d:-1:2f;", small,
+        (int)GUEST_FD_PATH);
+    CHECK("exec_records_skip_oversized",
+        strstr(records, expected + 1) != 0);
+    snprintf(expected, sizeof(expected), "=%d:", big);
+    CHECK("exec_records_skip_oversized", strstr(records, expected) == 0);
+    CHECK("exec_records_skip_oversized", reports == 1 &&
+        strcmp(last_report, "exec-fd-record-dropped") == 0);
+    guest_fd_clear(big);
+    guest_fd_clear(small);
+    close(big); close(small);
+}
+
 static void received_fd_adopts_known_object(void)
 {
     int p[2], q[2], received, native_copy, d, dir_copy;
@@ -477,6 +523,7 @@ int main(void)
     exec_records_reject_malformed();
     nofile_virtual_limit();
     exec_records_carry_limit();
+    exec_records_skip_oversized();
     received_fd_adopts_known_object();
     printf("guest_fd_test_failures=%d\n", failures);
     return failures != 0;

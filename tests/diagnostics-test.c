@@ -137,6 +137,8 @@ int main(void)
     check(linux_errno_name(95) != NULL
         && strcmp(linux_errno_name(95), "EOPNOTSUPP") == 0,
         "errno: 95 EOPNOTSUPP");
+    check(linux_errno_name(7) != NULL
+        && strcmp(linux_errno_name(7), "E2BIG") == 0, "errno: 7 E2BIG");
     check(linux_errno_name(200) == NULL, "errno: 200 unnamed");
 
     /* aggregate */

@@ -206,6 +206,14 @@ struct guest_fd_object *guest_fd_acquire(int fd)
         } else ++object->references;
     }
     pthread_mutex_unlock(&table_lock);
+    /* Lock-order hazard (known, not fixed): epoll's build_set and the
+       nested expansion call this under an instance lock.  If the stale
+       record's last reference were an epoll object, its release would take
+       the epoll registry lock under that instance lock, against the order
+       fd_replace -> registry -> instance -> table.  It needs an epoll fd
+       number closed natively without guest_fd_clear, which no path does
+       today; a new path that closes guest numbers natively must go through
+       guest_fd_clear (or defer this put) to keep it so. */
     guest_fd_put(stale);
     return object;
 }
@@ -435,11 +443,33 @@ void guest_fd_register_restore(enum guest_fd_type type,
         restore_functions[type] = restore;
 }
 
+/* linux_diagnostics.c (declared in linuxemu.h, which this file doesn't
+   include). */
+int32_t linux_report_unsupported(uint32_t number, int32_t linux_error,
+    const char *detail, const uint32_t *args);
+
+#define LINUX_NR_EXECVE 11
+#define LINUX_E2BIG 7
+
+/* A record that doesn't fit (or whose object can't describe itself) is
+   left out alone, with a diagnostic: its fd still survives exec and starts
+   native in the new image.  The other records still travel. */
+static void exec_record_skipped(int fd, const struct guest_fd_object *object,
+    int length)
+{
+    uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)object->type;
+    args[2] = (uint32_t)length;
+    (void)linux_report_unsupported(LINUX_NR_EXECVE, LINUX_E2BIG,
+        "exec-fd-record-dropped", args);
+}
+
 int guest_fd_exec_records(char *buffer, size_t size)
 {
     static struct guest_fd_object *seen[GUEST_FD_SLOTS];
     static int seen_fd[GUEST_FD_SLOTS];
-    int seen_count = 0, fd, i, failed = 0;
+    int seen_count = 0, fd, i;
     size_t used = sizeof(RECORDS_PREFIX) - 1;
     carried_hidden_count = 0;
     if (size <= used) return -1;
@@ -451,7 +481,7 @@ int guest_fd_exec_records(char *buffer, size_t size)
         if (written < 0 || (size_t)written >= size - used) return -1;
         used += (size_t)written;
     }
-    for (fd = 0; fd != GUEST_FD_SLOTS && !failed; ++fd) {
+    for (fd = 0; fd != GUEST_FD_SLOTS; ++fd) {
         struct guest_fd_object *object = guest_fd_acquire(fd);
         char body[2 * PATH_MAX + 32];
         int flags, written, length = -1;
@@ -472,8 +502,12 @@ int guest_fd_exec_records(char *buffer, size_t size)
             written = length < 0 ? -1 : snprintf(buffer + used, size - used,
                 "%d:%d:%s;", fd, (int)object->type, body);
         }
-        if (written < 0 || (size_t)written >= size - used) failed = 1;
-        else {
+        if (written < 0 || (size_t)written >= size - used) {
+            /* snprintf may have written part of it: the next record (or
+               the terminator below) goes over that. */
+            buffer[used] = '\0';
+            exec_record_skipped(fd, object, written < 0 ? length : written);
+        } else {
             used += (size_t)written;
             if (i == seen_count) {
                 int hidden[2], count = body_hidden(body, hidden), k;
@@ -485,8 +519,8 @@ int guest_fd_exec_records(char *buffer, size_t size)
         }
         guest_fd_put(object);
     }
-    if (failed) { carried_hidden_count = 0; return -1; }
     if (used == sizeof(RECORDS_PREFIX) - 1) { buffer[0] = '\0'; return 0; }
+    buffer[used] = '\0';
     return (int)used;
 }
 

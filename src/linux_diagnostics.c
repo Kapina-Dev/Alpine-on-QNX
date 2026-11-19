@@ -24,8 +24,8 @@ static const struct {
     const char *name;
 } errno_names[] = {
     { 1, "EPERM" }, { 2, "ENOENT" }, { 3, "ESRCH" }, { 4, "EINTR" },
-    { 5, "EIO" }, { 9, "EBADF" }, { 11, "EAGAIN" }, { 12, "ENOMEM" },
-    { 13, "EACCES" }, { 14, "EFAULT" }, { 17, "EEXIST" },
+    { 5, "EIO" }, { 7, "E2BIG" }, { 9, "EBADF" }, { 11, "EAGAIN" },
+    { 12, "ENOMEM" }, { 13, "EACCES" }, { 14, "EFAULT" }, { 17, "EEXIST" },
     { 20, "ENOTDIR" }, { 22, "EINVAL" }, { 25, "ENOTTY" },
     { 28, "ENOSPC" }, { 29, "ESPIPE" }, { 34, "ERANGE" },
     { 38, "ENOSYS" }, { 95, "EOPNOTSUPP" }, { 97, "EAFNOSUPPORT" },
