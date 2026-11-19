@@ -83,6 +83,7 @@ int main(int argc, char **argv)
     }
     linux_syscall_register_fd_types();
     (void)guest_fd_restore_records(getenv("LINUXEMU_FD_RECORDS"));
+    linux_epoll_restore_finish();
     unsetenv("LINUXEMU_FD_RECORDS");
     guest_thread_name_set(guest_process_initial_name(load_path));
     guest_process_record_executable(load_path);

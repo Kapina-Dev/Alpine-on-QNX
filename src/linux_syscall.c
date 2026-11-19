@@ -980,6 +980,7 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
 void linux_syscall_register_fd_types(void)
 {
     linux_eventfd_register();
+    linux_epoll_register();
 }
 
 static int32_t linux_execve(const char *guest_path, char *const guest_argv[],

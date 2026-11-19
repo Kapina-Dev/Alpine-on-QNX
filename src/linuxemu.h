@@ -280,6 +280,32 @@ int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event);
    converted by the caller); sigmask 0 means none. */
 int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
     int timeout_ms, const void *sigmask, uint32_t sigsetsize);
+/* mmap-backed zeroed storage for interest lists and poll arrays (no
+   malloc in the syscall handler); 0 on failure. */
+void *epoll_storage_alloc(size_t size);
+void epoll_storage_free(void *memory, size_t size);
+/* Registers the epoll exec restore (linux_syscall_register_fd_types);
+   restore_finish runs after guest_fd_restore_records. */
+void linux_epoll_register(void);
+void linux_epoll_restore_finish(void);
+/* Nested epoll and epoll in poll/select (linux_epoll.c).  acquire: the
+   referenced epoll object on a guest fd, or 0.  expand appends the host
+   pollfds of ep's enabled items, recursively (nested epolls' items follow
+   the instance's own entries); returns the count, or -1 with ELOOP past
+   depth 5 or ENOMEM past capacity.  expanded_ready: 1 when an expanded
+   item is ready after the caller's poll() (ready_now and identity checked),
+   consuming no EPOLLET or EPOLLONESHOT state.  A probe brackets the poll:
+   begin returns a channel to poll beside the expanded fds (-1 if none),
+   which any epoll list change makes readable; end returns 1 when a list
+   changed since begin (expand again before waiting longer). */
+struct guest_fd_object;
+struct guest_fd_object *linux_epoll_acquire(int fd);
+int linux_epoll_expand(struct guest_fd_object *ep, struct pollfd *out,
+    int capacity, int depth);
+int linux_epoll_expanded_ready(struct guest_fd_object *ep,
+    const struct pollfd *in, int count);
+int linux_epoll_probe_begin(unsigned *generation);
+int linux_epoll_probe_end(unsigned generation, int woke);
 int install_guest_traps(void);
 
 #endif
