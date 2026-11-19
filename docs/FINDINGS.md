@@ -635,12 +635,18 @@ Passport, ordinary user. Probes: `native-probes/phase3-probes.c` and
 Raw output:
 
 ```
-fifo_note=mkdir /tmp/p3fifo238260226 failed errno=2
-fifo_rdwr=fail:2 (step 2)
+fifo_note=mkdir /tmp/p3fifo242049244 failed errno=2
+fifo_rdwr.tmp=fail:2 (step 2)
 fifo_rdwr.disk=ok
-robust_mutex=absent (setrobust missing, consistent missing in libc)
+fifo_rdwr=ok-disk-only
+fifo_rdwr.step=2 (the /tmp failure)
+dlsym_control=pthread_mutexattr_setpshared found
+dead_owner_plain=ETIMEDOUT
+robust_header=PTHREAD_MUTEX_ROBUST not defined
+dlsym_setrobust=missing dlsym_consistent=missing
+robust_mutex=absent (via dlsym: setrobust missing, consistent missing)
 race_note=new pipe reused fd 5 and was written
-poll_close_race=n=0 revents=0x0 (POLLIN=0x5 POLLNVAL=0x1000) after 2003ms (blocked until timeout)
+poll_close_race=n=0 revents=0x0 (POLLIN=0x5 POLLNVAL=0x1000) after 2004ms (blocked until timeout)
 rdhup_signal.tcp=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
 rdhup_signal.unix=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
 stat./dev/android/epoll=uid=0(root) gid=0(nto) mode=777
@@ -649,21 +655,25 @@ open./dev/android/epoll=ok fd=3
 epoll_ctl_devctl=not attempted (protocol recovery out of scope)
 ```
 
-- **`fifo_rdwr`: a FIFO works as a readiness channel, but not in `/tmp`.**
-  `/tmp` is a symlink to `/dev/shmem`, which refuses directories
-  (`mkdir` gives `ENOENT`) and FIFOs (`mkfifo` gives `ENOENT`, step 2). On
-  the data filesystem (`/accounts/1000/shared/misc`) `mkfifo`,
-  `open(O_RDWR|O_NONBLOCK)` and `unlink` work; a written byte makes `poll`
-  report `POLLIN`, a read clears it (`poll` with timeout 0 reports
-  nothing), and a forked child's write wakes the parent's `poll`. So a
-  FIFO channel needs a directory on a disk filesystem, not `/tmp`.
-- **`robust_mutex`: absent.** The SDK headers declare no robust-mutex API,
-  and `libc.so.3` exports no `pthread_mutexattr_setrobust(_np)` or
-  `pthread_mutex_consistent(_np)`. A lock held by a process that died can't
-  be recovered with `EOWNERDEAD`, so shared state can't rely on it.
+- **`fifo_rdwr=ok-disk-only`.** `/tmp` is a symlink to `/dev/shmem`, which
+  refuses directories (`mkdir` gives `ENOENT`) and FIFOs (`mkfifo` gives
+  `ENOENT`, step 2). On the data filesystem (`/accounts/1000/shared/misc`)
+  `mkfifo`, `open(O_RDWR|O_NONBLOCK)` and `unlink` work; a written byte makes
+  `poll` report `POLLIN`, a read clears it (`poll` with timeout 0 reports
+  nothing), and a forked child's write wakes the parent's `poll`. A FIFO
+  channel therefore needs a directory on a disk filesystem, not `/tmp`.
+- **`robust_mutex=absent`.** The probe's positive control passes
+  (`dlsym_control=pthread_mutexattr_setpshared found`, so `dlsym(RTLD_DEFAULT)`
+  does search libc), `PTHREAD_MUTEX_ROBUST` is not defined by the SDK
+  headers (`robust_header=... not defined`), and `dlsym` finds neither
+  `pthread_mutexattr_setrobust(_np)` nor `pthread_mutex_consistent(_np)`.
+  What a dead owner does instead: a `PTHREAD_PROCESS_SHARED` mutex in shm
+  whose holder `_exit`ed without unlocking is never released
+  (`dead_owner_plain=ETIMEDOUT` on a 1 s `pthread_mutex_timedlock`), so shared
+  state can't rely on a lock surviving its owner.
 - **`poll_close_race`: `poll` is not woken by a close from another thread.**
   Thread A polling a pipe read end for 2 s was still blocked at the timeout
-  (`n=0 revents=0x0` after 2003 ms) although thread B had closed that fd
+  (`n=0 revents=0x0` after 2004 ms) although thread B had closed that fd
   after 100 ms and a new pipe reused the number and was written. No
   `POLLNVAL`, and the new pipe's `POLLIN` isn't seen either: the poll keeps
   waiting on the old object.
