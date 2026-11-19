@@ -37,6 +37,9 @@ struct guest_fd_ops {
     int (*set_status)(struct guest_fd_object *, int fd, int host_flags);
     void (*release)(struct guest_fd_object *);
     int (*serialize)(struct guest_fd_object *, int fd, char *, size_t);
+    /* Host poll bits (POLLOUT, ...) that are ready without the native
+       poll target's help, or 0.  Used by poll, select and epoll. */
+    short (*ready_now)(struct guest_fd_object *, int fd);
 };
 
 /* Created with one reference owned by the caller; identity is taken from
@@ -94,9 +97,11 @@ int guest_fd_dispatch_set_status(int fd, int host_flags);
    an object with a serialize op becomes one record "fd:type:hidden:hexpath;"
    in LINUXEMU_FD_RECORDS; a later fd sharing an already-written object
    becomes an alias record "fd:0:first_fd:;".  ops->serialize writes the
-   "hidden:hexpath" body for its object. */
+   "hidden:hexpath" body for its object, or "hidden:second:" for an object
+   with two hidden fds (both survive exec; hex digits never contain ':', so
+   the forms are unambiguous).  second_hidden_fd is -1 in the first form. */
 typedef int (*guest_fd_restore_fn)(int fd, int hidden_fd,
-    const char *host_path);
+    int second_hidden_fd, const char *host_path);
 /* Restores one record of the given type in the new image (0 or -1). */
 void guest_fd_register_restore(enum guest_fd_type type,
     guest_fd_restore_fn restore);

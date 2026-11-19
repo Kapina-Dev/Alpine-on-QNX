@@ -1,4 +1,5 @@
 #include "linuxemu.h"
+#include "guest_fd.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -154,12 +155,18 @@ int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
     case LINUX_FIONBIO:
         if (guest_argument == 0) return -EFAULT;
         {
-            int requested;
+            int requested, typed;
             memcpy(&requested, guest_argument, sizeof(requested));
-            value = fcntl(fd, F_GETFL);
+            /* A typed object (eventfd) keeps O_NONBLOCK itself and its
+               native fd must stay nonblocking. */
+            typed = guest_fd_dispatch_get_status(fd, &value);
+            if (typed == 0) value = fcntl(fd, F_GETFL);
             if (value < 0) return -(int32_t)linux_errno_number(errno);
             if (requested) value |= O_NONBLOCK;
             else value &= ~O_NONBLOCK;
+            typed = guest_fd_dispatch_set_status(fd, value);
+            if (typed != 0)
+                return typed > 0 ? 0 : -(int32_t)linux_errno_number(errno);
             return fcntl(fd, F_SETFL, value) == 0 ? 0 :
                 -(int32_t)linux_errno_number(errno);
         }

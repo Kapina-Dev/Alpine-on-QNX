@@ -16,7 +16,10 @@
    lock-free typed check reads memory that never moves. */
 #define GUEST_FD_SLOTS 4096
 #define HIDDEN_BASE_CAP 4032
-#define HIDDEN_RESERVE 64
+/* Emulator-owned fds per process: an eventfd holds two (readiness pipe
+   write end, shm page) and an epoll one, so 256 fits 64 eventfd+epoll
+   pairs plus the other users. */
+#define HIDDEN_RESERVE 256
 
 struct guest_fd_object {
     enum guest_fd_type type;
@@ -231,7 +234,7 @@ static int path_serialize(struct guest_fd_object *object, int fd,
 }
 
 static const struct guest_fd_ops path_ops = {
-    0, 0, 0, 0, 0, path_release, path_serialize
+    0, 0, 0, 0, 0, path_release, path_serialize, 0
 };
 
 int guest_fd_record_path(int fd, const char *host_path)
@@ -379,8 +382,23 @@ int guest_fd_dispatch_set_status(int fd, int host_flags)
 #define RECORDS_PREFIX "LINUXEMU_FD_RECORDS="
 
 static guest_fd_restore_fn restore_functions[GUEST_FD_BINDER + 1];
-static int carried_hidden[GUEST_FD_SLOTS];
+static int carried_hidden[2 * GUEST_FD_SLOTS];
 static int carried_hidden_count;
+
+/* The hidden fds a serialized body names: "hidden:hexpath" or
+   "hidden:second:".  Returns how many (0 to 2) went into out. */
+static int body_hidden(const char *body, int out[2])
+{
+    char *end;
+    long first = strtol(body, &end, 10), second;
+    int count = 0;
+    if (end == body || *end != ':') return 0;
+    if (first >= 0) out[count++] = (int)first;
+    body = end + 1;
+    second = strtol(body, &end, 10);
+    if (end != body && *end == ':' && second >= 0) out[count++] = (int)second;
+    return count;
+}
 
 void guest_fd_register_restore(enum guest_fd_type type,
     guest_fd_restore_fn restore)
@@ -430,11 +448,11 @@ int guest_fd_exec_records(char *buffer, size_t size)
         else {
             used += (size_t)written;
             if (i == seen_count) {
-                long hidden = strtol(body, 0, 10);
+                int hidden[2], count = body_hidden(body, hidden), k;
                 seen[seen_count] = object;
                 seen_fd[seen_count++] = fd;
-                if (hidden >= 0)
-                    carried_hidden[carried_hidden_count++] = (int)hidden;
+                for (k = 0; k != count; ++k)
+                    carried_hidden[carried_hidden_count++] = hidden[k];
             }
         }
         guest_fd_put(object);
@@ -491,11 +509,16 @@ static int restore_one(const char *record, size_t length)
 {
     char path[PATH_MAX];
     const char *cursor = record, *hex;
-    long fd, type, hidden;
+    long fd, type, hidden, second = -1;
     size_t hex_length, i;
     if (parse_number(&cursor, 0, hidden_base - 1, &fd) != 0 ||
             parse_number(&cursor, 0, GUEST_FD_BINDER, &type) != 0 ||
             parse_number(&cursor, -1, INT_MAX, &hidden) != 0) return -1;
+    /* A second number ending in ':' is a second hidden fd ("hidden:second:"
+       body); hex digits never contain ':'. */
+    if (memchr(cursor, ':', length - (size_t)(cursor - record)) != 0 &&
+            (parse_number(&cursor, 0, INT_MAX, &second) != 0 ||
+            (size_t)(cursor - record) != length)) return -1;
     hex = cursor;
     hex_length = length - (size_t)(hex - record);
     if (hex_length % 2 != 0 || hex_length / 2 >= sizeof(path)) return -1;
@@ -516,16 +539,22 @@ static int restore_one(const char *record, size_t length)
         return guest_fd_duplicate((int)hidden, (int)fd);
     }
     if (hidden >= 0 && fcntl((int)hidden, F_GETFD) < 0) return -1;
+    if (second >= 0 && fcntl((int)second, F_GETFD) < 0) return -1;
     if (type == GUEST_FD_PATH) {
-        if (hex_length == 0 || hidden != -1) return -1;
+        if (hex_length == 0 || hidden != -1 || second != -1) return -1;
         return guest_fd_record_path((int)fd, path);
     }
     if (restore_functions[type] == 0 ||
-            restore_functions[type]((int)fd, (int)hidden, path) != 0)
+            restore_functions[type]((int)fd, (int)hidden, (int)second,
+                path) != 0)
         return -1;
     if (hidden >= 0) {
         int flags = fcntl((int)hidden, F_GETFD);
         if (flags >= 0) fcntl((int)hidden, F_SETFD, flags | FD_CLOEXEC);
+    }
+    if (second >= 0) {
+        int flags = fcntl((int)second, F_GETFD);
+        if (flags >= 0) fcntl((int)second, F_SETFD, flags | FD_CLOEXEC);
     }
     return 0;
 }

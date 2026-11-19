@@ -136,6 +136,7 @@
 #define LINUX_NR_FCHMODAT 333
 #define LINUX_NR_FACCESSAT 334
 #define LINUX_NR_UTIMENSAT 348
+#define LINUX_NR_EVENTFD 351
 #define LINUX_NR_EVENTFD2 356
 #define LINUX_NR_PSELECT6 335
 #define LINUX_NR_PPOLL 336
@@ -189,7 +190,6 @@
 #define LINUX_O_NONBLOCK 0x00000800u
 #define LINUX_O_CLOEXEC 0x00080000u
 #define LINUX_O_DIRECT 0x00010000u
-#define LINUX_EFD_SEMAPHORE 0x00000001u
 #define LINUX_WNOHANG 0x00000001u
 #define LINUX_WUNTRACED 0x00000002u
 #define LINUX_WCONTINUED 0x00000008u
@@ -344,6 +344,38 @@ int32_t linux_writev_compat(int descriptor, const struct iovec *vectors,
     result = write(descriptor, buffer, total);
     free(buffer);
     return linux_result(result);
+}
+
+/* readv/writev on a typed object with read/write ops (eventfd): the
+   first bytes of the vector, at most a small fixed buffer's worth, go
+   through the object's op.  Returns 0 when the fd isn't such an object. */
+static int typed_vector_io(int fd, const struct iovec *vectors, int count,
+    int writing, int32_t *result)
+{
+    unsigned char buffer[64];
+    size_t length = 0, position, part;
+    int index, handled;
+
+    if (!guest_fd_is_typed(fd)) return 0;
+    if (count < 0 || count > 1024) { *result = -EINVAL; return 1; }
+    for (index = 0; index != count && length != sizeof(buffer); ++index) {
+        part = vectors[index].iov_len;
+        if (part > sizeof(buffer) - length) part = sizeof(buffer) - length;
+        if (writing) memcpy(buffer + length, vectors[index].iov_base, part);
+        length += part;
+    }
+    handled = writing ?
+        guest_fd_dispatch_write(fd, buffer, length, result) :
+        guest_fd_dispatch_read(fd, buffer, length, result);
+    if (!handled || writing || *result <= 0) return handled;
+    for (index = 0, position = 0; position != (size_t)*result; ++index) {
+        part = vectors[index].iov_len;
+        if (part > (size_t)*result - position)
+            part = (size_t)*result - position;
+        memcpy(vectors[index].iov_base, buffer + position, part);
+        position += part;
+    }
+    return 1;
 }
 
 static int resolve_at(int directory_fd, const char *guest_path,
@@ -927,153 +959,9 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
     return 0;
 }
 
-/* The wake eventfd: the pipe-backed subset libcurl uses.  The guest holds
-   the read end; the write end is an emulator-owned hidden fd kept in the
-   shared object, closed when the last guest reference goes. */
-struct wake_eventfd {
-    int write_fd;
-};
-
-static int32_t wake_eventfd_read(struct guest_fd_object *object, int fd,
-    void *buffer, size_t length)
-{
-    (void)object;
-    if (length < sizeof(uint64_t)) return -EINVAL;
-    return linux_result(read(fd, buffer, sizeof(uint64_t)));
-}
-
-static int32_t wake_eventfd_write(struct guest_fd_object *object, int fd,
-    const void *buffer, size_t length)
-{
-    struct wake_eventfd *data = guest_fd_object_data(object);
-    uint64_t value;
-
-    (void)fd;
-    if (length < sizeof(value)) return -EINVAL;
-    memcpy(&value, buffer, sizeof(value));
-    if (value != 1) return -EINVAL;
-    return linux_result(write(data->write_fd, &value, sizeof(value)));
-}
-
-static int wake_eventfd_poll_fd(struct guest_fd_object *object, int fd)
-{
-    (void)object;
-    return fd;
-}
-
-static int wake_eventfd_get_status(struct guest_fd_object *object, int fd)
-{
-    (void)object;
-    return fcntl(fd, F_GETFL);
-}
-
-static int wake_eventfd_set_status(struct guest_fd_object *object, int fd,
-    int host_flags)
-{
-    struct wake_eventfd *data = guest_fd_object_data(object);
-    int write_flags = fcntl(data->write_fd, F_GETFL);
-    if (fcntl(fd, F_SETFL, host_flags) != 0 || write_flags < 0) return -1;
-    write_flags = (write_flags & ~O_NONBLOCK) | (host_flags & O_NONBLOCK);
-    return fcntl(data->write_fd, F_SETFL, write_flags) == 0 ? 0 : -1;
-}
-
-static void wake_eventfd_release(struct guest_fd_object *object)
-{
-    struct wake_eventfd *data = guest_fd_object_data(object);
-    close(data->write_fd);
-}
-
-static int wake_eventfd_serialize(struct guest_fd_object *object, int fd,
-    char *buffer, size_t size)
-{
-    struct wake_eventfd *data = guest_fd_object_data(object);
-    int length = snprintf(buffer, size, "%d:", data->write_fd);
-    (void)fd;
-    return length < 0 || (size_t)length >= size ? -1 : length;
-}
-
-static const struct guest_fd_ops wake_eventfd_ops = {
-    wake_eventfd_read, wake_eventfd_write, wake_eventfd_poll_fd,
-    wake_eventfd_get_status, wake_eventfd_set_status, wake_eventfd_release,
-    wake_eventfd_serialize
-};
-
-static int wake_eventfd_restore(int fd, int hidden_fd, const char *host_path)
-{
-    struct guest_fd_object *object;
-    (void)host_path;
-    if (hidden_fd < 0) return -1;
-    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &wake_eventfd_ops,
-        fd, sizeof(struct wake_eventfd));
-    if (object == 0) return -1;
-    ((struct wake_eventfd *)guest_fd_object_data(object))->write_fd =
-        hidden_fd;
-    if (guest_fd_attach(fd, object) != 0) {
-        guest_fd_put(object);
-        return -1;
-    }
-    guest_fd_put(object);
-    return 0;
-}
-
 void linux_syscall_register_fd_types(void)
 {
-    guest_fd_register_restore(GUEST_FD_WAKE_EVENTFD, wake_eventfd_restore);
-}
-
-static int32_t linux_eventfd2(uint32_t initial_value, uint32_t flags)
-{
-    int descriptors[2];
-    int host_status_flags = 0;
-    int saved_errno;
-    struct guest_fd_object *object;
-    struct wake_eventfd *data;
-
-    if ((flags & ~(LINUX_EFD_SEMAPHORE | LINUX_O_NONBLOCK |
-            LINUX_O_CLOEXEC)) != 0) return -EINVAL;
-    /* The pipe-backed form is the wake descriptor subset used by libcurl. */
-    if (initial_value != 0 || flags != (LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)) {
-        const uint32_t args[6] = { initial_value, flags, 0, 0, 0, 0 };
-        return linux_unsupported(LINUX_NR_EVENTFD2, LINUX_EOPNOTSUPP,
-            "eventfd-form", args);
-    }
-    if (pipe(descriptors) != 0) return -(int32_t)linux_errno_number(errno);
-    if (guest_fd_is_hidden(descriptors[0])) {
-        close(descriptors[0]);
-        close(descriptors[1]);
-        return -EMFILE;
-    }
-    if ((flags & LINUX_O_NONBLOCK) != 0) host_status_flags |= O_NONBLOCK;
-    if ((host_status_flags != 0 &&
-            (fcntl(descriptors[0], F_SETFL, host_status_flags) != 0 ||
-            fcntl(descriptors[1], F_SETFL, host_status_flags) != 0)) ||
-        ((flags & LINUX_O_CLOEXEC) != 0 &&
-            fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) < 0))
-        goto fail_both;
-    descriptors[1] = guest_fd_hide(descriptors[1]);
-    if (descriptors[1] < 0) {
-        saved_errno = errno;
-        close(descriptors[0]);
-        return -(int32_t)linux_errno_number(saved_errno);
-    }
-    object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &wake_eventfd_ops,
-        descriptors[0], sizeof(struct wake_eventfd));
-    if (object == 0) goto fail_both;
-    data = guest_fd_object_data(object);
-    data->write_fd = descriptors[1];
-    if (guest_fd_attach(descriptors[0], object) != 0) {
-        saved_errno = errno;
-        guest_fd_put(object);
-        close(descriptors[0]);
-        return -(int32_t)linux_errno_number(saved_errno);
-    }
-    guest_fd_put(object);
-    return descriptors[0];
-fail_both:
-    saved_errno = errno;
-    close(descriptors[0]);
-    close(descriptors[1]);
-    return -(int32_t)linux_errno_number(saved_errno);
+    linux_eventfd_register();
 }
 
 static int32_t linux_execve(const char *guest_path, char *const guest_argv[],
@@ -1648,15 +1536,21 @@ void linux_syscall_dispatch(ucontext_t *context)
         break;
     }
     case LINUX_NR_READV:
-        result = linux_result(readv((int)context->uc_mcontext.cpu.gpr[0],
-            (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
-            (int)context->uc_mcontext.cpu.gpr[2]));
+        if (!typed_vector_io((int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int)context->uc_mcontext.cpu.gpr[2], 0, &result))
+            result = linux_result(readv((int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int)context->uc_mcontext.cpu.gpr[2]));
         break;
     case LINUX_NR_WRITEV:
-        result = linux_writev_compat(
-            (int)context->uc_mcontext.cpu.gpr[0],
-            (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
-            (int)context->uc_mcontext.cpu.gpr[2]);
+        if (!typed_vector_io((int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int)context->uc_mcontext.cpu.gpr[2], 1, &result))
+            result = linux_writev_compat(
+                (int)context->uc_mcontext.cpu.gpr[0],
+                (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
+                (int)context->uc_mcontext.cpu.gpr[2]);
         break;
     case LINUX_NR_UMASK:
         result = (int32_t)umask((mode_t)context->uc_mcontext.cpu.gpr[0]);
@@ -2203,8 +2097,11 @@ void linux_syscall_dispatch(ucontext_t *context)
         }
         break;
     }
+    case LINUX_NR_EVENTFD:
+        result = linux_eventfd_create(context->uc_mcontext.cpu.gpr[0], 0);
+        break;
     case LINUX_NR_EVENTFD2:
-        result = linux_eventfd2(context->uc_mcontext.cpu.gpr[0],
+        result = linux_eventfd_create(context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_PIPE2:

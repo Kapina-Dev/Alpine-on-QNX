@@ -28,7 +28,7 @@ static void count_release(struct guest_fd_object *object)
 }
 
 static const struct guest_fd_ops counting_ops = {
-    0, 0, 0, 0, 0, count_release, 0
+    0, 0, 0, 0, 0, count_release, 0, 0
 };
 
 static struct guest_fd_object *new_object(int backing_fd)
@@ -192,7 +192,7 @@ static void stale_slot_cleared_on_create(void)
 
 /* A typed test object that carries a hidden fd across exec. */
 struct carried { int hidden; };
-static int restored_hidden;
+static int restored_hidden, restored_second;
 
 static void carried_release(struct guest_fd_object *object)
 {
@@ -209,13 +209,15 @@ static int carried_serialize(struct guest_fd_object *object, int fd,
 }
 
 static const struct guest_fd_ops carried_ops = {
-    0, 0, 0, 0, 0, carried_release, carried_serialize
+    0, 0, 0, 0, 0, carried_release, carried_serialize, 0
 };
 
-static int carried_restore(int fd, int hidden_fd, const char *host_path)
+static int carried_restore(int fd, int hidden_fd, int second_hidden_fd,
+    const char *host_path)
 {
     struct guest_fd_object *object;
     (void)host_path;
+    restored_second = second_hidden_fd;
     object = guest_fd_object_new(GUEST_FD_WAKE_EVENTFD, &carried_ops, fd,
         sizeof(struct carried));
     if (object == 0) return -1;
@@ -269,6 +271,85 @@ static void exec_records_round_trip(void)
     guest_fd_clear(d);
     guest_fd_clear(p[0]);
     close(d); close(p[0]);
+}
+
+/* Body "hidden:second:": both hidden fds survive exec and are restored
+   close-on-exec again. */
+struct carried_two { int hidden, second; };
+
+static void carried_two_release(struct guest_fd_object *object)
+{
+    struct carried_two *data = guest_fd_object_data(object);
+    close(data->hidden);
+    close(data->second);
+}
+
+static int carried_two_serialize(struct guest_fd_object *object, int fd,
+    char *buffer, size_t size)
+{
+    struct carried_two *data = guest_fd_object_data(object);
+    (void)fd;
+    return snprintf(buffer, size, "%d:%d:", data->hidden, data->second);
+}
+
+static const struct guest_fd_ops carried_two_ops = {
+    0, 0, 0, 0, 0, carried_two_release, carried_two_serialize, 0
+};
+
+static void exec_records_two_hidden(void)
+{
+    char records[512], expected[64];
+    int p[2], hidden, second, flags;
+    struct guest_fd_object *object;
+    struct carried_two *data;
+    if (pipe(p) != 0) { ++failures; return; }
+    guest_fd_register_restore(GUEST_FD_EVENTFD, carried_restore);
+    hidden = guest_fd_hide(p[1]);
+    second = guest_fd_hide(dup(p[0]));
+    object = guest_fd_object_new(GUEST_FD_EVENTFD, &carried_two_ops, p[0],
+        sizeof(struct carried_two));
+    data = guest_fd_object_data(object);
+    data->hidden = hidden;
+    data->second = second;
+    guest_fd_attach(p[0], object);
+    guest_fd_put(object);
+    snprintf(expected, sizeof(expected), "%d:%d:%d:%d:;", p[0],
+        (int)GUEST_FD_EVENTFD, hidden, second);
+    CHECK("exec_records_two_hidden",
+        guest_fd_exec_records(records, sizeof(records)) > 0 &&
+        strstr(records, expected) != 0);
+    CHECK("exec_records_two_hidden", guest_fd_exec_prepare() == 0);
+    flags = fcntl(hidden, F_GETFD);
+    CHECK("exec_records_two_hidden", flags >= 0 && (flags & FD_CLOEXEC) == 0);
+    flags = fcntl(second, F_GETFD);
+    CHECK("exec_records_two_hidden", flags >= 0 && (flags & FD_CLOEXEC) == 0);
+    /* New image: stand up fresh inherited hidden fds (clearing closed the
+       old ones) and restore the record. */
+    guest_fd_clear(p[0]);
+    hidden = guest_fd_hide(dup(p[0]));
+    second = guest_fd_hide(dup(p[0]));
+    fcntl(hidden, F_SETFD, 0);
+    fcntl(second, F_SETFD, 0);
+    snprintf(records, sizeof(records), "%d:%d:%d:%d:;", p[0],
+        (int)GUEST_FD_EVENTFD, hidden, second);
+    restored_hidden = restored_second = -2;
+    CHECK("exec_records_two_hidden", guest_fd_restore_records(records) == 1);
+    CHECK("exec_records_two_hidden",
+        restored_hidden == hidden && restored_second == second);
+    flags = fcntl(second, F_GETFD);
+    CHECK("exec_records_two_hidden", flags >= 0 && (flags & FD_CLOEXEC) != 0);
+    /* A one-number body still restores with no second fd. */
+    guest_fd_clear(p[0]);
+    hidden = guest_fd_hide(dup(p[0]));
+    snprintf(records, sizeof(records), "%d:%d:%d:;", p[0],
+        (int)GUEST_FD_EVENTFD, hidden);
+    CHECK("exec_records_two_hidden", guest_fd_restore_records(records) == 1 &&
+        restored_hidden == hidden && restored_second == -1);
+    /* Malformed second numbers are skipped. */
+    CHECK("exec_records_two_hidden",
+        guest_fd_restore_records("5:3:1:x:;5:3:1:2:ab;5:3:1:2:3:;") == 0);
+    guest_fd_clear(p[0]);
+    close(p[0]);
 }
 
 static void exec_records_alias_shares_object(void)
@@ -392,6 +473,7 @@ int main(void)
     stale_slot_cleared_on_create();
     exec_records_round_trip();
     exec_records_alias_shares_object();
+    exec_records_two_hidden();
     exec_records_reject_malformed();
     nofile_virtual_limit();
     exec_records_carry_limit();

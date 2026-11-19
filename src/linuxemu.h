@@ -232,6 +232,12 @@ void linux_syscall_dispatch(ucontext_t *context);
 /* Registers the exec-restore functions of the fd types linux_syscall.c
    owns.  Call before guest_fd_restore_records. */
 void linux_syscall_register_fd_types(void);
+/* eventfd (351) and eventfd2 (356): the guest fd or a negative Linux
+   errno.  eventfd passes linux_flags 0. */
+int32_t linux_eventfd_create(uint32_t initial, uint32_t linux_flags);
+/* Registers the eventfd exec restore (called by
+   linux_syscall_register_fd_types). */
+void linux_eventfd_register(void);
 int install_guest_traps(void);
 
 #endif
