@@ -68,6 +68,8 @@ set -x
     "$project_dir/native-probes/phase3-probes.c" -lsocket
 "$cc" $common_flags -o "$build_dir/probe_epolld" \
     "$project_dir/native-probes/probe_epolld.c"
+"$cc" $common_flags -o "$build_dir/phase3b-probes" \
+    "$project_dir/native-probes/phase3b-probes.c"
 "$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \
     -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c -lsocket
 "$cc" $common_flags -std=gnu99 -marm -DLINUXEMU_TESTING=1 \
@@ -117,6 +119,7 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/rim-binder-probe"
 "$sdk_root/bin/readelf" -h "$build_dir/phase3-probes"
 "$sdk_root/bin/readelf" -h "$build_dir/probe_epolld"
+"$sdk_root/bin/readelf" -h "$build_dir/phase3b-probes"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu-loader-test"
 "$sdk_root/bin/readelf" -h "$project_dir/build/elf-fixture-tool"
