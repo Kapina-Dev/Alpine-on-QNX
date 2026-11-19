@@ -5,7 +5,9 @@
  * One epoll instance is one guest fd object (GUEST_FD_EPOLL).  Its native
  * backing is the read end of a private pipe, the wake channel: the guest's
  * fd number is that read end (a real number for dup, close, fork and exec)
- * and the write end is an emulator-owned hidden fd.  The interest list is
+ * and the write end is an emulator-owned hidden fd.  Waits poll and drain
+ * a hidden duplicate of the read end, so a close of the guest's number
+ * under a waiter leaves the channel working.  The interest list is
  * process-local, in mmap-backed storage (this runs inside the syscall
  * handler: no malloc or stdio).
  *
@@ -150,9 +152,9 @@ struct epoll_instance {
     unsigned generation;    /* bumped by every change to items */
     size_t next_start;      /* rotation: first item a wait examines */
     int wake_write;         /* hidden write end of the wake channel */
-    int wake_read;          /* its hidden read end, or -1: the guest fd's
-                               own native read end (a fork child or a
-                               restored image has a private channel) */
+    int wake_read;          /* its hidden read end: a duplicate of the
+                               guest fd's native read end (a fork child or
+                               a restored image has a private channel) */
     int nonblock;           /* O_NONBLOCK as the guest set it */
     unsigned waiters;       /* threads polling this instance's set */
     unsigned stale_waiters; /* of those, polling a set older than generation */
@@ -396,7 +398,7 @@ static int set_status_flag(int fd, int flag)
 
 int32_t linux_epoll_create(uint32_t linux_flags)
 {
-    int channel[2], saved_errno;
+    int channel[2], saved_errno, wake_read = -1;
     struct guest_fd_object *object;
     struct epoll_instance *instance;
     if ((linux_flags & ~LINUX_EPOLL_CLOEXEC) != 0) return linux_error(EINVAL);
@@ -419,6 +421,17 @@ int32_t linux_epoll_create(uint32_t linux_flags)
         }
         channel[1] = hidden;
     }
+    /* The wait polls and drains a hidden duplicate of the read end, never
+       the guest's number: another thread may close epfd under a waiter
+       (Linux keeps the wait running), and then a wake write would meet a
+       pipe with no reader (SIGPIPE), or the number, reused, would name a
+       stranger's file whose data the drain would eat. */
+    wake_read = fcntl(channel[0], F_DUPFD, guest_fd_hidden_base());
+    if (wake_read < 0) {
+        if (errno == EINVAL) errno = EMFILE;
+        goto fail;
+    }
+    if (fcntl(wake_read, F_SETFD, FD_CLOEXEC) != 0) goto fail;
     object = guest_fd_object_new(GUEST_FD_EPOLL, &epoll_ops, channel[0],
         sizeof(struct epoll_instance));
     if (object == 0) goto fail;
@@ -428,7 +441,7 @@ int32_t linux_epoll_create(uint32_t linux_flags)
         instance->lock = fresh_lock;
     }
     instance->wake_write = channel[1];
-    instance->wake_read = -1;
+    instance->wake_read = wake_read;
     pthread_mutex_lock(&registry_lock);
     instance->next = registry;
     if (registry != 0) registry->previous = instance;
@@ -437,6 +450,7 @@ int32_t linux_epoll_create(uint32_t linux_flags)
     if (guest_fd_attach(channel[0], object) != 0) {
         saved_errno = errno;
         instance->wake_write = -1;
+        instance->wake_read = -1;
         guest_fd_put(object);
         errno = saved_errno;
         goto fail;
@@ -447,6 +461,7 @@ fail:
     saved_errno = errno;
     close(channel[0]);
     close(channel[1]);
+    if (wake_read >= 0) close(wake_read);
     return linux_error(saved_errno);
 }
 
@@ -1369,8 +1384,8 @@ int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
     if (object == 0) return result;
     instance = guest_fd_object_data(object);
     /* Set at create, restore or fork, never while the guest runs another
-       thread on it. */
-    wake_fd = instance->wake_read >= 0 ? instance->wake_read : epfd;
+       thread on it; never the guest's epfd (it may close under us). */
+    wake_fd = instance->wake_read;
     memset(&arrays, 0, sizeof(arrays));
     mask.signal_wait_fd = -1;
     if (sigmask != 0) {

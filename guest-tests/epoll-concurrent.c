@@ -30,8 +30,16 @@
  *   32 stress: 4 threads add, modify, delete and close 64 pipes for 5 s
  *      while 2 threads wait; no reported data belongs to a registration
  *      that was removed (DEL, MOD or close) before that wait began
+ *   34 B waits (2 s) on an epoll watching an accepted socket; A closes
+ *      the epoll fd, then the watched socket, then accepts a new
+ *      connection onto the epoll fd's old number and sends 6 bytes to it.
+ *      With SIGPIPE at its default action the process survives, B returns
+ *      (events or a timeout) within its timeout, and all 6 bytes are still
+ *      readable on the new socket (B's wait didn't drain them)
  *
  * EPOLL_CONCURRENT_CHECK=N in the environment runs only check N.
+ * EPOLL_CONCURRENT_IGNORE_SIGPIPE=1 ignores SIGPIPE for check 34 (to see
+ * its second failure, the drained socket, on a core that has the first).
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -39,6 +47,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -625,6 +634,71 @@ static int check_stress(void)
     return 0;
 }
 
+/* The epoll fd is closed under a waiter (Linux keeps the wait running on
+   the file), and its number is handed to a new socket.  The emulator's
+   wake channel must not be the guest's number: a wake write would then
+   meet a pipe with no reader (SIGPIPE), and the waiter's drain would read
+   the new socket's data. */
+static int check_close_under_wait(void)
+{
+    struct sockaddr_in address;
+    struct waiter w;
+    char data[16];
+    int ep = epoll_create1(0), lfd, first, second, watched, accepted, got = 0;
+    long long started;
+    const char *ignore = getenv("EPOLL_CONCURRENT_IGNORE_SIGPIPE");
+    signal(SIGPIPE, ignore != 0 && atoi(ignore) == 1 ? SIG_IGN : SIG_DFL);
+    if (ep < 0) return fail(10, "epoll_create1");
+    lfd = listener(&address);
+    first = socket(AF_INET, SOCK_STREAM, 0);
+    second = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0 || first < 0 || second < 0) return fail(10, "socket");
+    if (connect(first, (struct sockaddr *)&address, sizeof(address)) != 0)
+        return fail(10, "connect");
+    watched = accept(lfd, 0, 0);
+    if (watched < 0) return fail(10, "accept");
+    if (ep >= watched) { errno = 0; return fail(10, "fd order"); }
+    if (ctl(ep, EPOLL_CTL_ADD, watched, EPOLLIN, TAG_OLD) != 0)
+        return fail(34, "ADD");
+    if (start_wait(&w, ep, 2000) != 0) return fail(10, "pthread_create");
+    started = now_ms();
+    sleep_ms(50);
+    if (close(ep) != 0) return fail(34, "close the epoll fd");
+    sleep_ms(20);
+    if (close(watched) != 0) return fail(34, "close the watched socket");
+    sleep_ms(20);
+    if (connect(second, (struct sockaddr *)&address, sizeof(address)) != 0)
+        return fail(10, "connect");
+    accepted = accept(lfd, 0, 0);
+    if (accepted < 0) return fail(10, "accept");
+    if (accepted != ep)
+        { errno = 0; return fail(10, "accept did not reuse the epoll fd's number"); }
+    if (write(second, "abcdef", 6) != 6) return fail(10, "write");
+    if (join_wait(&w, 3500) != 0)
+        { errno = 0; return fail(34, "B's 2 s wait did not return"); }
+    if (w.result < 0) return fail(34, "epoll_wait");
+    if (now_ms() - started > 3000)
+        { errno = 0; return fail(34, "B returned after its timeout"); }
+    if (reported(&w, TAG_OLD))
+        { errno = 0; return fail(34, "the closed socket's item was reported"); }
+    sleep_ms(20);
+    for (;;) {
+        ssize_t n = recv(accepted, data + got, sizeof(data) - (size_t)got,
+            MSG_DONTWAIT);
+        if (n <= 0) break;
+        got += (int)n;
+    }
+    if (got != 6 || memcmp(data, "abcdef", 6) != 0) {
+        fprintf(stderr, "epoll-concurrent check 34: %d of 6 bytes left\n",
+            got);
+        errno = 0;
+        return fail(34, "the wait drained the new socket's data");
+    }
+    signal(SIGPIPE, SIG_DFL);
+    close(accepted); close(first); close(second); close(lfd);
+    return 0;
+}
+
 /* EPOLL_CONCURRENT_CHECK=N runs only check N (to show one check's RED on
    a core that fails an earlier one). */
 static int wanted(int check)
@@ -653,6 +727,8 @@ int main(void)
     if (wanted(33) && (arm(33, 30), result = check_socket_then_socket()) != 0)
         return result;
     if (wanted(32) && (arm(32, 30), result = check_stress()) != 0)
+        return result;
+    if (wanted(34) && (arm(34, 10), result = check_close_under_wait()) != 0)
         return result;
     return 0;
 }
