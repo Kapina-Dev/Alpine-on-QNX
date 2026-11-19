@@ -29,6 +29,12 @@
  * counted field is therefore only advanced by a 64-bit compare-and-swap
  * (eventfd_atomic_cas64): the process whose swap moves counted from seen
  * to total adds total - seen, so each expiration is added exactly once.
+ * The word also carries an arming number that every settime bumps, and
+ * the spec is read under a seqlock (sequence) together with it, so a
+ * total computed from a replaced arming never swaps into the new one.
+ * Left: a catch_up whose swap won just before another process's settime
+ * may still add that old arming's last few expirations after the
+ * settime's reset (bounded by what the old arming produced).
  *
  * Who fires.  Only the process that armed a timerfd (or an exec image that
  * inherited it armed) has its QNX timer, so poll/epoll readiness in a fork
@@ -81,6 +87,7 @@
 #include <sys/neutrino.h>
 #include <sys/procmgr.h>
 #include <sys/siginfo.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -124,10 +131,33 @@ struct timerfd_shared {
     uint32_t reserved;
     int64_t first_deadline;         /* host-clock ns of expiration 1 */
     int64_t interval;               /* ns; 0 for a one-shot timer */
-    uint64_t counted;               /* expirations added; CAS only */
+    uint64_t counted;               /* arming << 48 | count; CAS only */
     uint32_t cancel_on_set;         /* absolute REALTIME + CANCEL_ON_SET */
     uint32_t cancelled;             /* a clock set seen, not yet read */
     uint64_t cancel_offset;         /* realtime - monotonic ns; CAS only */
+    uint32_t sequence;              /* seqlock over the spec: odd while
+                                       a settime writes it */
+    uint32_t reserved2;
+};
+
+/* counted holds the arming number (bumped by every settime) in its top
+   16 bits and the expirations of that arming added so far below.  A
+   process that computed a total from one arming's spec can only swap
+   within that arming, so after a re-arm elsewhere its swap fails instead
+   of carrying the old arming's total into the new one. */
+#define COUNT_BITS 48
+#define COUNT_MASK ((((uint64_t)1) << COUNT_BITS) - 1)
+#define WORD_ARMING(word) ((word) >> COUNT_BITS)
+#define WORD_COUNT(word) ((word) & COUNT_MASK)
+/* Seqlock spins before assuming the writer died mid-update. */
+#define SEQUENCE_SPINS 100000
+
+/* One consistent view of the spec and counted (snapshot()). */
+struct arming {
+    uint32_t armed;
+    int64_t first_deadline;
+    int64_t interval;
+    uint64_t word;                  /* counted */
 };
 
 /* Per process.  The guest's fd (the channel read end) is passed to every
@@ -169,45 +199,99 @@ static void store64(volatile uint64_t *pointer, uint64_t value)
         seen = swapped;
 }
 
-static uint64_t counted_now(struct timerfd_shared *shared)
+/* Reads the spec and counted under the page's seqlock.  QNX has no
+   robust process-shared locks, so a writer that died mid-update (odd
+   sequence forever) is waited for only SEQUENCE_SPINS times. */
+static void snapshot(struct timerfd_shared *shared, struct arming *arming)
 {
-    return eventfd_atomic_load64(&shared->counted);
+    volatile struct timerfd_shared *page = shared;
+    int attempt;
+    for (attempt = 0; ; ++attempt) {
+        uint32_t before = page->sequence, after;
+        __sync_synchronize();
+        arming->armed = page->armed;
+        arming->first_deadline = page->first_deadline;
+        arming->interval = page->interval;
+        arming->word = eventfd_atomic_load64(&shared->counted);
+        __sync_synchronize();
+        after = page->sequence;
+        if ((before & 1u) == 0 && before == after) return;
+        if (attempt >= SEQUENCE_SPINS) return;
+        if (attempt > 100) sched_yield();
+    }
 }
 
-/* Expirations of the current arming due at now. */
-static uint64_t due_total(const struct timerfd_shared *shared, int64_t now)
+/* settime's write side.  Writers in different processes exclude each
+   other through the even -> odd swap; one that died mid-update is taken
+   over after SEQUENCE_SPINS tries. */
+static void arming_begin(struct timerfd_shared *shared)
 {
-    if (!shared->armed || now < shared->first_deadline) return 0;
-    if (shared->interval == 0) return 1;
-    return (uint64_t)((now - shared->first_deadline) / shared->interval) + 1;
+    int attempt;
+    for (attempt = 0; attempt < SEQUENCE_SPINS; ++attempt) {
+        uint32_t sequence = *(volatile uint32_t *)&shared->sequence;
+        if ((sequence & 1u) == 0 && __sync_val_compare_and_swap(
+                &shared->sequence, sequence, sequence + 1) == sequence)
+            return;
+        if (attempt > 100) sched_yield();
+    }
+    (void)__sync_fetch_and_or(&shared->sequence, 1u);
+}
+
+static void arming_end(struct timerfd_shared *shared)
+{
+    __sync_synchronize();
+    (void)__sync_fetch_and_add(&shared->sequence, 1u);
+}
+
+/* Expirations of the arming due at now (at most COUNT_MASK). */
+static uint64_t due_total(const struct arming *arming, int64_t now)
+{
+    uint64_t total;
+    if (!arming->armed || now < arming->first_deadline) return 0;
+    if (arming->interval == 0) return 1;
+    total = (uint64_t)((now - arming->first_deadline) / arming->interval) +
+        1;
+    return total > COUNT_MASK ? COUNT_MASK : total;
+}
+
+/* Moves counted up to total within the snapshot's arming; returns how
+   much this caller moved it (0 when another process got there first or
+   the timerfd was re-armed meanwhile). */
+static uint64_t advance_counted(struct timerfd_shared *shared,
+    const struct arming *arming, uint64_t total)
+{
+    uint64_t word = arming->word;
+    while (WORD_COUNT(word) < total) {
+        uint64_t seen = eventfd_atomic_cas64(&shared->counted, word,
+            (word & ~COUNT_MASK) | total);
+        if (seen == word) return total - WORD_COUNT(word);
+        if (WORD_ARMING(seen) != WORD_ARMING(word)) return 0;
+        word = seen;
+    }
+    return 0;
 }
 
 /* Adds the expirations due now that no process has counted yet.  The
    swap of counted decides which caller adds them, so two processes
-   catching up at once never add the same expiration twice. */
+   catching up at once never add the same expiration twice, and a total
+   computed from a replaced arming is never swapped in. */
 static void catch_up(struct timerfd_shared *shared, int write_fd)
 {
-    uint64_t total, seen;
-    if (!shared->armed) return;
-    total = due_total(shared, clock_now(shared->host_clock));
-    seen = counted_now(shared);
-    while (total > seen) {
-        uint64_t swapped = eventfd_atomic_cas64(&shared->counted, seen,
-            total);
-        if (swapped == seen) {
-            /* 0xfffffffffffffffe expirations can't be reached (584000
-               years at 1 ns), so a refused add is not handled. */
-            (void)eventfd_counter_add(&shared->event, write_fd,
-                total - seen);
-            return;
-        }
-        seen = swapped;
-    }
+    struct arming arming;
+    uint64_t added;
+    snapshot(shared, &arming);
+    if (!arming.armed) return;
+    added = advance_counted(shared, &arming,
+        due_total(&arming, clock_now(shared->host_clock)));
+    /* 0xfffffffffffffffe expirations can't be reached (584000 years at
+       1 ns), so a refused add is not handled. */
+    if (added != 0)
+        (void)eventfd_counter_add(&shared->event, write_fd, added);
 }
 
 /* realtime - monotonic, sampled with realtime on both sides of the
    monotonic read (retried when something slept in between). */
-static int64_t realtime_offset(void)
+static int realtime_offset(int64_t *offset)
 {
     int64_t before = 0, monotonic = 0, after = 0;
     int attempt;
@@ -215,9 +299,12 @@ static int64_t realtime_offset(void)
         before = clock_now(CLOCK_REALTIME);
         monotonic = clock_now(CLOCK_MONOTONIC);
         after = clock_now(CLOCK_REALTIME);
-        if (after - before < NS_PER_MS) break;
+        if (after - before >= 0 && after - before < NS_PER_MS) break;
     }
-    return before + (after - before) / 2 - monotonic;
+    *offset = before + (after - before) / 2 - monotonic;
+    /* Every sample noisy (or the clock stepped between the two realtime
+       reads): no trustworthy offset this time. */
+    return attempt < 3 ? 0 : -1;
 }
 
 /* TFD_TIMER_CANCEL_ON_SET: a realtime clock set since the baseline marks
@@ -225,8 +312,7 @@ static int64_t realtime_offset(void)
 static void check_clock_set(struct timerfd_shared *shared, int write_fd)
 {
     int64_t offset, baseline, change;
-    if (!shared->cancel_on_set) return;
-    offset = realtime_offset();
+    if (!shared->cancel_on_set || realtime_offset(&offset) != 0) return;
     baseline = (int64_t)eventfd_atomic_load64(&shared->cancel_offset);
     change = offset > baseline ? offset - baseline : baseline - offset;
     store64(&shared->cancel_offset, (uint64_t)offset);
@@ -237,18 +323,20 @@ static void check_clock_set(struct timerfd_shared *shared, int write_fd)
 
 /* Time to the next expiration and the interval, as gettime reports them
    (lock held).  A one-shot timer that has fired reports 0. */
-static void current_spec(const struct timerfd_shared *shared, int64_t *value,
+static void current_spec(struct timerfd_shared *shared, int64_t *value,
     int64_t *interval)
 {
+    struct arming arming;
     int64_t now;
-    *interval = shared->interval;
+    snapshot(shared, &arming);
+    *interval = arming.interval;
     *value = 0;
-    if (!shared->armed) return;
+    if (!arming.armed) return;
     now = clock_now(shared->host_clock);
-    if (now < shared->first_deadline) *value = shared->first_deadline - now;
-    else if (shared->interval != 0) {
-        int64_t passed = (now - shared->first_deadline) / shared->interval + 1;
-        *value = shared->first_deadline + passed * shared->interval - now;
+    if (now < arming.first_deadline) *value = arming.first_deadline - now;
+    else if (arming.interval != 0) {
+        int64_t passed = (now - arming.first_deadline) / arming.interval + 1;
+        *value = arming.first_deadline + passed * arming.interval - now;
     }
 }
 
@@ -256,17 +344,19 @@ static void current_spec(const struct timerfd_shared *shared, int64_t *value,
    (lock held), in ms: at least 1, at most the read slice. */
 static int wait_slice(struct timerfd_shared *shared)
 {
+    struct arming arming;
     int64_t next, left;
     uint64_t counted;
-    if (!shared->armed) return TIMERFD_READ_SLICE_MS;
-    counted = counted_now(shared);
-    if (shared->interval == 0) {
+    snapshot(shared, &arming);
+    if (!arming.armed) return TIMERFD_READ_SLICE_MS;
+    counted = WORD_COUNT(arming.word);
+    if (arming.interval == 0) {
         if (counted != 0) return TIMERFD_READ_SLICE_MS;
-        next = shared->first_deadline;
+        next = arming.first_deadline;
     } else {
-        if (counted > (uint64_t)(TIMERFD_NS_MAX / shared->interval))
+        if (counted > (uint64_t)(TIMERFD_NS_MAX / arming.interval))
             return TIMERFD_READ_SLICE_MS;
-        next = shared->first_deadline + (int64_t)counted * shared->interval;
+        next = arming.first_deadline + (int64_t)counted * arming.interval;
     }
     left = next - clock_now(shared->host_clock);
     if (left <= 0) return 1;
@@ -297,16 +387,18 @@ static int rearm_from_page(int index)
 {
     struct timer_slot *slot = &slots[index];
     struct timerfd_shared *shared = slot->shared;
+    struct arming arming;
     int64_t now, delay;
-    if (!shared->armed) return 0;
+    snapshot(shared, &arming);
+    if (!arming.armed) return 0;
     if (slot_timer(index) != 0) return -1;
     now = clock_now(shared->host_clock);
-    if (now < shared->first_deadline) delay = shared->first_deadline - now;
-    else if (shared->interval != 0)
-        delay = shared->first_deadline + ((now - shared->first_deadline) /
-            shared->interval + 1) * shared->interval - now;
+    if (now < arming.first_deadline) delay = arming.first_deadline - now;
+    else if (arming.interval != 0)
+        delay = arming.first_deadline + ((now - arming.first_deadline) /
+            arming.interval + 1) * arming.interval - now;
     else return 0;      /* a fired one-shot: catch_up counts it */
-    return host_arm(slot, delay, shared->interval);
+    return host_arm(slot, delay, arming.interval);
 }
 
 static void on_pulse(uint32_t value)
@@ -318,13 +410,15 @@ static void on_pulse(uint32_t value)
     slot = &slots[index];
     if (slot->in_use && slot->generation == (uint16_t)(value >> 16)) {
         struct timerfd_shared *shared = slot->shared;
+        struct arming arming;
         check_clock_set(shared, slot->write_fd);
         catch_up(shared, slot->write_fd);
+        snapshot(shared, &arming);
         /* A one-shot pulse that came before the deadline (QNX rounds to
            ticks, so it shouldn't) would leave a waiter asleep: re-arm. */
-        if (shared->armed && shared->interval == 0 &&
-                counted_now(shared) == 0 && slot->has_timer) {
-            int64_t left = shared->first_deadline -
+        if (arming.armed && arming.interval == 0 &&
+                WORD_COUNT(arming.word) == 0 && slot->has_timer) {
+            int64_t left = arming.first_deadline -
                 clock_now(shared->host_clock);
             if (left > 0) (void)host_arm(slot, left, 0);
         }
@@ -555,14 +649,16 @@ static short timerfd_ready_now(struct guest_fd_object *object, int fd)
 {
     struct timerfd_data *data = guest_fd_object_data(object);
     struct timerfd_shared *shared = data->shared;
+    struct arming arming;
     int due;
     (void)fd;
     if (eventfd_counter_load(&shared->event) != 0) return POLLRDNORM;
     pthread_mutex_lock(&timer_lock);
     check_clock_set(shared, data->write_fd);
-    due = shared->cancelled || (shared->armed &&
-        due_total(shared, clock_now(shared->host_clock)) >
-        counted_now(shared));
+    snapshot(shared, &arming);
+    due = shared->cancelled || (arming.armed &&
+        due_total(&arming, clock_now(shared->host_clock)) >
+        WORD_COUNT(arming.word));
     pthread_mutex_unlock(&timer_lock);
     return due ? POLLRDNORM : 0;
 }
@@ -775,28 +871,37 @@ int32_t linux_timerfd_settime(int fd, uint32_t flags, const void *new_spec,
         return result;
     }
     {
-        int64_t now = clock_now(shared->host_clock), delay = 0;
+        int64_t now = clock_now(shared->host_clock), delay = 0, offset = 0;
+        uint64_t word;
+        int armed = requested[0] != 0;
+        if (cancel) (void)realtime_offset(&offset);
+        arming_begin(shared);
         shared->cancel_on_set = 0;
         shared->interval = requested[1];
-        store64(&shared->counted, 0);
-        shared->armed = requested[0] != 0;
-        if (shared->armed) {
+        shared->armed = (uint32_t)armed;
+        if (armed) {
             shared->first_deadline = (flags & LINUX_TFD_TIMER_ABSTIME) != 0 ?
                 requested[0] : now + requested[0];
             delay = shared->first_deadline - now;
         }
-        if (cancel) store64(&shared->cancel_offset,
-            (uint64_t)realtime_offset());
+        /* A new arming number with a count of 0: a swap computed from the
+           previous spec in any process now fails. */
+        word = eventfd_atomic_load64(&shared->counted);
+        store64(&shared->counted, ((WORD_ARMING(word) + 1) & 0xffffu) <<
+            COUNT_BITS);
+        if (cancel) store64(&shared->cancel_offset, (uint64_t)offset);
         (void)__sync_lock_test_and_set(&shared->cancelled, 0);
         __sync_synchronize();
         shared->cancel_on_set = (uint32_t)cancel;
+        arming_end(shared);
         /* Linux resets the count on every settime. */
         eventfd_counter_set(&shared->event, data->write_fd, fd, 0);
         if (slot->has_timer &&
-                host_arm(slot, delay, shared->armed ? shared->interval : 0)
-                != 0) {
+                host_arm(slot, delay, armed ? requested[1] : 0) != 0) {
             result = -(int32_t)linux_errno_number(errno);
+            arming_begin(shared);
             shared->armed = 0;
+            arming_end(shared);
         }
         /* A deadline already passed counts now, as Linux fires at once. */
         catch_up(shared, data->write_fd);
@@ -850,12 +955,15 @@ int32_t linux_timerfd_set_ticks(int fd, const void *guest_ticks)
     }
     data = guest_fd_object_data(object);
     pthread_mutex_lock(&timer_lock);
-    /* Expirations due so far are folded into the replaced count. */
-    if (data->shared->armed) {
-        uint64_t total = due_total(data->shared,
-            clock_now(data->shared->host_clock));
-        if (total > counted_now(data->shared))
-            store64(&data->shared->counted, total);
+    /* Expirations due so far are folded into the replaced count:
+       counted only moves up, within the current arming, by swap, so a
+       concurrent catch_up elsewhere is never rolled back. */
+    {
+        struct arming arming;
+        snapshot(data->shared, &arming);
+        if (arming.armed)
+            (void)advance_counted(data->shared, &arming, due_total(&arming,
+                clock_now(data->shared->host_clock)));
     }
     eventfd_counter_set(&data->shared->event, data->write_fd, fd, ticks);
     pthread_mutex_unlock(&timer_lock);

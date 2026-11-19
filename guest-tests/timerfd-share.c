@@ -33,6 +33,13 @@
  *   19 clock_gettime works for CLOCK_BOOTTIME (7), CLOCK_REALTIME_ALARM
  *      (8) and CLOCK_BOOTTIME_ALARM (9), clock_getres for 7, and
  *      CLOCK_BOOTTIME moves with CLOCK_MONOTONIC over 50 ms
+ *   20 re-arming against readers in other processes: the parent re-arms
+ *      one shared 1 ms periodic timerfd 400 times, alternating a first
+ *      deadline 10 s in the past (10000 expirations due at once) and one
+ *      1 ms ahead, while 3 forked children spin reading it; everything read
+ *      never exceeds what the armings could have produced (+2), and the
+ *      last arming's count is right (+-2): an old arming's total must
+ *      never be added again under a new arming
  *
  * "timerfd-share --only N" runs check N alone; "--only 13-spin" runs
  * the nonblocking double-count half of check 13 alone.
@@ -733,6 +740,136 @@ static int check_clocks(void)
     return 0;
 }
 
+/* Expirations an arming with this first deadline could have produced by
+   at: an upper bound when first is the earliest it can be. */
+static int64_t at_most(int64_t first, int64_t at)
+{
+    return due(first, 1 * MS, at);
+}
+
+/* The check 20 reader: sums nonblocking reads until 's' arrives on the
+   control pipe; also the sum since 'p' (the last arming). */
+static int rearm_child(int t, int control, int report, int ack)
+{
+    int64_t sums[2] = { 0, 0 };
+    int phase = 0;
+    child_bound();
+    for (;;) {
+        uint64_t value;
+        char byte;
+        int r = read_count(t, &value);
+        if (r < 0) return 2;
+        sums[0] += (int64_t)value;
+        if (phase) sums[1] += (int64_t)value;
+        if (read(control, &byte, 1) == 1) {
+            if (byte == 'p') {
+                phase = 1;
+                if (write(ack, "a", 1) != 1) return 4;
+            } else break;
+        }
+    }
+    return write(report, sums, sizeof(sums)) == (ssize_t)sizeof(sums) ?
+        0 : 3;
+}
+
+static int check_rearm_race(void)
+{
+    enum { ARMINGS = 400, READERS = 3 };
+    int64_t bound = 0, previous_first = 0, before, after, first, sums[2],
+        final_before, final_after, t_a, t_b, total = 0, last = 0, lo, hi;
+    uint64_t value = 0;
+    int t = tfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK_FLAG),
+        control[READERS][2], report[2], ack[2], i, status;
+    pid_t pids[READERS];
+    if (t < 0 || pipe(report) != 0 || pipe(ack) != 0)
+        return fail(10, "timerfd or pipe");
+    for (i = 0; i < READERS; ++i) {
+        if (pipe(control[i]) != 0 ||
+                fcntl(control[i][0], F_SETFL, O_NONBLOCK) != 0)
+            return fail(10, "control pipe");
+        pids[i] = fork();
+        if (pids[i] < 0) return fail(10, "fork");
+        if (pids[i] == 0) _exit(rearm_child(t, control[i][0], report[1],
+            ack[1]));
+    }
+    for (i = 0; i < ARMINGS; ++i) {
+        before = mono();
+        if (i % 2 == 0) {
+            first = before - 10 * SECOND;
+            if (settime(t, TFD_ABSTIME, first, 1 * MS) != 0)
+                return fail(20, "settime with a past first deadline");
+        } else {
+            first = before + 1 * MS;
+            if (settime(t, 0, 1 * MS, 1 * MS) != 0)
+                return fail(20, "settime 1 ms ahead");
+        }
+        after = mono();
+        if (i > 0) bound += at_most(previous_first, after);
+        previous_first = first;
+        sleep_ms(2);
+    }
+    /* Disarm, let every reader start its "since the last arming" sum,
+       then arm the last time: those sums hold only the last arming. */
+    if (settime(t, 0, 0, 0) != 0) return fail(20, "disarm");
+    bound += at_most(previous_first, mono());
+    for (i = 0; i < READERS; ++i)
+        if (write(control[i][1], "p", 1) != 1)
+            return fail(10, "control write");
+    for (i = 0; i < READERS; ++i) {
+        char byte;
+        if (read(ack[0], &byte, 1) != 1) return fail(10, "ack read");
+    }
+    final_before = mono();
+    if (settime(t, 0, 1 * MS, 1 * MS) != 0)
+        return fail(20, "last settime");
+    final_after = mono();
+    sleep_ms(50);
+    for (i = 0; i < READERS; ++i)
+        if (write(control[i][1], "s", 1) != 1)
+            return fail(10, "control write");
+    for (i = 0; i < READERS; ++i) {
+        status = wait_child(pids[i]);
+        if (status != 0 || read(report[0], sums, sizeof(sums)) !=
+                (ssize_t)sizeof(sums)) {
+            fprintf(stderr, "reader status %d\n", status);
+            errno = 0;
+            return fail(20, "reader child");
+        }
+        total += sums[0];
+        last += sums[1];
+    }
+    t_a = mono();
+    if (read_count(t, &value) < 0) return fail(20, "final read");
+    t_b = mono();
+    total += (int64_t)value;
+    last += (int64_t)value;
+    lo = at_most(final_after + 1 * MS, t_a);
+    hi = at_most(final_before + 1 * MS, t_b);
+    bound += hi;
+    fprintf(stderr, "timerfd-share 20: read %lld (bound %lld), last arming "
+        "%lld (due %lld-%lld)\n", (long long)total, (long long)bound,
+        (long long)last, (long long)lo, (long long)hi);
+    if (total > bound + 2) {
+        errno = 0;
+        return fail(20, "more read than the armings produced (an old "
+            "arming counted again)");
+    }
+    if (last < lo - 2 || last > hi + 2) {
+        errno = 0;
+        return fail(20, "the last arming's count is wrong");
+    }
+    close(t);
+    for (i = 0; i < READERS; ++i) {
+        close(control[i][0]);
+        close(control[i][1]);
+    }
+    close(report[0]);
+    close(report[1]);
+    close(ack[0]);
+    close(ack[1]);
+    return 0;
+}
+
 static int run_check(int check, const char *self)
 {
     arm(check);
@@ -749,6 +886,7 @@ static int run_check(int check, const char *self)
     case 17: return check_cancel_on_set();
     case 18: return check_many();
     case 19: return check_clocks();
+    case 20: return check_rearm_race();
     default: errno = EINVAL; return fail(10, "no such check");
     }
 }
@@ -765,7 +903,7 @@ int main(int argc, char **argv)
     }
     if (argc == 3 && strcmp(argv[1], "--only") == 0)
         return run_check(atoi(argv[2]), argv[0]);
-    for (check = 11; check <= 19; ++check)
+    for (check = 11; check <= 20; ++check)
         if ((result = run_check(check, argv[0])) != 0) return result;
     return 0;
 }
