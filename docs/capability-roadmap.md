@@ -427,10 +427,14 @@ Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
   - Each blocking eventfd op and masked `ppoll`/`pselect6`/`epoll_pwait`
     made and closed a two-fd pipe, so 127 blocked threads exhausted the
     hidden reserve (`EMFILE` from `read`). Each thread now keeps one
-    signal-wait channel (a self-connected loopback UDP socket, one fd;
-    pipe fallback), drained at each wait and closed only at thread exit
-    (numbers withdrawn before the close) and in the fork child
-    (eventfd-blocking check 18, 200 threads).
+    signal-wait channel, a persistent hidden pipe, drained at each wait
+    and closed only at thread exit (numbers withdrawn before the close)
+    and in the fork child (eventfd-blocking check 18, 100 threads). The
+    limit stays about 127 concurrently-waiting threads. A one-fd
+    self-connected loopback UDP socket was used briefly and removed: its
+    stress test (`scripts/run-iopkt-stress.sh`) crashed io-pkt on the
+    Passport (`docs/FINDINGS.md` 2026-11-19), and Linuxemu must never send
+    io-pkt a message from a signal handler.
   - Exec records: one oversized record dropped every record; now only that
     record is dropped, with an `exec-fd-record-dropped` diagnostic.
   - The diagnostics errno table names `E2BIG`.
@@ -470,9 +474,18 @@ Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
   proves a page mapped, not writable.
 - `readv`/`writev` don't refuse hidden descriptors (pre-existing; matters
   more with eventfd's hidden fds).
-- A thread's signal-wait channel is made once (socket or pipe) and briefly
-  holds the lowest free guest fd numbers while it is moved into the hidden
-  range. Threads that ever waited keep one hidden fd while idle.
+- A thread's signal-wait pipe is made once and briefly holds the lowest
+  free guest fd numbers while it is moved into the hidden range. Threads
+  that ever waited keep two hidden fds while idle (about 127
+  concurrently-waiting threads at most).
+- Isolate the io-pkt crash (`docs/FINDINGS.md` 2026-11-19): run the
+  pieces of `guest-tests/iopkt-signal-stress.c` one at a time (the UDP
+  channel written from handlers, AF_UNIX `SCM_RIGHTS` ping-pong, path
+  bind/unlink under signals, TCP, thread churn), with the user present to
+  reboot, since a crash leaves the phone without network until reboot. If
+  plain guest socket use under signals triggers it, consider a
+  qnxBlockop-style guard (keep signals off a thread while it is inside an
+  io-pkt call).
 - Every `epoll_ctl` takes the process-wide `fd_replace_lock`, a throughput
   cost for Looper/Binder-style `ctl` churn.
 - M4 (review): `guest_fd_acquire`'s stale-record drop can release the

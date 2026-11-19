@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -13,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #define LINUX_CLONE_VM 0x00000100u
@@ -59,10 +57,10 @@ struct guest_thread_state {
     sem_t *futex_semaphore;
     volatile sig_atomic_t futex_interrupted;
     /* The thread's signal-wait channel (guest_thread_signal_wait_begin):
-       made on first use and kept until the thread ends.  One fd when it
-       is a self-connected loopback datagram socket (read == write), two
-       for the pipe fallback.  Posters are this thread's own signal
-       handlers; they write only while signal_wait_active. */
+       a nonblocking pipe made on first use and kept until the thread ends.
+       Posters are this thread's own signal handlers; they write only
+       while signal_wait_active.  Never a socket: a handler must not send
+       io-pkt a message (an io-pkt crash, docs/FINDINGS.md 2026-11-19). */
     volatile sig_atomic_t signal_wait_write_fd;
     int signal_wait_read_fd;
     volatile sig_atomic_t signal_wait_active;
@@ -329,7 +327,7 @@ void guest_thread_after_fork(void)
         memcpy(name, state->name, sizeof(name));
     }
     /* The channels are the parent's threads' (the child's copies of the
-       same pipe or socket): the child makes its own on first use. */
+       same pipes): the child makes its own on first use. */
     for (cursor = thread_registry; cursor != 0; cursor = cursor->next)
         signal_wait_close(cursor);
     if (state != 0 && state != &main_thread) free(state);
@@ -484,40 +482,7 @@ static int set_nonblocking(int fd)
     return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ? -1 : 0;
 }
 
-/* One fd: a datagram socket bound to loopback and connected to itself, so
-   a write to it makes it readable.  Emulator-owned, so it moves to the
-   hidden range (close-on-exec). */
-static int make_socket_channel(void)
-{
-    struct sockaddr_in address;
-    socklen_t length = sizeof(address);
-    int fd = socket(AF_INET, SOCK_DGRAM, 0), hidden;
-    if (fd < 0) return -1;
-    hidden = guest_fd_hide(fd);
-    if (hidden < 0) {
-        int saved_errno = errno == EINVAL ? EMFILE : errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    fd = hidden;
-    memset(&address, 0, sizeof(address));
-    address.sin_len = sizeof(address);
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-            getsockname(fd, (struct sockaddr *)&address, &length) != 0 ||
-            connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-            set_nonblocking(fd) != 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
-    return fd;
-}
-
-/* The fallback, two fds: a nonblocking pipe, both ends hidden. */
+/* Two fds: a nonblocking pipe, both ends hidden (close-on-exec). */
 static int make_pipe_channel(int *read_fd, int *write_fd)
 {
     int descriptors[2], i;
@@ -556,11 +521,8 @@ int guest_thread_signal_wait_begin(void)
     char sink[64];
     if (state == 0) { errno = EINVAL; return -1; }
     if (state->signal_wait_read_fd < 0) {
-        int read_fd = make_socket_channel(), write_fd = read_fd;
-        if (read_fd < 0) {
-            if (errno == EMFILE) return -1;
-            if (make_pipe_channel(&read_fd, &write_fd) != 0) return -1;
-        }
+        int read_fd, write_fd;
+        if (make_pipe_channel(&read_fd, &write_fd) != 0) return -1;
         state->signal_wait_read_fd = read_fd;
         __sync_synchronize();
         state->signal_wait_write_fd = write_fd;

@@ -159,12 +159,13 @@ Limits of the Phase 3 part 1 calls (eventfd and epoll):
 - **Signal-wait channels.** A thread that blocks in an eventfd `read` or
   `write`, or in `ppoll`, `pselect6` or `epoll_pwait` with a signal mask,
   gets one signal-wait channel on its first such wait and keeps it until
-  it exits: a loopback UDP socket connected to itself (one hidden
-  descriptor), or a pipe (two) if the socket can't be made. About 250
-  threads can therefore be blocked at once (200 are tested); before this a
-  fresh two-descriptor pipe per wait ran out at 127. Threads that waited
-  once keep their descriptor while idle, so very many such threads still
-  reach `EMFILE`.
+  it exits: a pipe (two hidden descriptors). About 127 threads can
+  therefore be blocked at once (100 are tested), and threads that waited
+  once keep their pair while idle, so more threads than that reach
+  `EMFILE`. A one-descriptor loopback UDP socket was tried and dropped:
+  the signal handler writes the channel, and a stress test that did so
+  crashed the Passport's network stack (io-pkt), see `docs/FINDINGS.md`
+  2026-11-19.
 - **Fork copies an epoll.** Linux shares one epoll between parent and
   child; here the child gets an independent copy of the interest list, and
   a change in one process isn't seen by the other. nginx, Redis and

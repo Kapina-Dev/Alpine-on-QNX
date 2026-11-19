@@ -18,11 +18,12 @@
  *   16 select with the eventfd in the write set reports it writable
  *   17 a forked child blocks in read and is SIGKILLed while blocked; the
  *      parent's write and read still work afterwards
- *   18 200 threads block in reads of one EFD_SEMAPHORE eventfd at once;
- *      none fails (EMFILE included: a two-fd signal-wait pipe per blocked
- *      thread ran the emulator's 256 hidden fds out at 127 threads); one
- *      write of 200 then completes every read with 1
- *      (EVENTFD_BLOCKING_THREADS=N changes the count)
+ *   18 100 threads block in reads of one EFD_SEMAPHORE eventfd at once;
+ *      none fails (EMFILE included); one write of 100 then completes every
+ *      read with 1 (EVENTFD_BLOCKING_THREADS=N changes the count).  Each
+ *      thread that has waited keeps a two-fd signal-wait pipe until it
+ *      exits, so the emulator's 256 hidden fds cap concurrently-waiting
+ *      threads near 127; 100 leaves a margin.
  *
  * Not checked: a counter above 0 with an empty readiness channel (left by
  * a process killed inside the few instructions between draining the
@@ -334,7 +335,7 @@ static int check_fork_kill(void)
     return 0;
 }
 
-#define MANY_READERS 200
+#define MANY_READERS 100
 
 static int check_many_readers(void)
 {
