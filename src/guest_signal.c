@@ -406,7 +406,11 @@ static void host_signal_handler(int host_signal, siginfo_t *information,
     uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
     if (linux_signal == 0) return;
     if (!guest_thread_syscall_active() && guest_memory_is_executable(pc, 4) &&
-        guest_signal_deliver(context, linux_signal, information) == 0) return;
+        guest_signal_deliver(context, linux_signal, information) == 0) {
+        /* The guest handler's mask, on the host until its sigreturn. */
+        guest_signal_apply_frame_mask(information);
+        return;
+    }
     guest_thread_signal_pending(linux_signal, information);
 }
 
@@ -430,7 +434,6 @@ static void poke_handler(int host_signal, siginfo_t *information,
     siginfo_t pending;
     int has_information, linux_signal;
     (void)host_signal;
-    (void)information;
     if (guest_thread_syscall_active() || !guest_memory_is_executable(pc, 4)) {
         guest_thread_signal_wake();
         return;
@@ -439,6 +442,7 @@ static void poke_handler(int host_signal, siginfo_t *information,
     if (linux_signal == 0 ||
             guest_signal_deliver(context, linux_signal,
                 has_information ? &pending : 0) != 0) return;
+    guest_signal_apply_frame_mask(information);
     /* More routed signals: the next poke arrives once this frame is set
        up (the poke is blocked until this handler returns), so they nest
        as Linux delivers several pending signals. */
@@ -874,14 +878,19 @@ int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
  * guest blocked stayed unblocked on QNX: a blocked default-action signal
  * ended the process, a handled one was queued by the host handler.
  *
- * guest_signal_frame_probe checks that layout once at start-up (a handler
- * on a spare signal must find a known mask there); only then does
- * guest_signal_apply_frame_mask write the guest's mask into the trap's
+ * guest_signal_frame_probe checks that layout once at start-up: a handler
+ * on a spare signal must find a known mask at that offset, and a signal it
+ * adds there must be blocked after the handler returns (so the slot is
+ * really what SignalReturn restores).  Only then does
+ * guest_signal_apply_frame_mask write the guest's mask into a handler's
  * frame: every host signal a Linux signal maps to is blocked exactly when
  * the guest blocks it (SIGILL and SIGSEGV never); the other host signals
- * keep their saved state.
+ * keep their saved state.  A failed probe leaves the old behaviour and is
+ * reported in LINUXEMU_DIAGNOSTICS.
  */
 #define FRAME_MASK_OFFSET (sizeof(siginfo_t) + 2 * sizeof(void *))
+/* The signal the probe adds through the slot. */
+#define FRAME_PROBE_ADDED SIGUSR2
 static int frame_mask_ok;
 static volatile int frame_probe_matched;
 static sigset_t frame_probe_expected;
@@ -900,18 +909,21 @@ static int same_signals(const sigset_t *first, const sigset_t *second)
 static void frame_probe_handler(int host_signal, siginfo_t *information,
     void *argument)
 {
+    sigset_t *slot = (sigset_t *)(void *)((char *)information +
+        FRAME_MASK_OFFSET);
     sigset_t saved;
     (void)host_signal;
     (void)argument;
-    memcpy(&saved, (const char *)information + FRAME_MASK_OFFSET,
-        sizeof(saved));
+    memcpy(&saved, slot, sizeof(saved));
     frame_probe_matched = same_signals(&saved, &frame_probe_expected);
+    /* Only write where the layout matched. */
+    if (frame_probe_matched) sigaddset(slot, FRAME_PROBE_ADDED);
 }
 
 void guest_signal_frame_probe(void)
 {
     struct sigaction action, old_action;
-    sigset_t old_mask, after;
+    sigset_t old_mask, after, wanted;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = frame_probe_handler;
     action.sa_flags = SA_SIGINFO;
@@ -930,8 +942,20 @@ void guest_signal_frame_probe(void)
     pthread_sigmask(SIG_SETMASK, 0, &after);
     pthread_sigmask(SIG_SETMASK, &old_mask, 0);
     sigaction(SIGEMT, &old_action, 0);
-    frame_mask_ok = frame_probe_matched &&
-        same_signals(&after, &frame_probe_expected);
+    /* After return: the saved mask plus the signal written into the
+       slot, proving the write is what SignalReturn restores. */
+    wanted = frame_probe_expected;
+    sigaddset(&wanted, FRAME_PROBE_ADDED);
+    frame_mask_ok = frame_probe_matched && same_signals(&after, &wanted);
+    if (!frame_mask_ok) {
+        uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+        args[0] = (uint32_t)frame_probe_matched;
+        args[1] = (uint32_t)FRAME_MASK_OFFSET;
+        /* Reported against rt_sigprocmask (175): guest masks then stay
+           emulated only, as before. */
+        (void)linux_report_unsupported(175, ENOSYS, "signal-frame-mask",
+            args);
+    }
 }
 
 void guest_signal_apply_frame_mask(siginfo_t *trap_information)

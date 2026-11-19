@@ -199,6 +199,28 @@ static void *guest_thread_start(void *argument)
     return 0;
 }
 
+/* The guest's mask starts as the host mask Linuxemu was started with.
+   Since the trap writes the guest's mask into the host (rt_sigprocmask),
+   an execve (run inside the trap handler) passes the old image's guest
+   mask on as the host mask, as Linux keeps the blocked set across exec;
+   the new image's guest view must start from it. */
+static void seed_signal_mask(struct guest_thread_state *state)
+{
+    sigset_t host;
+    int host_signal;
+    if (pthread_sigmask(SIG_SETMASK, 0, &host) != 0) return;
+    for (host_signal = 1; host_signal <= SIGRTMAX; ++host_signal) {
+        int linux_signal;
+        if (host_signal == SIGILL || host_signal == SIGSEGV ||
+                sigismember(&host, host_signal) != 1) continue;
+        linux_signal = guest_signal_from_host(host_signal);
+        if (linux_signal > 0 && linux_signal <= 64 &&
+                linux_signal != 9 && linux_signal != 19)
+            state->signal_mask[(linux_signal - 1) / 32] |=
+                1u << ((linux_signal - 1) % 32);
+    }
+}
+
 int guest_thread_initialize(void)
 {
     int error = pthread_key_create(&thread_state_key, 0);
@@ -208,6 +230,7 @@ int guest_thread_initialize(void)
     main_thread.signal_wait_write_fd = -1;
     main_thread.tid = initial_guest_tid();
     main_thread.host_thread = pthread_self();
+    seed_signal_mask(&main_thread);
     thread_registry = &main_thread;
     next_tid = (uint32_t)main_thread.tid + 1u;
     error = pthread_setspecific(thread_state_key, &main_thread);

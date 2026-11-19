@@ -1001,8 +1001,12 @@ programs).
   the guest's mask into its own frame's saved mask
   (`guest_signal_apply_frame_mask`). A start-up self-check
   (`guest_signal_frame_probe`: a handler on SIGEMT must find a known mask
-  at that offset, and the mask must be back after return) enables it; if
-  the layout ever differs the old behaviour stays. The same probe program
+  at that offset, and SIGUSR2 written into it there must be blocked after
+  return) enables it; if the layout ever differs the old behaviour stays
+  and `LINUXEMU_DIAGNOSTICS` reports `signal-frame-mask`. Because the host
+  mask now follows the guest's, `execve` (run inside the trap) passes the
+  blocked set on, as Linux does, and the new image seeds its guest mask
+  from the host mask at start-up. The same probe program
   shows the saved mask also carries QNX's always-masked top eight signals.
 - **Real-time signals queue only with `SA_SIGINFO`.** With SIGRTMIN+3
   blocked and three `sigqueue`s, a zero-timeout `sigtimedwait` loop took 1

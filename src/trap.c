@@ -100,13 +100,19 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
             return;
         }
         if (guest_memory_is_executable(pc, 4) &&
-            guest_signal_deliver(context, 11, info) == 0) return;
+            guest_signal_deliver(context, 11, info) == 0) {
+            guest_signal_apply_frame_mask(info);
+            return;
+        }
         fatal_signal(sig, info, pc);
     }
     if (sig != SIGILL) fatal_signal(sig, info, pc);
     if (site == 0) {
         if (guest_memory_is_executable(pc, 2) &&
-            guest_signal_deliver(context, 4, info) == 0) return;
+            guest_signal_deliver(context, 4, info) == 0) {
+            guest_signal_apply_frame_mask(info);
+            return;
+        }
         fatal_signal(sig, info, pc);
     }
     if (width == 4u &&
@@ -138,8 +144,11 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
         if (syscall_number == 175u)
             guest_signal_apply_frame_mask(info);
         context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + width);
-        guest_signal_deliver_pending(context, syscall_number, original_r0,
-            width);
+        /* A delivered handler runs with its sa_mask (and the signal)
+           blocked on the host too, until its sigreturn. */
+        if (guest_signal_deliver_pending(context, syscall_number,
+                original_r0, width) == 1)
+            guest_signal_apply_frame_mask(info);
         return;
     } else {
         fatal_signal(sig, info, pc);

@@ -38,6 +38,8 @@
  *      queue's ring stay pending in the QNX kernel until read; a sigqueue
  *      the kernel refuses with EAGAIN ends the sending early); the open
  *      fd count is unchanged afterwards
+ *   23 the blocked set survives execve: a fork child (SIGUSR1 blocked)
+ *      execs this fixture, whose sigprocmask old set holds SIGUSR1
  *
  * Linuxemu moves a process-directed signal into its queue on a collector
  * thread, a few microseconds after the kill returns, so the checks that
@@ -507,10 +509,36 @@ static int check_storm(void)
     return 0;
 }
 
-int main(void)
+/* The blocked set survives execve: a child that blocks SIGUSR1 (it
+   inherits main's mask) and execs this fixture sees SIGUSR1 in the old
+   set of its first sigprocmask. */
+static int check_exec_mask(const char *self)
+{
+    int status;
+    pid_t child = fork();
+    if (child < 0) return fail(23, "fork");
+    if (child == 0) {
+        execl(self, self, "exec-mask", (char *)0);
+        _exit(3);
+    }
+    if (waitpid(child, &status, 0) != child) return fail(23, "waitpid");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "exec'd image status %#x (exit 1: SIGUSR1 not in "
+            "its mask, 3: exec failed)\n", status);
+        return fail(23, "blocked set lost across execve");
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     sigset_t blocked;
     int result;
+    if (argc > 1 && strcmp(argv[1], "exec-mask") == 0) {
+        sigset_t old;
+        if (sigprocmask(SIG_BLOCK, 0, &old) != 0) return 2;
+        return sigismember(&old, SIGUSR1) == 1 ? 0 : 1;
+    }
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGUSR1);
     sigaddset(&blocked, SIGUSR2);
@@ -541,5 +569,7 @@ int main(void)
     if ((result = check_blocking()) != 0) return result;
     arm(22);
     if ((result = check_storm()) != 0) return result;
+    arm(23);
+    if ((result = check_exec_mask(argv[0])) != 0) return result;
     return 0;
 }

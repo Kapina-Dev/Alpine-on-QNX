@@ -77,8 +77,6 @@ int main(int argc, char **argv)
         perror("linuxemu initialization");
         return 1;
     }
-    guest_signal_frame_probe();
-    guest_signal_queue_defaults();
     if (guest_fd_initialize() != 0) {
         perror("linuxemu fd table");
         return 1;
@@ -95,6 +93,9 @@ int main(int argc, char **argv)
         linux_diag_runtime_initialize();
         if (enabled) guest_signal_diagnostics_initialize();
     }
+    /* After the diagnostics start: a failed frame probe is reported. */
+    guest_signal_frame_probe();
+    guest_signal_queue_defaults();
     /* After the diagnostics start: it can report a dropped item. */
     linux_epoll_restore_finish();
 #ifdef LINUXEMU_TESTING

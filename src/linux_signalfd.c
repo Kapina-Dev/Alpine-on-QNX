@@ -340,7 +340,17 @@ static int collect_records(const uint32_t mask[2], unsigned char *buffer,
                 (blocked[0] & (1u << (linux_signal - 1))) != 0) {
             /* One pending instance of a standard signal: a copy that
                reached the kernel again after the queued one is the same
-               Linux instance. */
+               Linux instance.  The collector works beside this without a
+               shared lock, so two races remain, both bounded to one
+               instance of one standard signal: a duplicate (the collector
+               took a second copy from the kernel and queues it after
+               this read emptied the queue: a later read returns it once
+               more), and a loss (a kill that lands after process_take
+               above but before this discarding take_kernel, while the
+               collector is between sigwaitinfo and its re-arm, is
+               discarded here although Linux would leave it pending).
+               Both need a second kill of the same signal inside that
+               window. */
             siginfo_t discarded;
             uint32_t single[2];
             single[0] = 1u << (linux_signal - 1);
