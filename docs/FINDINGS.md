@@ -627,3 +627,64 @@ in the code.
   too. It's a pre-existing fault, recorded in `docs/corpus-results.md` and
   not fixed here.
 
+
+## 2026-11-19 — Phase 3 part 1: device probes for eventfd and epoll
+
+Passport, ordinary user. Probes: `native-probes/phase3-probes.c` and
+`native-probes/probe_epolld.c` (built by `scripts/build-native-probes.sh`).
+Raw output:
+
+```
+fifo_note=mkdir /tmp/p3fifo238260226 failed errno=2
+fifo_rdwr=fail:2 (step 2)
+fifo_rdwr.disk=ok
+robust_mutex=absent (setrobust missing, consistent missing in libc)
+race_note=new pipe reused fd 5 and was written
+poll_close_race=n=0 revents=0x0 (POLLIN=0x5 POLLNVAL=0x1000) after 2003ms (blocked until timeout)
+rdhup_signal.tcp=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
+rdhup_signal.unix=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
+stat./dev/android/epoll=uid=0(root) gid=0(nto) mode=777
+stat./dev/binder=uid=1000(?) gid=10011(?) mode=660
+open./dev/android/epoll=ok fd=3
+epoll_ctl_devctl=not attempted (protocol recovery out of scope)
+```
+
+- **`fifo_rdwr`: a FIFO works as a readiness channel, but not in `/tmp`.**
+  `/tmp` is a symlink to `/dev/shmem`, which refuses directories
+  (`mkdir` gives `ENOENT`) and FIFOs (`mkfifo` gives `ENOENT`, step 2). On
+  the data filesystem (`/accounts/1000/shared/misc`) `mkfifo`,
+  `open(O_RDWR|O_NONBLOCK)` and `unlink` work; a written byte makes `poll`
+  report `POLLIN`, a read clears it (`poll` with timeout 0 reports
+  nothing), and a forked child's write wakes the parent's `poll`. So a
+  FIFO channel needs a directory on a disk filesystem, not `/tmp`.
+- **`robust_mutex`: absent.** The SDK headers declare no robust-mutex API,
+  and `libc.so.3` exports no `pthread_mutexattr_setrobust(_np)` or
+  `pthread_mutex_consistent(_np)`. A lock held by a process that died can't
+  be recovered with `EOWNERDEAD`, so shared state can't rely on it.
+- **`poll_close_race`: `poll` is not woken by a close from another thread.**
+  Thread A polling a pipe read end for 2 s was still blocked at the timeout
+  (`n=0 revents=0x0` after 2003 ms) although thread B had closed that fd
+  after 100 ms and a new pipe reused the number and was written. No
+  `POLLNVAL`, and the new pipe's `POLLIN` isn't seen either: the poll keeps
+  waiting on the old object.
+- **`rdhup_signal`: no `POLLHUP` or `POLLRDHUP`-like bit on half close.**
+  After the peer's `shutdown(SHUT_WR)`, a loopback TCP socket and an
+  `AF_UNIX` stream socket both report `revents=0x1` for a poll mask of
+  `POLLIN|POLLHUP|POLLRDNORM`. `POLLHUP` is clear. On QNX `POLLIN` is 0x5, so
+  `revents=0x1` is the `POLLRDNORM` bit alone (the probe's "POLLIN=y" is a
+  partial-bit match). `recv(MSG_PEEK)` returns 0, so peer
+  shutdown is detected as readable plus a zero-length peek.
+- **shm facts (earlier throwaway probe, same day).** As the ordinary user,
+  `shm_open` + immediate `shm_unlink` + `ftruncate` + `mmap(MAP_SHARED)` work
+  and leave no name in `/dev/shmem`. A `PTHREAD_PROCESS_SHARED` mutex and
+  condition variable in that memory work across `fork`. The shm fd passes
+  over `SCM_RIGHTS` and the receiver's mapping shares the counter.
+- **`/dev/android/epoll`.** With the Android runtime's nodes present
+  (`/dev/android/eventfd` dated today, `/dev/binder` and `epoll` dated
+  2026-11-18, `/tmp/android_core_started_by_player` present; the ordinary
+  user can't read the process list, so the processes themselves weren't
+  inspected), `/dev/android/epoll` is owned by root:nto with mode 777 and
+  `open(O_RDWR)` **succeeds** as the ordinary user, unlike `/dev/binder`
+  (owner 1000, group 10011, mode 660, `EACCES` in the 2026-11-17 spike).
+  The `epoll_ctl` devctl was not attempted: identifying it needs protocol
+  recovery, which is out of scope.
