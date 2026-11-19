@@ -50,6 +50,7 @@ run_rootfs_fixture epoll-modes
 run_rootfs_fixture epoll-nesting
 run_rootfs_fixture looper-pattern
 run_rootfs_fixture timerfd-basic
+run_rootfs_fixture timerfd-share
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"

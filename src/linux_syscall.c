@@ -101,6 +101,7 @@
 #define LINUX_NR_TKILL 238
 #define LINUX_NR_FCNTL64 221
 #define LINUX_NR_FUTEX 240
+#define LINUX_NR_CLOCK_SETTIME 262
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
@@ -159,6 +160,7 @@
 #define LINUX_NR_PRLIMIT64 369
 #define LINUX_NR_GETRANDOM 384
 #define LINUX_NR_CLOCK_GETTIME64 403
+#define LINUX_NR_CLOCK_SETTIME64 404
 #define LINUX_NR_CLOCK_GETRES_TIME64 406
 #define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
 #define LINUX_NR_PSELECT6_TIME64 413
@@ -985,6 +987,7 @@ static int32_t linux_pipe(void *guest_descriptors, uint32_t flags)
 void linux_syscall_register_fd_types(void)
 {
     linux_eventfd_register();
+    linux_timerfd_register();
     linux_epoll_register();
 }
 
@@ -2064,6 +2067,8 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_TIME:
     case LINUX_NR_GETTIMEOFDAY:
     case LINUX_NR_NANOSLEEP:
+    case LINUX_NR_CLOCK_SETTIME:
+    case LINUX_NR_CLOCK_SETTIME64:
     case LINUX_NR_CLOCK_GETTIME:
     case LINUX_NR_CLOCK_GETRES:
     case LINUX_NR_CLOCK_NANOSLEEP:

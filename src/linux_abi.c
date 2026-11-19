@@ -89,6 +89,7 @@ int linux_errno_number(int value)
     case EALREADY: return 114;
 #endif
     case EINPROGRESS: return 115;
+    case ECANCELED: return 125;
     default: return 5;
     }
 }

@@ -117,6 +117,17 @@ uint64_t eventfd_counter_load(struct eventfd_shared *shared)
     return load64(&shared->counter);
 }
 
+uint64_t eventfd_atomic_load64(volatile uint64_t *pointer)
+{
+    return load64(pointer);
+}
+
+uint64_t eventfd_atomic_cas64(volatile uint64_t *pointer, uint64_t expected,
+    uint64_t desired)
+{
+    return cas64(pointer, expected, desired);
+}
+
 /* Takes what a read returns: the whole counter, or 1 in semaphore mode.
    0 when the counter is empty. */
 uint64_t eventfd_counter_take(struct eventfd_shared *shared, int write_fd,
@@ -176,7 +187,7 @@ void eventfd_counter_set(struct eventfd_shared *shared, int write_fd,
    SA_RESTART exactly as for an interrupted native read or write.
 
    Returns 0 to re-check the counter, or a negative Linux errno. */
-static int32_t wait_for_change(struct eventfd_data *data, int read_fd,
+static int32_t wait_for_change(struct eventfd_shared *shared, int read_fd,
     uint64_t write_value, int timeout)
 {
     struct pollfd entries[2];
@@ -188,7 +199,7 @@ static int32_t wait_for_change(struct eventfd_data *data, int read_fd,
     guest_thread_signal_wait_arm();
     /* The re-check after the wait fd exists: a change from here on either
        raises the channel (read) or is seen by the next slice (write). */
-    counter = load64(&data->shared->counter);
+    counter = load64(&shared->counter);
     if (write_value == 0 ? counter != 0 :
             EVENTFD_COUNTER_MAX - counter >= write_value) {
         guest_thread_signal_wait_end();
@@ -229,12 +240,18 @@ static int32_t wait_for_change(struct eventfd_data *data, int read_fd,
    the number may now be something else.  The channel drain reads through
    that number, so stop (EBADF) rather than read a stranger's data.  Linux
    would finish the read on the old file; this is the safe approximation. */
-static int still_attached(struct guest_fd_object *object, int fd)
+int eventfd_still_attached(struct guest_fd_object *object, int fd)
 {
     struct guest_fd_object *current = guest_fd_acquire(fd);
     int same = current == object;
     guest_fd_put(current);
     return same;
+}
+
+int32_t eventfd_wait_readable(struct eventfd_shared *shared, int read_fd,
+    int timeout)
+{
+    return wait_for_change(shared, read_fd, 0, timeout);
 }
 
 static int32_t eventfd_read(struct guest_fd_object *object, int fd,
@@ -249,8 +266,9 @@ static int32_t eventfd_read(struct guest_fd_object *object, int fd,
         if (value != 0) break;
         if (data->shared->nonblock)
             return -(int32_t)linux_errno_number(EAGAIN);
-        waited = wait_for_change(data, fd, 0, EVENTFD_READ_SLICE_MS);
-        if (waited == 0 && !still_attached(object, fd))
+        waited = wait_for_change(data->shared, fd, 0,
+            EVENTFD_READ_SLICE_MS);
+        if (waited == 0 && !eventfd_still_attached(object, fd))
             waited = -(int32_t)linux_errno_number(EBADF);
         if (waited != 0) return waited;
     }
@@ -273,8 +291,8 @@ static int32_t eventfd_write(struct guest_fd_object *object, int fd,
         if (data->shared->nonblock)
             return -(int32_t)linux_errno_number(EAGAIN);
         /* value != 0 here: a write of 0 always succeeds. */
-        waited = wait_for_change(data, fd, value, slice);
-        if (waited == 0 && !still_attached(object, fd))
+        waited = wait_for_change(data->shared, fd, value, slice);
+        if (waited == 0 && !eventfd_still_attached(object, fd))
             waited = -(int32_t)linux_errno_number(EBADF);
         if (waited != 0) return waited;
         if (slice < EVENTFD_WRITE_SLICE_MAX_MS) slice *= 2;
@@ -552,6 +570,16 @@ static int eventfd_receive(int fd, const int *companions, int count)
         return -1;
     }
     return 0;
+}
+
+void *eventfd_map_page(int shm_fd)
+{
+    return map_page(shm_fd);
+}
+
+int eventfd_hidden_copy(int fd)
+{
+    return hidden_copy(fd);
 }
 
 void linux_eventfd_register(void)

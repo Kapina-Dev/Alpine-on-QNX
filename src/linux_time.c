@@ -9,10 +9,12 @@
 #define LINUX_NR_TIME 13
 #define LINUX_NR_GETTIMEOFDAY 78
 #define LINUX_NR_NANOSLEEP 162
+#define LINUX_NR_CLOCK_SETTIME 262
 #define LINUX_NR_CLOCK_GETTIME 263
 #define LINUX_NR_CLOCK_GETRES 264
 #define LINUX_NR_CLOCK_NANOSLEEP 265
 #define LINUX_NR_CLOCK_GETTIME64 403
+#define LINUX_NR_CLOCK_SETTIME64 404
 #define LINUX_NR_CLOCK_GETRES_TIME64 406
 #define LINUX_NR_CLOCK_NANOSLEEP_TIME64 407
 #define LINUX_TIMER_ABSTIME 1u
@@ -24,6 +26,13 @@ static int map_clock(int linux_clock, clockid_t *host_clock)
     case 1: *host_clock = CLOCK_MONOTONIC; return 0;
     case 2: *host_clock = CLOCK_PROCESS_CPUTIME_ID; return 0;
     case 3: *host_clock = CLOCK_THREAD_CPUTIME_ID; return 0;
+    /* CLOCK_BOOTTIME and the *_ALARM clocks as timerfd maps them
+       (linux_timerfd.c): BOOTTIME and BOOTTIME_ALARM read QNX's
+       monotonic clock (whether it stops in device sleep is unmeasured),
+       REALTIME_ALARM the realtime clock. */
+    case 7: *host_clock = CLOCK_MONOTONIC; return 0;
+    case 8: *host_clock = CLOCK_REALTIME; return 0;
+    case 9: *host_clock = CLOCK_MONOTONIC; return 0;
     default: return -1;
     }
 }
@@ -85,6 +94,21 @@ static int32_t get_clock(uint32_t *arguments, int time64, int resolution)
     if (!time64 && value.tv_sec > INT32_MAX) return -EOVERFLOW;
     if (time64) store_time64(result, &value);
     else store_time32(result, &value);
+    return 0;
+}
+
+/* Only CLOCK_REALTIME can be set (others EINVAL, as Linux).  The host
+   decides permission: an ordinary user gets EPERM. */
+static int32_t set_clock(uint32_t *arguments, int time64)
+{
+    struct timespec value;
+    int result;
+    if ((int)arguments[0] != 0) return -EINVAL;
+    result = time64 ? load_time64((const void *)arguments[1], &value) :
+        load_time32((const void *)arguments[1], &value);
+    if (result != 0) return result;
+    if (clock_settime(CLOCK_REALTIME, &value) != 0)
+        return -(int32_t)linux_errno_number(errno);
     return 0;
 }
 
@@ -155,6 +179,10 @@ int32_t linux_time_syscall(uint32_t number, uint32_t arguments[6])
     }
     if (number == LINUX_NR_NANOSLEEP)
         return sleep_clock(arguments, 0, 0);
+    if (number == LINUX_NR_CLOCK_SETTIME)
+        return set_clock(arguments, 0);
+    if (number == LINUX_NR_CLOCK_SETTIME64)
+        return set_clock(arguments, 1);
     if (number == LINUX_NR_CLOCK_GETTIME)
         return get_clock(arguments, 0, 0);
     if (number == LINUX_NR_CLOCK_GETRES)

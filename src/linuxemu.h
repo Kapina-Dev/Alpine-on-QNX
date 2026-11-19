@@ -296,6 +296,28 @@ void eventfd_channel_raise(struct eventfd_shared *shared, int write_fd);
 /* Drain, clear channel_full, re-check the counter (and re-raise). */
 void eventfd_channel_settle(struct eventfd_shared *shared, int write_fd,
     int read_fd);
+/* The 64-bit atomics behind the counter (ldrexd/strexd), for other
+   8-byte aligned fields of a shared page.  cas64 returns the value seen;
+   the swap happened when it equals expected. */
+uint64_t eventfd_atomic_load64(volatile uint64_t *pointer);
+uint64_t eventfd_atomic_cas64(volatile uint64_t *pointer, uint64_t expected,
+    uint64_t desired);
+/* The interruptible blocking wait of an eventfd read: sleeps until the
+   channel (read_fd) may hold a byte, the counter is already non-zero, or
+   timeout ms pass (0 back: re-check), or a guest signal arrives (-EINTR
+   in Linux numbering, restarted by the trap's SA_RESTART path).  Holds
+   nothing while it sleeps. */
+int32_t eventfd_wait_readable(struct eventfd_shared *shared, int read_fd,
+    int timeout);
+/* After a wait: fd still carries object (another thread may have closed
+   or replaced the number).  A blocked read returns EBADF when not. */
+/* Maps a shared page (EVENTFD_PAGE bytes) from its shm fd, or 0. */
+void *eventfd_map_page(int shm_fd);
+/* A hidden copy of an fd that arrived over SCM_RIGHTS, or -1 (EMFILE when
+   no hidden number is free). */
+int eventfd_hidden_copy(int fd);
+struct guest_fd_object;
+int eventfd_still_attached(struct guest_fd_object *object, int fd);
 /* A new channel: fds[0] the guest's pipe read end (admitted, nonblocking,
    FD_CLOEXEC when cloexec), fds[1] the hidden nonblocking write end,
    fds[2] a hidden zeroed shm page of EVENTFD_PAGE bytes mapped at *page.
@@ -314,6 +336,8 @@ int32_t linux_timerfd_gettime(int fd, void *spec, int time64);
 #define LINUX_TFD_IOC_SET_TICKS 0x40085400u
 int32_t linux_timerfd_set_ticks(int fd, const void *guest_ticks);
 void linux_timerfd_after_fork(void);
+/* Registers the timerfd exec-record restore and SCM_RIGHTS receive. */
+void linux_timerfd_register(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);
