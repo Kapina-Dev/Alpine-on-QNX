@@ -111,6 +111,52 @@ thread-directed, and interruption checks:
 sh scripts/run-signal-smoke.sh
 ```
 
+Run the Phase 3 eventfd and epoll guest fixtures:
+
+```sh
+sh scripts/run-event-smoke.sh
+```
+
+It ends with `linuxemu_event_smoke_failures=N` and runs after
+`run-signal-smoke` in the full regression. Each fixture is a musl C program
+in `guest-tests/NAME.c`, committed as `guest-tests/fixtures/NAME-armhf` and
+run from inside the test rootfs (so a fixture that execs itself finds its
+own path). It exits with the number of the first failing check and prints
+the check and `errno` on stderr; a hang is ended by a watchdog with exit
+code 100 + the check number. The header comment of each source lists its
+checks.
+
+- `eventfd-semantics`: counter, semaphore mode, nonblocking reads,
+  overflow and the `EINVAL` cases, `poll`, `fcntl`, `dup`, the libcurl
+  pattern, and `EMFILE` when a process runs out of eventfds.
+- `eventfd-blocking`: blocking reads and writes across threads, signals
+  with and without `SA_RESTART`, `POLLOUT` and `select` write readiness,
+  and a child killed while blocked.
+- `eventfd-share`: one eventfd across `fork`, `execve` and `SCM_RIGHTS`
+  (including the Phase 1 gate: an eventfd and a pipe received by a child
+  that closed its inherited copies).
+- `epoll-basic`: create, the `epoll_ctl` errors, level-triggered waits,
+  timeouts, `maxevents` and rotation, `epoll_pwait` masks, `epoll_pwait2`.
+- `epoll-concurrent`: `ctl`, `close`, `dup2` and number reuse while another
+  thread waits, including one socket replacing another on the same number.
+- `epoll-modes`: `EPOLLET`, `EPOLLONESHOT`, `EPOLLRDHUP`, `EPOLLEXCLUSIVE`,
+  `EPOLLWAKEUP`, and `EPOLLHUP` at pipe EOF.
+- `epoll-nesting`: nested epoll, epoll in `poll`/`select`, epoll across
+  `fork` and `execve`, and a spin detector for quiet waits
+  (`EPOLL_NESTING_CHECK=N` runs check N alone).
+- `looper-pattern`: Android's Looper loop (an eventfd wake, pipes and a
+  socketpair, timeouts, fds added and removed while waiting).
+- `wake-eventfd-dup` (assembly, built by `build-native-probes.sh`): the
+  libcurl wake eventfd through `dup`, `dup2` and closing the original
+  number.
+
+To rebuild a fixture, use a rootfs copy with Alpine `build-base` installed
+and commit the new binary:
+
+```sh
+ALPINE_ROOT=build/fixture-rootfs sh scripts/build-guest-fixture.sh epoll-basic
+```
+
 Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
 
 ```sh
@@ -223,7 +269,10 @@ sh scripts/run-corpus.sh git nginx  # selected apps
 - `linux_futex.c`: locked futex waiter registry, wake/requeue operations, and timeout conversion.
 - `guest_signal.c`: signal-number conversion, per-thread masks, Linux ARM signal frames, alternate stacks, delivery, and return.
 - `linux_time.c`: Linux time32/time64, clock-ID, resolution, and sleep conversion.
-- `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion.
+- `guest_fd.c`: the virtual descriptor table, typed descriptor objects, hidden descriptors, per-number epochs, and fork/exec records.
+- `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion, plus eventfd and epoll readiness in `poll`/`select`.
+- `linux_eventfd.c`: the eventfd object (shared-memory counter and readiness pipe).
+- `linux_epoll.c`: epoll instances, interest lists, waits, nesting, and fork/exec carry.
 - `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
 - `linux_termios.c`: Linux terminal flags, baud rates, control characters, window sizes, and related ioctl conversion.
 - `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
@@ -269,8 +318,7 @@ Each item below is covered by a device test suite.
   Alpine Python.
 - Alpine Python 3.14.7 imports and runs files, SQLite, clocks, verified HTTPS,
   loopback TCP/UDP, subprocesses, signals, four-thread synchronization, and a
-  `ThreadingHTTPServer` across 100 sequential connections. Unsupported `epoll`
-  creation returns Linux `ENOSYS`.
+  `ThreadingHTTPServer` across 100 sequential connections.
 - Alpine Git 2.54.0 creates, commits, verifies, packs, clones, pushes, and
   incrementally fetches repositories. Verified HTTPS clone/fetch and invalid
   certificate, unavailable authentication, and unreachable-server failures
@@ -300,19 +348,17 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - `svc #0` patching covers ARM code, plus Thumb-2 code in statically loaded binaries that carry a symbol table. Thumb code in libraries mapped at run time is not patched.
 - `vfork` and process-style `clone` currently use host `fork`; the `CLONE_VM | CLONE_VFORK | SIGCHLD` form used by musl `posix_spawn` is accepted without shared-address-space semantics.
 - Futex priority-inheritance and robust-list operations are unsupported. Non-private futex calls only synchronize threads inside one Linuxemu host process, so process-shared futexes across `fork` are not supported.
-- `ppoll` and `pselect6` use a transient per-thread nonblocking wake pipe to bridge QNX's separate mask and wait operations. `pselect6` returns `EMFILE` if that internal read descriptor is outside QNX `FD_SETSIZE`, which requires the process to have exhausted the descriptor range accepted by `select`.
+- `ppoll`, `pselect6`, `epoll_pwait` and blocking eventfd reads use a per-thread nonblocking signal-wait pipe to bridge QNX's separate mask and wait operations. The pipe lives in the hidden descriptor range; `select` and `pselect6` accept descriptors up to 4096.
 - Clock IDs beyond realtime, monotonic, process CPU time, and thread CPU time are rejected.
 - Socket ancillary/control messages other than `SCM_RIGHTS` and unlisted socket options are rejected. The DNS smoke test requires a reachable resolver and is bounded by an external timeout.
 - Package tests use apk's unprivileged `--no-chown` mode. Nanosecond timestamps are reduced to the seconds available through QNX `utime`, and Linux `flock` is approximated with QNX `fcntl` record locks.
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current
   process only.
-- `eventfd2` provides the nonblocking, close-on-exec, zero-initialized wake
-  descriptor form used by libcurl. It is pipe-backed; general counters,
-  semaphore mode, duplication from the event descriptor, and inherited event
-  descriptors are outside the supported surface and fail explicitly where
-  they can be identified. Replacing it as a `dup2`/`dup3` destination is
-  supported for Git's subprocess path.
+- eventfd and epoll limits (fork-copied epoll, registrations keyed by fd
+  number, the `EPOLLET` approximation, `EPOLLEXCLUSIVE`, `EPOLLRDHUP`, pipe
+  hangups, `SCM_RIGHTS`, capacities) are listed in
+  [compatibility.md](compatibility.md).
 - Patching is limited to validated `SHF_EXECINSTR` sections. Thumb instructions are decoded only in statically loaded binaries that carry a symbol table.
 - Section headers are currently required so the loader can avoid patching embedded data in executable segments.
 - Executable shared file mappings are rejected. Executable private file mappings use an anonymous copy because QNX 10.3 rejects instruction-cache invalidation on the file-backed form used by musl's loader.

@@ -364,6 +364,114 @@ signals; watcher tests pass create, update, rename, delete, and overflow cases.
 - inotify covers `IN_CREATE`, `IN_DELETE`, `IN_MOVED_*`, and `IN_CLOSE_WRITE`
   on directories, which is what FileObserver and PackageManager use.
 
+### Phase 3 part 1 status: complete (2026-11-19)
+
+Full eventfd and epoll, on branch `phase3a-events` (base `396a9d5`).
+Design and plan:
+`docs/superpowers/specs/2026-11-19-phase3a-eventfd-epoll-design.md` and
+`docs/superpowers/plans/2026-11-19-phase3a-eventfd-epoll.md`. Supported
+calls and limits: `docs/compatibility.md`; device facts: `docs/FINDINGS.md`.
+Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
+
+**What landed.**
+
+- eventfd: `eventfd`/`eventfd2` as a typed descriptor object, a 64-bit
+  counter in shared memory updated by a lock-free `ldrexd`/`strexd`
+  compare-and-swap, with a pipe as the pollable readiness channel.
+  Semaphore mode, overflow, blocking reads and writes with signal
+  interruption and `SA_RESTART`, `POLLOUT`, and one shared object across
+  `dup`, `fork`, `execve` and `SCM_RIGHTS` (the hidden fds travel with the
+  message under an `LXRIGHT1` descriptor map). libcurl's wake descriptor is
+  now this eventfd.
+- epoll: `epoll_create`/`create1`/`ctl`/`wait`/`pwait`/`pwait2` over QNX
+  `poll()`. Level-triggered, `EPOLLET` (approximated), `EPOLLONESHOT`,
+  `EPOLLRDHUP` (zero-length `MSG_PEEK`), `EPOLLEXCLUSIVE`, `EPOLLWAKEUP`;
+  fair rotation; `ctl` and close wake a waiter in another thread; stale
+  items are found by a per-fd-number epoch; nested epoll to depth 5 and
+  epoll fds in `poll`/`select`; an independent copy across `fork`, the
+  interest list across `execve`.
+- `poll`/`select`: eventfd and epoll readiness, `POLLHUP` at pipe EOF, and
+  host fd sets of 4096 bits.
+- The hidden descriptor reserve went from 64 to 256, so the guest
+  `RLIMIT_NOFILE` is 744 on the Passport (was 936).
+- The Android Looper pattern passes (`looper-pattern`).
+- The RIM `epolld` probe (research only): `/dev/android/epoll` is root:nto
+  mode 777 and opens `O_RDWR` as the ordinary user, unlike `/dev/binder`.
+  Its devctl protocol was not recovered; the `poll()` backend stays the
+  only one.
+
+**Bugs found and fixed on the way.**
+
+- The per-thread signal-wait pipe that `ppoll`/`pselect6` create landed on
+  guest-visible fd numbers; it is now hidden. Hiding it put it above QNX's
+  `FD_SETSIZE` of 256, and `pselect6` returned `EMFILE`; fd sets are now
+  4096 bits.
+- QNX gives every socket of a family the same (st_dev, st_ino), so the
+  design's identity check couldn't see one socket replacing another on a
+  reused number. A per-number epoch replaced it.
+- `epoll_ctl` from another thread didn't wake a blocked waiter; `ctl` now bumps a generation and writes the wake channel.
+- An epoll lock held by another thread at `fork` stayed locked in the
+  child; the child now gets fresh locks and its own wake channel.
+- A race in the nested-epoll probe counter left a process-wide busy spin
+  (unbounded with timeout -1); the epoll-nesting spin detector (check 17)
+  pins the fix.
+- Emulator limits that failed silently (exec list too long, nesting table
+  full) are now reported in `LINUXEMU_DIAGNOSTICS`.
+- `sendmsg` with more than 253 fds returns `EINVAL`, as Linux's
+  `SCM_MAX_FD`.
+
+**Gate results.**
+
+- All nine `run-event-smoke` fixtures pass on the Passport.
+- Full device regression: every suite passes, `linuxemu_full_regression_failures=0`
+  (core `fd053762…`), including `run-python-smoke` and `run-git-smoke`. The
+  python3 SIGSEGV at `0x60067dc4` didn't appear. The Python smoke's old
+  check that `select.epoll()` fails with `ENOSYS` was turned into a
+  positive epoll check.
+- Application corpus: 7 of 11 compatible. Redis is newly compatible (all
+  five stages on epoll); BusyBox's shutdown stage failed once and passed in
+  three reruns (intermittent, watch item). No app reports an eventfd or
+  epoll call any more. Results: `docs/corpus-results.md`.
+- Node.js gets past `epoll_create1` and now dies at start-up with a SIGSEGV
+  at address 0, after `madvise` (`ENOSYS`) and a refused `mremap`.
+- nginx creates its epoll (`using the "epoll" event method`), but
+  `ioctl(FIOASYNC)` on the master/worker socketpair returns `ENOTTY`, so it
+  starts no worker and never answers.
+
+**Carried forward.**
+
+- nginx: `ioctl(FIOASYNC)` on sockets. nginx's next call on that fd is
+  `fcntl(F_SETOWN)`, which Linuxemu answers with `EINVAL` (QNX returns
+  `ENOSYS`), so it is likely the blocker after that. Unknown ioctls return
+  `ENOTTY` without a `LINUXEMU_DIAGNOSTICS` entry and should be reported.
+- Node.js: the start-up SIGSEGV (pc `0x0116d688`, address 0) after
+  `madvise` `ENOSYS` and `mremap` `mremap-kind`; likely V8 memory or JIT
+  work (Phase 4/6).
+- The intermittent BusyBox corpus shutdown failure ("still-alive" after
+  `wait` returned 143).
+- A guest-copy helper that returns `EFAULT` for a bad guest buffer: an
+  eventfd `read`/`write` into unmapped memory kills Linuxemu today (the
+  existing `ioctl`/`writev`/pipe convention), and epoll's `EFAULT` check
+  proves a page mapped, not writable.
+- `readv`/`writev` don't refuse hidden descriptors (pre-existing; matters
+  more with eventfd's hidden fds).
+- The signal-wait pipe briefly holds the two lowest free guest fd numbers
+  while it is moved into the hidden range.
+- Every `epoll_ctl` takes the process-wide `fd_replace_lock`, a throughput
+  cost for Looper/Binder-style `ctl` churn.
+- The diagnostics errno table has no `E2BIG`, so `epoll-exec-list-too-long`
+  prints `error=E7`.
+- Smaller items from the reviews: an eventfd `F_SETFL` keeps
+  only `O_NONBLOCK`; a failed exec restore leaks two carried hidden fds;
+  a current-generation waiter can loop briefly while a wake byte remains;
+  `ppoll`/`pselect6` return `EINTR` when an fd is ready and an unblocked
+  signal is pending (Linux returns the count).
+- Every limit in `docs/compatibility.md` ("Limits of the Phase 3 part 1
+  calls") stays as documented: fork-copied epoll, registrations keyed by fd
+  number, the `EPOLLET` approximation, `EPOLLEXCLUSIVE` waking all waiters,
+  late `EPOLLRDHUP`, pipe hangups with data left, the near-full eventfd
+  writer, epoll fds over `SCM_RIGHTS`, and the capacities.
+
 ## Phase 4: Thumb and stripped-binary support
 
 Implement safe Thumb guest decoding and interception:

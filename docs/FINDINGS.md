@@ -505,7 +505,8 @@ table's back is dropped when it's next used. It replaces the fixed
   resumes a fresh one (`getdents-chunks`, 164 → 0).
 - **A guest close-all loop could close emulator fds.** The guest's
   `RLIMIT_NOFILE` is now virtual, at the hidden base: **936** on the
-  Passport, where the host limit is 1000/1000. close, dup2/dup3, F_DUPFD,
+  Passport, where the host limit is 1000/1000 (744 since Phase 3 part 1
+  raised the hidden reserve from 64 to 256). close, dup2/dup3, F_DUPFD,
   poll and select refuse hidden numbers (`fd-close-all`, 151 → 0).
 - **SCM_RIGHTS adoption, narrow scope.** A received fd whose pipe-backed
   object the receiver already holds (for example, inherited across fork)
@@ -627,15 +628,16 @@ in the code.
   too. It's a pre-existing fault, recorded in `docs/corpus-results.md` and
   not fixed here.
 
-
 ## 2026-11-19 — Phase 3 part 1: device probes for eventfd and epoll
 
 Passport, ordinary user. Probes: `native-probes/phase3-probes.c` and
 `native-probes/probe_epolld.c` (built by `scripts/build-native-probes.sh`).
-Raw output:
+Raw output of one run of each, back to back (rerun at the Phase 3 part 1
+gate so that every line comes from the same run; the verdicts match the
+first runs):
 
 ```
-fifo_note=mkdir /tmp/p3fifo242049244 failed errno=2
+fifo_note=mkdir /tmp/p3fifo507519170 failed errno=2
 fifo_rdwr.tmp=fail:2 (step 2)
 fifo_rdwr.disk=ok
 fifo_rdwr=ok-disk-only
@@ -645,8 +647,8 @@ dead_owner_plain=ETIMEDOUT
 robust_header=PTHREAD_MUTEX_ROBUST not defined
 dlsym_setrobust=missing dlsym_consistent=missing
 robust_mutex=absent (via dlsym: setrobust missing, consistent missing)
-race_note=new pipe reused fd 5 and was written
-poll_close_race=n=0 revents=0x0 (POLLIN=0x5 POLLNVAL=0x1000) after 2004ms (blocked until timeout)
+race_note=new pipe reused fd 4 and was written
+poll_close_race=n=0 revents=0x0 (POLLIN=0x5 POLLNVAL=0x1000) after 2002ms (blocked until timeout)
 rdhup_signal.tcp=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
 rdhup_signal.unix=n=1 revents=0x1 (POLLIN=y POLLHUP=n POLLRDNORM=y) peek=0 errno=0
 stat./dev/android/epoll=uid=0(root) gid=0(nto) mode=777
@@ -668,12 +670,13 @@ epoll_ctl_devctl=not attempted (protocol recovery out of scope)
   headers (`robust_header=... not defined`), and `dlsym` finds neither
   `pthread_mutexattr_setrobust(_np)` nor `pthread_mutex_consistent(_np)`.
   What a dead owner does instead: a `PTHREAD_PROCESS_SHARED` mutex in shm
-  whose holder `_exit`ed without unlocking is never released
-  (`dead_owner_plain=ETIMEDOUT` on a 1 s `pthread_mutex_timedlock`), so shared
-  state can't rely on a lock surviving its owner.
+  whose holder `_exit`ed without unlocking was still locked 1 s later
+  (`dead_owner_plain=ETIMEDOUT` from a 1 s `pthread_mutex_timedlock`; the
+  probe waits no longer than that), so shared state can't rely on a lock
+  surviving its owner.
 - **`poll_close_race`: `poll` is not woken by a close from another thread.**
   Thread A polling a pipe read end for 2 s was still blocked at the timeout
-  (`n=0 revents=0x0` after 2004 ms) although thread B had closed that fd
+  (`n=0 revents=0x0` after 2002 ms) although thread B had closed that fd
   after 100 ms and a new pipe reused the number and was written. No
   `POLLNVAL`, and the new pipe's `POLLIN` isn't seen either: the poll keeps
   waiting on the old object.
@@ -812,3 +815,63 @@ Linuxemu now reports a pipe read end that QNX calls readable with
 `poll`/`ppoll` and in epoll (`EPOLLHUP`), as Linux does for an empty pipe
 with no writers. Known limit: with unread data left, the hangup shows only
 once the data is read. The `epoll-modes` fixture's check 18 pins this.
+
+## 2026-11-19 — Phase 3 part 1: other QNX facts found while adding eventfd and epoll
+
+Passport, ordinary user, native probes and builds (throwaway probes, not
+committed). Each fact is pinned by a guest test or a note in the code.
+
+- **No inline 64-bit compare-and-swap with the SDK compiler.** GCC 4.6.3
+  (`-march=armv7-a`) compiles `__sync_val_compare_and_swap` on a
+  `uint64_t` to a call to `__sync_val_compare_and_swap_8`, which the QNX
+  `libgcc.a` doesn't have, so the link fails:
+
+  ```
+  00000000 <cas64>:  0: eafffffe  b  0 <__sync_val_compare_and_swap_8>
+  cas64.c:(.text+0x0): undefined reference to `__sync_val_compare_and_swap_8'
+  ```
+
+  The eventfd counter therefore uses an inline `ldrexd`/`strexd` loop
+  between `dmb` barriers (the Linux kernel's `atomic64_cmpxchg` sequence).
+  `nm` of the core lists no `__sync*` or libatomic symbol. The 32-bit
+  `__sync` builtins are inline (`ldrex`/`strex`).
+- **`POLLHUP` on a full peer close.** QNX does report a stream socket's
+  hangup once the peer has closed completely, but not on a half close or on
+  pipes. QNX bits: `POLLRDNORM` 0x1, `POLLWRNORM` 0x2, `POLLHUP` 0x40,
+  `POLLNVAL` 0x1000.
+
+  | Case | revents | `recv(MSG_PEEK)` |
+  | --- | --- | --- |
+  | stream socketpair, open | 0 | -1 `EAGAIN` |
+  | peer fully closed, events `POLLIN` | 0x41 | 0 |
+  | peer fully closed, events 0 | 0x40 | 0 |
+  | peer fully closed, events `POLLIN\|POLLOUT` | 0x43 | 0 |
+  | peer wrote 1 byte, then closed | 0x41 | 1 |
+  | peer `shutdown(SHUT_WR)` only | 0x1 | 0 |
+  | both sides `SHUT_WR` | 0x43 | 0 |
+  | datagram socketpair, peer closed | 0x1 | -1, errno 254 |
+  | pipe read end, writer closed | 0x1 | — |
+  | pipe write end, reader closed | 0x2 | — |
+  | closed fd in the set | 0x1000 | — |
+
+  So `EPOLLHUP` on a closed stream peer needs no emulation. Pipes are
+  covered by the pipe EOF entry above.
+- **A pipe's write end reports `POLLRDNORM` while the pipe holds data.**
+  Linux never reports `POLLIN` on a write end. `epoll-basic` registers
+  write ends with events 0 so its checks don't depend on it.
+- **QNX `select()` works above its `FD_SETSIZE` of 256.** With a large
+  enough set, a pipe at fd 800 is reported correctly, empty (0) and with
+  data (1). Hiding the per-thread signal-wait pipe put it at 744 or above,
+  where `pselect6` had refused it (`EMFILE`, `signal-queue-wait-syscalls`
+  exit 8). Linuxemu's host fd sets are now 4096 bits.
+- **`msync(MS_ASYNC)` tells mapped from unmapped memory.** An unmapped page
+  or NULL gives `ENOMEM`; bss, stack, text and `mmap` pages give 0.
+  `epoll_wait` uses it as the `EFAULT` fallback for guest memory the
+  loader doesn't track. It shows that a page is mapped, not that it is
+  writable.
+- **A `poll()` busy loop costs less CPU than it seems.** A wait spinning
+  on a pipe for 200 ms used only 50 to 70 ms of
+  `CLOCK_THREAD_CPUTIME_ID`, because most of each round trip is QNX's pipe
+  manager (another process) answering the poll; a sleeping wait uses 0 to
+  1 ms. The `epoll-nesting` spin detector (check 17) uses a 20 ms
+  threshold for that reason.

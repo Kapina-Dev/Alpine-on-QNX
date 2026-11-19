@@ -181,3 +181,60 @@ which is Phase 3 work. `statx` and `capget` no longer appear, and
   Phase 2. The corpus Python app passes all five stages.
 - `run-git-smoke`, which the full regression runs after `run-python-smoke`,
   passed when run separately on the same core (rc=0).
+
+## Phase 3 part 1: 2026-11-19
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user.
+- **Linuxemu:** branch `phase3a-events` at `b38f3cb` (core unchanged since
+  `1e3b521`), core sha256
+  `fd0537628f93b998a63a5fa8059b6baddd285b5e8b8cf2b5e0f11a76ecc8f647`.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+- **Leftovers:** no Linuxemu process was left running; the harness killed
+  the nginx server it started (status 137).
+
+```text
+apk install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+busybox install=pass startup=pass basic=pass concurrent=pass shutdown=fail compatible=no unsupported=1
+gcc-make install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+git install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+inotify-tools install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=2
+nginx install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=0
+node install=pass startup=fail basic=skip concurrent=skip shutdown=skip compatible=no unsupported=3
+python install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+redis install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+sqlite install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+vim install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+corpus apps=11 compatible=7
+```
+
+The score is 7 of 11 again, but the set changed. **Redis is now compatible**
+(all five stages pass on epoll; `redis-benchmark` ran about 600 SET and
+GET requests per second). BusyBox failed its shutdown stage once (see
+below) and passed it in three reruns; with it the score would be 8 of 11.
+
+### Why each failing app fails
+
+| App | Stage | Cause | Roadmap |
+|---|---|---|---|
+| nginx | basic | The master's `ioctl(channel, FIOASYNC)` (Linux `0x5452`) on the master/worker socketpair returns `ENOTTY`, so nginx logs `ioctl(FIOASYNC) failed while spawning "worker process" (25: Not a tty)` and runs with no worker; nothing accepts ("server did not answer within 60s"). Epoll itself works: the error log shows `using the "epoll" event method`. Linuxemu returns `ENOTTY` for unknown ioctls without a diagnostic, so the report lists nothing. | Unscheduled (ioctl coverage) |
+| Node.js | startup | Past `epoll_create1`. Node now dies with a fatal SIGSEGV (`linuxemu: fatal signal=0x0000000b pc=0x0116d688 address=0x00000000`) before printing its version. Its report shows `madvise` (ENOSYS, 17 calls) and `mremap` refused (`EINVAL`, `mremap-kind`) just before; not yet diagnosed further. | Phase 4/6 (V8 memory and JIT) |
+| inotify-tools | basic | `inotify_init`/`inotify_init1` return ENOSYS ("Couldn't initialize inotify") | Phase 3 part 3 |
+| BusyBox | shutdown | Intermittent: once, `sleep 30 &; kill -TERM; wait` returned 143 but `kill -0` still found the pid ("still-alive"). Three reruns of the BusyBox app passed, and the same check passed 60 of 60 times on this core and on the pre-phase core without `LINUXEMU_DIAGNOSTICS`. A watch item, like the 2026-11-17 diagnostics SIGTERM race. | Watch |
+
+nginx was reproduced by hand with a debug error log (`build/t9/nginx-probe.sh`
+on the device, not committed) to find the `FIOASYNC` call.
+
+### Unsupported calls per app
+
+| App | Calls (occurrences) |
+|---|---|
+| apk, GCC/make, Git, nginx, SQLite, Vim | none |
+| BusyBox | `sendfile64` 3 (EINVAL, `sendfile-input`) |
+| inotify-tools | `inotify_init` 1, `inotify_init1` 1 (ENOSYS) |
+| Node.js | `madvise` 17 (ENOSYS), `mremap` 1 (EINVAL, `mremap-kind`), `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+| Python | `membarrier` 2 (EINVAL, `membarrier-cmd`) |
+| Redis | `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+
+No `epoll_*` or `eventfd*` call is reported any more. Python's
+`epoll_create1` ENOSYS and the `pwritev2` refusals of the Phase 2 run are
+gone.

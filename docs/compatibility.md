@@ -34,7 +34,9 @@ pseudoterminals. An attached tmux 3.7c client with `TERM=xterm-256color`
 attaches and exits cleanly, in an SSH pseudo-terminal and in Term49.
 
 The 0.1.6 core adds a Linux-style descriptor table: `RLIMIT_NOFILE` is
-virtual (936 on the Passport), descriptor exhaustion returns `EMFILE`,
+virtual (744 on the Passport since Phase 3 part 1, which reserves 256
+host descriptors for the emulator; 936 in the 0.1.6 release), descriptor
+exhaustion returns `EMFILE`,
 descriptor records survive `fork` and `execve`, and directory listings stay
 complete when entries are deleted mid-walk (`rm -r`, `find -delete`). Set
 `LINUXEMU_DIAGNOSTICS=<file>` to log the unsupported calls a guest makes.
@@ -60,9 +62,44 @@ Phase 2 adds these Linux calls, each with a direct ARM guest test:
   replaced descriptors. `dup2` and `dup3` are serialized against `close`
   inside one process.
 
-The pinned application corpus scores 7 of 11 apps compatible: BusyBox, apk,
-Python, Git, SQLite, Vim, and GCC with make. nginx and Redis need `epoll`,
-inotify-tools needs `inotify`, and Node.js stops at start-up on `epoll_create1`. After Phase 2 none of the corpus apps hit ENOSYS for the calls it added.
+Phase 3 part 1 adds the full Linux eventfd and epoll, each covered by the
+`run-event-smoke` guest fixtures:
+
+- `eventfd` and `eventfd2` with Linux semantics: a 64-bit counter shared
+  through memory, `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`,
+  blocking reads and writes (interrupted by signals, restarted with
+  `SA_RESTART`), overflow (`EAGAIN`, or a blocking write released by a
+  read), the Linux `EINVAL` cases, and `POLLIN`/`POLLOUT` readiness in
+  `poll`, `select` and epoll. One eventfd is the same object across `dup`,
+  `fork`, `execve` and `SCM_RIGHTS` (to a Linuxemu receiver), and its
+  `O_NONBLOCK` flag is shared as on Linux. libcurl's wake descriptor is
+  now this eventfd.
+- `epoll_create`, `epoll_create1`, `epoll_ctl` (`ADD`, `MOD`, `DEL` with
+  Linux's errors, including `EPERM` for regular files and directories and
+  `ELOOP` for cycles), `epoll_wait`, `epoll_pwait` with a signal mask, and
+  `epoll_pwait2` with a `timespec` timeout. Level-triggered readiness,
+  `EPOLLET`, `EPOLLONESHOT`, `EPOLLRDHUP`, `EPOLLEXCLUSIVE` (Linux's
+  validation rules) and `EPOLLWAKEUP` (accepted, never reported); user data
+  is returned unchanged, and a small `maxevents` rotates fairly between
+  ready items. A watched fd that is closed, replaced by `dup2`/`dup3` or
+  whose number is reused is dropped, also while another thread waits, and
+  `ctl` from another thread wakes a waiter. Nested epoll (depth 5, as on
+  Linux), epoll fds in `poll` and `select`, and epoll across `fork` and
+  `execve` work. A Looper-style loop (eventfd wake, pipes and sockets,
+  timeouts, fds added and removed while waiting) is covered.
+- A pipe read end at EOF now reports `POLLHUP` (and `EPOLLHUP`) as on Linux;
+  QNX reports only readable.
+- `select` and `pselect6` accept descriptors up to 4096 (QNX's own
+  `FD_SETSIZE` is 256).
+
+The pinned application corpus scores 7 of 11 apps compatible after Phase 3
+part 1: apk, Python, Git, SQLite, Vim, GCC with make, and now Redis.
+BusyBox failed its shutdown stage once in that run and passed it in three
+reruns (an intermittent watch item). nginx serves nothing because
+`ioctl(FIOASYNC)` on its worker channel returns `ENOTTY`, inotify-tools
+needs `inotify`, and Node.js gets past `epoll_create1` and then crashes at
+start-up (SIGSEGV, address 0). No corpus app hits an unsupported eventfd
+or epoll call.
 
 ## Deliberate limits
 
@@ -110,13 +147,86 @@ Limits of the Phase 2 calls:
   device's qnx6 file system is not sparse, so a write far past the end of a
   file first fills the gap with zeros.
 
+Limits of the Phase 3 part 1 calls (eventfd and epoll):
+
+- **Capacity.** Each process keeps 256 host descriptors hidden for the
+  emulator, so the guest's `RLIMIT_NOFILE` is 744 on the Passport (936
+  before). An eventfd uses two hidden descriptors and an epoll one, so a
+  process holds about 128 eventfds (fewer with epolls, signal-wait pipes
+  and other hidden descriptors). Running out returns `EMFILE`.
+- **Fork copies an epoll.** Linux shares one epoll between parent and
+  child; here the child gets an independent copy of the interest list, and
+  a change in one process isn't seen by the other. nginx, Redis and
+  libuv create their epoll after forking or exec at once.
+- **Registrations follow the fd number.** A watched fd's `dup` that
+  outlives the original number doesn't keep the registration: closing the
+  original number drops it, where Linux keeps it until the open file is
+  fully closed.
+- **`EPOLLET` is approximated.** QNX `poll()` is level-triggered. After an
+  edge-triggered item is reported, it stays quiet until the guest reads,
+  writes, sends, receives or accepts on that fd number, or modifies the
+  item. So:
+  - new data arriving while the guest hasn't touched the fd gives no new
+    edge (programs written for `EPOLLET` drain to `EAGAIN`, which re-arms);
+  - any I/O re-arms, so an item can be reported again with no new data
+    (a spurious wakeup);
+  - I/O on a `dup` of the watched number doesn't re-arm the item;
+  - an edge-triggered outer epoll watching an inner epoll re-arms only when
+    the inner epoll is read or waited on.
+- **`EPOLLEXCLUSIVE`** is validated as Linux does and then treated as a
+  plain registration: every waiter may wake, not just one.
+- **`EPOLLRDHUP`** is reported for `SOCK_STREAM` sockets only (not
+  `SOCK_SEQPACKET`), only once unread data has been read (Linux reports it
+  at once), and only when `EPOLLIN` is requested too; an item asking for
+  `EPOLLRDHUP` alone sees it only when the peer fully closes.
+- **Pipe hangups.** A pipe whose writer closed with data left reports no
+  `POLLHUP`/`EPOLLHUP` until the data is read, because QNX gives no sign
+  that the writer is gone. A named FIFO that no writer ever opened may
+  report `POLLHUP` where Linux blocks (not measured). The write end of a
+  pipe whose reader closed gets no `POLLERR`.
+- **eventfd writes near the maximum.** A writer waiting in `poll`, `select`
+  or epoll for `POLLOUT` on an eventfd whose counter is at its maximum
+  (`0xfffffffffffffffe`) isn't woken when a reader drains it; it sees
+  `POLLOUT` on its next wait. A blocking `write` itself is released.
+- **Closing a blocked eventfd.** If another thread closes an eventfd while
+  a `read` blocks on it, the read fails `EBADF`; Linux lets it finish.
+- **A killed process mid-update.** A process killed by `SIGKILL` in the few
+  instructions between draining an eventfd's readiness pipe and raising it
+  again leaves a nonzero counter with an empty pipe. `poll`, `select` and
+  epoll check the counter before sleeping, so a Linuxemu poller still sees
+  the eventfd as readable.
+- **Passing over `SCM_RIGHTS`.**
+  - An epoll fd received from another process arrives as a plain pipe,
+    not an epoll.
+  - An eventfd travels with its hidden descriptors appended to the message.
+    A receiver that isn't Linuxemu (a native QNX process) gets those extra
+    descriptors as ordinary fds.
+  - If the host truncates the message, the receiving Linuxemu can't
+    recognise the extra descriptors, so a guest with a large enough control
+    buffer receives the sender's hidden pipe write end and shared-memory fd
+    as ordinary fds.
+  - If rebuilding the eventfd fails on the receiving side, the guest gets
+    the bare readiness pipe instead of an eventfd, without an error.
+  - More than 253 guest fds in one message returns `EINVAL`, as on Linux.
+    Each eventfd adds two hidden descriptors to the host message; how many
+    descriptors QNX accepts in one message isn't measured.
+- **Nesting and exec.** A process holds at most 256 nested epoll
+  registrations (an epoll inside another); more returns `ENOMEM` and is
+  reported as `epoll-nest-table-full`. An epoll kept across `execve` (no
+  `EPOLL_CLOEXEC`) carries about 21 to 30 items; a longer list arrives
+  empty and is reported as `epoll-exec-list-too-long`.
+- `select` and `pselect6` accept descriptor numbers up to 4096 (QNX's own
+  `FD_SETSIZE` is 256); Linux bounds them only by `RLIMIT_NOFILE`.
+
+Other limits:
+
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
   only in statically loaded binaries that carry a symbol table, not in
   libraries mapped at run time.
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
 - Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary
-  ioctls, `epoll`, `inotify`, graphics, kernel modules, and Linux service management are
+  ioctls, `inotify`, `timerfd`, `signalfd`, graphics, kernel modules, and Linux service management are
   outside the v0.1 surface.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.
@@ -128,8 +238,6 @@ Limits of the Phase 2 calls:
   physical Term49 session still freezes at that output rate (confirmed on
   the device on 2026-10-14); `cmatrix -s -u 10` remains the conservative
   command.
-- `eventfd2` implements the pipe-backed wake descriptor form needed by libcurl,
-  rather than general Linux event counters.
 - Executable shared file mappings are rejected. Private executable file
   mappings use an anonymous copy.
 - Package installation is unprivileged and should use
