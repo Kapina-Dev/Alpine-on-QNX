@@ -875,3 +875,42 @@ committed). Each fact is pinned by a guest test or a note in the code.
   manager (another process) answering the poll; a sleeping wait uses 0 to
   1 ms. The `epoll-nesting` spin detector (check 17) uses a 20 ms
   threshold for that reason.
+
+## 2026-11-19 — io-pkt crashed under the signal-wait channel stress test
+
+Passport, ordinary user, branch `phase3a-events` at 265f24f. The
+signal-wait channel was then a self-connected loopback UDP socket per
+thread, written by the emulator's host signal handler during masked waits.
+An outside report on a Go-on-QNX port said io-pkt misbehaves when
+Unix-domain socket operations (bind, unlink, `SCM_RIGHTS`) are interrupted
+by signals, so `guest-tests/iopkt-signal-stress.c` was written to load
+those windows: 8 waiter threads in masked `ppoll`/`epoll_pwait` and blocking
+eventfd reads, AF_UNIX stream ping-pong passing a pipe fd by `SCM_RIGHTS`
+every message, TCP loopback ping-pong, short-lived threads that do a masked
+`ppoll` and an AF_UNIX bind/unlink and exit, an AF_UNIX path
+bind/listen/close/unlink loop, and a signaller sending `tgkill` to every
+live thread about every 100 us.
+
+- The first run (10 s, `build/linuxemu`, socket channel) printed nothing.
+  At 16:32:16 GMT the system log recorded `IopktMonRun: io-pkt process
+  dies` and `io-pkt crashed possibly`, and left
+  `/var/log/io-pkt-v6-hc.core`. Wi-Fi never came back (ssh and ping
+  failed). The phone was shut down with the power key from the menu at
+  16:37:24 and booted again at 16:39.
+- Not thermal: `limit_device_to_shutdown:0`, `wifi_temp_nominal:1`, and the
+  PON reasons showed no thermal cause.
+- An ordinary user can take down the whole network stack this way; the
+  network stays down until reboot.
+- **Trigger not yet isolated.** The test combined the UDP channel written
+  from signal handlers (io-pkt messages sent from a handler while the
+  same thread may be inside its own io-pkt call) with AF_UNIX
+  `SCM_RIGHTS` and path bind/unlink under constant signals. Which part
+  does it is unknown.
+- Action: the signal-wait channel is a persistent hidden pipe again
+  (pipe-manager, not io-pkt), so a signal handler never sends io-pkt a
+  message. The concurrently-waiting thread limit returns to about 127.
+  The stress fixture and `scripts/run-iopkt-stress.sh` are kept for
+  isolating the trigger and are not part of the regression; run them only
+  with someone at the phone to reboot it.
+- The same test passed natively on Linux (x86, 8 s, all classes
+  progressed, no integrity failures).
