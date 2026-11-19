@@ -185,16 +185,19 @@ def test_threaded_http_server():
     assert not server_thread.is_alive()
 
 
-def test_unsupported_errors():
-    if not hasattr(select, "epoll"):
-        return
+def test_epoll():
+    read_fd, write_fd = os.pipe()
+    poller = select.epoll()
     try:
-        poller = select.epoll()
-    except OSError as error:
-        assert error.errno == errno.ENOSYS
-    else:
+        poller.register(read_fd, select.EPOLLIN)
+        os.write(write_fd, b"x")
+        events = poller.poll(1)
+        assert events == [(read_fd, select.EPOLLIN)], events
+        poller.unregister(read_fd)
+    finally:
         poller.close()
-        raise AssertionError("unsupported epoll unexpectedly succeeded")
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 check("imports_files", test_imports_and_files)
@@ -206,5 +209,5 @@ check("subprocesses", test_subprocesses)
 check("signals", test_signals)
 check("threads", test_threads)
 check("threaded_http_server", test_threaded_http_server)
-check("unsupported_errors", test_unsupported_errors)
+check("epoll", test_epoll)
 print("python_runtime_smoke_failures=0", flush=True)
