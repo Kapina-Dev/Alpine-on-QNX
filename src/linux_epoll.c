@@ -95,6 +95,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#define LINUX_NR_EXECVE 11
 #define LINUX_NR_EPOLL_CTL 251
 
 #define LINUX_EPOLL_CLOEXEC 0x00080000u
@@ -366,7 +367,15 @@ static int epoll_serialize(struct guest_fd_object *object, int fd,
         *cursor++ = ';';
     }
     pthread_mutex_unlock(&instance->lock);
-    if (!fits) cursor = text + 3;
+    if (!fits) {
+        uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+        args[0] = (uint32_t)fd;
+        args[1] = (uint32_t)instance->count;
+        cursor = text + 3;
+        /* The documented limit: the new image's instance starts empty. */
+        (void)linux_report_unsupported(LINUX_NR_EXECVE,
+            linux_errno_number(E2BIG), "epoll-exec-list-too-long", args);
+    }
     length = (size_t)(cursor - text);
     if (3 + 2 * length + 1 > size) return -1;
     memcpy(buffer, "-1:", 3);
@@ -521,19 +530,32 @@ static int make_channel(int *read_end, int *write_end)
     return 0;
 }
 
-/* Any instance changed.  The two atomic operations pair with
-   probe_begin's: either this sees the new prober, or the prober's snapshot
-   already includes this change (and its expansion, which locks the
-   instance after the snapshot, sees the change itself). */
+/* Any instance changed.  Fast path (no probe running): the lock-free
+   bump and the read of probers pair with probe_begin's increment and
+   snapshot (all full barriers): either this sees the new prober, or the
+   prober's snapshot already includes this change (and its expansion, which
+   locks the instance after the snapshot, sees the change itself).
+
+   With probers, the generation is bumped again under probe_lock together
+   with stale_probers = probers, as an instance does under its lock.  Every
+   prober counted then took its snapshot (under probe_lock) before that
+   bump, so each one sees a change at probe_end and gives its count back;
+   a prober that begins between the two bumps is counted and also sees the
+   second one.  (Counting it against only the first bump left
+   stale_probers at 1 for good: the byte was never drained and every later
+   probe woke at once.) */
 static void probe_note_change(void)
 {
     __sync_add_and_fetch(&probe_generation, 1u);
     if (__sync_add_and_fetch(&probers, 0u) == 0) return;
     pthread_mutex_lock(&probe_lock);
-    if (probers != 0 && probe_write >= 0) {
-        char byte = 1;
+    if (probers != 0) {
+        __sync_add_and_fetch(&probe_generation, 1u);
         stale_probers = probers;
-        (void)write(probe_write, &byte, 1);
+        if (probe_write >= 0) {
+            char byte = 1;
+            (void)write(probe_write, &byte, 1);
+        }
     }
     pthread_mutex_unlock(&probe_lock);
 }
@@ -851,10 +873,14 @@ static int32_t epoll_ctl_locked(int epfd, int op, int fd,
     }
     if (op == LINUX_EPOLL_CTL_ADD) {
         if (index >= 0) result = linux_error(EEXIST);
-        else if ((instance->count == instance->capacity &&
-                grow_items(instance) != 0) ||
-                (child != 0 && nest_add(instance, child) != 0))
+        else if (instance->count == instance->capacity &&
+                grow_items(instance) != 0)
             result = linux_error(errno);
+        else if (child != 0 && nest_add(instance, child) != 0)
+            /* An emulator limit (Linux has none this low): ENOMEM, the
+               closest Linux error, reported in the diagnostics. */
+            result = linux_report_unsupported(LINUX_NR_EPOLL_CTL,
+                linux_errno_number(ENOMEM), "epoll-nest-table-full", args);
         else {
             struct epoll_item *item = &instance->items[instance->count++];
             item->fd = fd;
@@ -894,7 +920,7 @@ int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event)
 {
     struct linux_epoll_event requested;
     int32_t result;
-    uint32_t args[4];
+    uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };   /* the diagnostics copy 6 */
     args[0] = (uint32_t)epfd; args[1] = (uint32_t)op;
     args[2] = (uint32_t)fd; args[3] = (uint32_t)(uintptr_t)event;
     /* Linux's order: the event copy, both fds, a file without poll, then
@@ -1641,18 +1667,32 @@ void linux_epoll_restore_finish(void)
                 --instance->count;
                 continue;
             }
+            target = linux_epoll_acquire(item->fd);
+            item->child = 0;
+            if (target != 0) {
+                item->child = guest_fd_object_data(target);
+                if (nest_add(instance, item->child) != 0) {
+                    /* Kept as a plain fd it would poll the epoll's native
+                       pipe, readable at EOF after exec: drop it. */
+                    uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+                    args[0] = (uint32_t)item->fd;
+                    guest_fd_put(target);
+                    (void)linux_report_unsupported(LINUX_NR_EXECVE,
+                        linux_errno_number(ENOMEM),
+                        "epoll-exec-nest-table-full", args);
+                    memmove(item, item + 1,
+                        (instance->count - i - 1) * sizeof(*item));
+                    --instance->count;
+                    continue;
+                }
+            }
+            guest_fd_put(target);
             item->epoch = guest_fd_epoch(item->fd);
             item->device = status.st_dev;
             item->inode = status.st_ino;
             item->quiet = 0;
             set_quiet(item, quiet);
             __sync_add_and_fetch(&watched[item->fd], 1u);
-            target = linux_epoll_acquire(item->fd);
-            if (target != 0) {
-                item->child = guest_fd_object_data(target);
-                if (nest_add(instance, item->child) != 0) item->child = 0;
-            }
-            guest_fd_put(target);
             ++i;
         }
     }

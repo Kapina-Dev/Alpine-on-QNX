@@ -227,7 +227,11 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
         if (guest_fd_is_hidden(guest[i].fd)) hidden_any = 1;
         else if (guest_fd_is_typed(guest[i].fd)) typed_any = 1;
     }
-    capacity = (size_t)count + 2 + (typed_any ? POLL_STACK_ENTRIES : 0);
+    /* Room for expansions: the rest of the stack buffer when the set is
+       small, so a small poll on an epoll doesn't map. */
+    capacity = (size_t)count + 2 + (!typed_any ? 0 : count + 2 <
+        POLL_STACK_ENTRIES ? POLL_STACK_ENTRIES - count - 2 :
+        POLL_STACK_ENTRIES);
     if (timeout > 0) deadline = poll_now_ms() + timeout;
     memset(&storage, 0, sizeof(storage));
     if (signal_interrupted != 0) *signal_interrupted = 0;

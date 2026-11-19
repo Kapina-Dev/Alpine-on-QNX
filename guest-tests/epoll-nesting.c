@@ -21,6 +21,14 @@
  *      child-side DEL doesn't affect the parent's wait
  *   16 exec without EPOLL_CLOEXEC: the new image's epoll (3 items) reports
  *      the inherited pipe with its data, and its eventfd once written
+ *   17 probes stay quiet after a storm: threads ADD/DEL pipes on an inner
+ *      epoll while others poll()/epoll_wait() an outer epoll watching it;
+ *      afterwards, with nothing ready, poll() and epoll_wait() on the outer
+ *      epoll with a 200 ms timeout sleep (at least 150 ms elapsed, under
+ *      20 ms of this thread's CPU time) instead of spinning.  10 rounds.
+ *      (Measured: a sleeping wait costs 0-1 ms of CPU; a spinning one about
+ *      50-70 ms, the rest being QNX's pipe manager answering each poll.)
+ *      EPOLL_NESTING_VERBOSE prints each quiet wait's times.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -464,6 +472,106 @@ static int check_exec(const char *self)
     return 0;
 }
 
+static volatile int storm_stop, ctl_stop;
+static int storm_outer, storm_inner;
+
+static void *storm_ctl(void *argument)
+{
+    int p[2];
+    (void)argument;
+    if (pipe(p) != 0) _exit(10);
+    while (!ctl_stop) {
+        struct epoll_event event;
+        if (ctl(storm_inner, EPOLL_CTL_ADD, p[0], EPOLLIN, 0x17) != 0 ||
+                epoll_ctl(storm_inner, EPOLL_CTL_DEL, p[0], &event) != 0) {
+            fprintf(stderr, "epoll-nesting: storm ctl (errno %d)\n", errno);
+            _exit(17);
+        }
+    }
+    close(p[0]);
+    close(p[1]);
+    return 0;
+}
+
+static void *storm_probe(void *argument)
+{
+    int use_wait = argument != 0;
+    while (!storm_stop) {
+        /* Timeout 0: as many probe starts and ends as possible, so they
+           race the ctl threads' changes. */
+        if (use_wait) {
+            if (wait_one(storm_outer, 0, 0) != 0) _exit(17);
+        } else if (poll_in(storm_outer, 0) != 0) _exit(17);
+    }
+    return 0;
+}
+
+static long long thread_cpu_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* One idle 200 ms wait on the outer epoll: 0, or why it failed. */
+static const char *quiet_wait(int use_wait)
+{
+    long long started = now_ms(), cpu = thread_cpu_ms(), elapsed, used;
+    int result = use_wait ? wait_one(storm_outer, 200, 0) :
+        poll_in(storm_outer, 200);
+    elapsed = now_ms() - started;
+    used = thread_cpu_ms() - cpu;
+    if (getenv("EPOLL_NESTING_VERBOSE") != 0)
+        fprintf(stderr, "epoll-nesting: quiet %s: %lld ms, %lld ms CPU\n",
+            use_wait ? "epoll_wait" : "poll", elapsed, used);
+    if (result != 0) return "reported with nothing ready";
+    if (elapsed < 150 || used >= 20) {
+        fprintf(stderr, "epoll-nesting: %s 200 ms: %lld ms elapsed, %lld ms "
+            "CPU\n", use_wait ? "epoll_wait" : "poll", elapsed, used);
+        return elapsed < 150 ? "returned early" : "spun (CPU time)";
+    }
+    return 0;
+}
+
+static int check_storm(void)
+{
+    int round;
+    storm_outer = epoll_create1(0);
+    storm_inner = epoll_create1(0);
+    if (storm_outer < 0 || storm_inner < 0) return fail(10, "epoll_create1");
+    if (ctl(storm_outer, EPOLL_CTL_ADD, storm_inner, EPOLLIN, 0x71) != 0)
+        return fail(17, "ADD inner to outer");
+    for (round = 0; round != 10; ++round) {
+        pthread_t threads[5];
+        const char *why;
+        int i;
+        arm(17);
+        storm_stop = 0;
+        ctl_stop = 0;
+        for (i = 0; i != 5; ++i)
+            if (pthread_create(&threads[i], 0,
+                    i < 2 ? storm_ctl : storm_probe,
+                    i == 4 ? (void *)1 : 0) != 0)
+                return fail(10, "pthread_create");
+        sleep_ms(400);
+        /* The last changes happen while probes still run; then the probes
+           run on alone for a while before stopping. */
+        ctl_stop = 1;
+        for (i = 0; i != 2; ++i) pthread_join(threads[i], 0);
+        sleep_ms(50);
+        storm_stop = 1;
+        for (i = 2; i != 5; ++i) pthread_join(threads[i], 0);
+        if ((why = quiet_wait(0)) != 0 || (why = quiet_wait(1)) != 0) {
+            fprintf(stderr, "epoll-nesting: round %d\n", round);
+            errno = 0;
+            return fail(17, why);
+        }
+    }
+    close(storm_outer);
+    close(storm_inner);
+    return 0;
+}
+
 /* EPOLL_NESTING_CHECK=N runs check N alone (after the A/B setup). */
 int main(int argc, char **argv)
 {
@@ -484,6 +592,8 @@ int main(int argc, char **argv)
     if ((only == 0 || only == 15) && (result = check_fork()) != 0)
         return result;
     if ((only == 0 || only == 16) && (result = check_exec(argv[0])) != 0)
+        return result;
+    if ((only == 0 || only == 17) && (result = check_storm()) != 0)
         return result;
     fprintf(stderr, "epoll-nesting: all checks passed\n");
     return 0;
