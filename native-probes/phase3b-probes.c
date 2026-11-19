@@ -4,7 +4,7 @@
  * pulse_timer_accuracy, pulse_coalescing, monotonic_in_sleep,
  * realtime_change_detect. Lines starting with '#' are supporting detail.
  * Every wait is bounded; alarm() is a last-resort guard. No signal handler
- * here touches io-pkt (the only handler sets a flag).
+ * here touches io-pkt (the handlers only set a flag, or write to stderr and _exit).
  */
 #define _QNX_SOURCE 1
 #include <errno.h>
@@ -239,14 +239,33 @@ static void accuracy(clockid_t clk, int chid, int coid, long long *med, long lon
     }
 }
 
+/* Periodic pulse timer, receiver asleep for sleep_us, then count the queued
+ * pulses. Returns the count; -1 if the timer could not be created. */
+static int coalesce(int chid, int coid, long period_ns, useconds_t sleep_us, int *ovr)
+{
+    timer_t t;
+    struct itimerspec its;
+    int n = 0;
+
+    *ovr = -1;
+    while (recv_pulse(chid, 1000000LL)) ;
+    if (make_timer(CLOCK_MONOTONIC, coid, &t) < 0) return -1;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_nsec = period_ns;
+    its.it_interval.tv_nsec = period_ns;
+    timer_settime(t, 0, &its, NULL);
+    usleep(sleep_us);
+    *ovr = timer_getoverrun(t);
+    timer_delete(t);
+    while (recv_pulse(chid, 2000000LL)) n++;
+    return n;
+}
+
 static void probe_pulse(void)
 {
     int chid = ChannelCreate(0);
     int coid = ConnectAttach(0, 0, chid, _NTO_SIDE_CHANNEL, 0);
     long long m1, p1, m2, p2;
-    timer_t t;
-    struct itimerspec its;
-    int n = 0, ovr;
 
     if (chid < 0 || coid < 0) {
         printf("pulse_timer_accuracy=unknown (channel errno=%d)\n", errno);
@@ -255,25 +274,20 @@ static void probe_pulse(void)
     }
     accuracy(CLOCK_MONOTONIC, chid, coid, &m1, &p1);
     accuracy(CLOCK_REALTIME, chid, coid, &m2, &p2);
-    printf("pulse_timer_accuracy=%lld,%lld\n", m1, p1);
-    printf("# pulse_timer_accuracy monotonic median_us=%lld p99_us=%lld; realtime_abs median_us=%lld p99_us=%lld (lateness vs ideal, 200 x 10 ms)\n",
+    printf("pulse_timer_accuracy=%lld,%lld (monotonic relative median_us,p99_us; realtime absolute %lld,%lld; lateness vs ideal, 200 x 10 ms)\n",
            m1, p1, m2, p2);
 
-    /* coalescing */
-    if (make_timer(CLOCK_MONOTONIC, coid, &t) < 0) {
-        printf("pulse_coalescing=unknown (errno=%d)\n", errno);
-        return;
+    /* coalescing: three runs separate a tick limit from a queue cap */
+    {
+        int ovr_c, ovr_a, ovr_b;
+        int nc = coalesce(chid, coid, 100000, 50000, &ovr_c);   /* 100 us, 50 ms */
+        int na = coalesce(chid, coid, 100000, 100000, &ovr_a);  /* 100 us, 100 ms */
+        int nb = coalesce(chid, coid, 5000000, 50000, &ovr_b);  /* 5 ms, 50 ms */
+        const char *queue = nb >= 8 ? "queued" : nb <= 2 ? "merged" : "partial";
+        const char *limit = na >= nc * 3 / 2 ? "tick_limited" : "queue_capped";
+        printf("pulse_coalescing=%s,%s (100us/50ms=%d of 500; 100us/100ms=%d of 1000; 5ms/50ms=%d of 10; overrun=%d,%d,%d)\n",
+               queue, limit, nc, na, nb, ovr_c, ovr_a, ovr_b);
     }
-    memset(&its, 0, sizeof(its));
-    its.it_value.tv_nsec = 100000;
-    its.it_interval.tv_nsec = 100000;
-    timer_settime(t, 0, &its, NULL);
-    usleep(50000);
-    ovr = timer_getoverrun(t);
-    timer_delete(t);
-    while (recv_pulse(chid, 2000000LL)) n++;
-    printf("pulse_coalescing=%d,%d\n", n, 500);
-    printf("# pulse_coalescing timer_getoverrun=%d\n", ovr);
 }
 
 /* ---- clocks ---- */
@@ -321,7 +335,7 @@ static void probe_clocks(void)
     if (tod_id >= 0 && st_err == 0)
         printf("realtime_change_detect=procmgr_event_tod\n");
     else if (tod_id >= 0 && trig == 0 && pulse)
-        printf("realtime_change_detect=procmgr_event_tod (registration and manual trigger verified; real change untestable, clock_settime errno=%d)\n", st_err);
+        printf("realtime_change_detect=procmgr_event_tod_unverified (registration ok, only a manually triggered pulse delivered; no real clock change possible, clock_settime errno=%d)\n", st_err);
     else
         printf("realtime_change_detect=none (clock_settime errno=%d, procmgr_event_notify_add errno=%d)\n", st_err, reg_err);
     if (tod_id >= 0) procmgr_event_notify_delete(tod_id);

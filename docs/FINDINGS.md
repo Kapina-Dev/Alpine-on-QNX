@@ -919,34 +919,31 @@ live thread about every 100 us.
 
 Passport (QNX 8.0.0), ordinary user. Probe: `native-probes/phase3b-probes.c`
 (built by `scripts/build-native-probes.sh`, bounded by `alarm(60)`; no signal
-handler touches io-pkt). Two runs, back to back, agreed on every verdict;
-raw output of the first (every value below is **measured**):
+handler touches io-pkt). Raw output of the final run (every value below is
+**measured**; earlier runs of the first probe version agreed on the
+sigwait, accuracy and clock verdicts):
 
 ```
 sigwait_collect=ok
 # sigwait handler_ran=0 err=0,0,0
-sigwait_siginfo=kill(pid=50471119,uid=0,code=0,value=0);sigqueue(pid=50471119,uid=0,code=-2,value=42);child_kill(pid=50475218,uid=0,code=0,value=0)
-# expected: self pid=50471119 uid=101431000, child pid=50475218; SI_USER=0 SI_QUEUE=-2
-pulse_timer_accuracy=2415,5626
-# pulse_timer_accuracy monotonic median_us=2415 p99_us=5626; realtime_abs median_us=705 p99_us=3903 (lateness vs ideal, 200 x 10 ms)
-pulse_coalescing=50,500
-# pulse_coalescing timer_getoverrun=0
+sigwait_siginfo=kill(pid=54194178,uid=0,code=0,value=0);sigqueue(pid=54194178,uid=0,code=-2,value=42);child_kill(pid=54198479,uid=0,code=0,value=0)
+# expected: self pid=54194178 uid=101431000, child pid=54198479; SI_USER=0 SI_QUEUE=-2
+pulse_timer_accuracy=2550,5124 (monotonic relative median_us,p99_us; realtime absolute 1546,3257; lateness vs ideal, 200 x 10 ms)
+pulse_coalescing=queued,tick_limited (100us/50ms=50 of 500; 100us/100ms=100 of 1000; 5ms/50ms=10 of 10; overrun=0,0,0)
 monotonic_in_sleep=unknown
 # monotonic_in_sleep cannot force screen-off sleep unattended
 # clock_settime(REALTIME)=fail errno=1; settimeofday errno=1; uid=101431000; offset drift across calls ns=0
 # procmgr_event_notify_add(PROCMGR_EVENT_TOD) = 1 errno=0
 # spurious TOD pulse after registration: 0
 # procmgr_event_trigger(TOD)=0 errno=0, pulse delivered=1
-realtime_change_detect=procmgr_event_tod (registration and manual trigger verified; real change untestable, clock_settime errno=1)
+realtime_change_detect=procmgr_event_tod_unverified (registration ok, only a manually triggered pulse delivered; no real clock change possible, clock_settime errno=1)
 ```
 
-Second run: accuracy `2331,5618` (realtime absolute median 1032, p99 5187),
-all else identical.
-
 - **`sigwait_collect=ok`.** With SIGUSR1 blocked in every thread (main, two
-  idle threads, the waiter), a process-directed `kill`, a `sigqueue` and a
-  fork child's `kill` were all taken by `sigtimedwait` in the dedicated
-  thread within its 1 s limit, and the installed handler never ran.
+  idle threads, the waiter) and collected by the waiting thread
+  (`sigtimedwait`, 1 s limit), a process-directed `kill`, a `sigqueue` and a
+  fork child's `kill` were all taken by it, and the installed handler never
+  ran.
 - **`sigwait_siginfo`.** `si_pid` is the sender's QNX pid (correct for self
   and child), `si_code` is `SI_USER` (0) for `kill` and `SI_QUEUE` (-2) for
   `sigqueue`, and `si_value` carries 42. **`si_uid` is 0 in all three cases**
@@ -955,21 +952,25 @@ all else identical.
   it.
 - **`pulse_timer_accuracy`** (median, p99 lateness in microseconds, 200
   pulses of a 10 ms periodic `SIGEV_PULSE` timer): `CLOCK_MONOTONIC`
-  relative 2415/5626; `CLOCK_REALTIME` absolute 705/3903. The first expiry
-  is rounded up to the kernel tick, so lateness is millisecond-scale, never
-  early.
-- **`pulse_coalescing=50,500`.** A 100 us periodic timer with the receiver
-  asleep for 50 ms delivered 50 pulses against 500 ideal expirations (about
-  one per 1 ms tick; the pulses queue, they are not merged), and
-  `timer_getoverrun` returned 0. Pulse count therefore cannot give the
-  expiration count; compute expirations from the clock.
+  relative 2550/5124; `CLOCK_REALTIME` absolute 1546/3257. Lateness is
+  millisecond-scale (an earlier run gave 2415/5626 and 705/3903). Minimum
+  and maximum lateness were not printed.
+- **`pulse_coalescing=queued,tick_limited`.** Three runs separate a tick
+  limit from a queue cap: a 100 us periodic timer over a 50 ms sleep gave
+  50 pulses and over a 100 ms sleep gave 100 (a 50-entry cap would give 50
+  both times), so the rate is about one pulse per 1 ms; a 5 ms timer over
+  50 ms gave 10 of 10 (queued, not merged). `timer_getoverrun` was 0 in all
+  three. Pulse count cannot give the expiration count for sub-tick periods;
+  compute expirations from the clock.
 - **`monotonic_in_sleep=unknown`.** A screen-off device sleep cannot be
   forced unattended; not measured.
-- **`realtime_change_detect`.** As an ordinary user `clock_settime` and
-  `settimeofday` fail with `EPERM` (errno 1), so a real clock change could
-  not be produced. The SDK header `sys/procmgr.h` defines
-  `PROCMGR_EVENT_TOD` ("time-of-day changed"); `procmgr_event_notify_add`
-  with a pulse event is accepted (returns id 1), no spurious pulse arrives,
-  and `procmgr_event_trigger(PROCMGR_EVENT_TOD)` delivers the pulse. That
-  proves registration and delivery, not that a real `clock_settime` fires
-  it. No other change-notification mechanism was found in the headers.
+- **`realtime_change_detect=procmgr_event_tod_unverified`.** As an ordinary
+  user `clock_settime` and `settimeofday` fail with `EPERM` (errno 1), so a
+  real clock change could not be produced. The SDK header `sys/procmgr.h`
+  defines `PROCMGR_EVENT_TOD` ("time-of-day changed");
+  `procmgr_event_notify_add` with a pulse event is accepted (returns id 1),
+  no spurious pulse arrives, and `procmgr_event_trigger(PROCMGR_EVENT_TOD)`
+  delivers the pulse. Registration and delivery of a manually triggered
+  pulse are verified; delivery on a real clock change is not. A grep of
+  `time.h`, `sys/neutrino.h` and `sys/procmgr.h` in the SDK for clock-change
+  and time-change names found no other notification mechanism.
