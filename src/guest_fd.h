@@ -78,6 +78,19 @@ void guest_fd_retire(int fd);
    instances' waiters.  Cheap when no epoll watches fd.  Takes epoll locks,
    so it is never called with table_lock or an epoll instance lock held. */
 void linux_epoll_note_close(int fd);
+/* EPOLLET re-arm, in linux_epoll.c.  linux_epoll_et_quiet[fd] counts the
+   edge-triggered items on fd that reported and wait for the guest's next
+   I/O on fd; the I/O paths call linux_epoll_note_io(fd) after the call, so
+   an fd with none costs one plain load.  The slow path takes the epoll
+   registry and instance locks (never the fd-replace lock), so it runs with
+   no lock held. */
+extern volatile unsigned linux_epoll_et_quiet[GUEST_FD_SLOTS];
+void linux_epoll_note_io_slow(int fd);
+static inline void linux_epoll_note_io(int fd)
+{
+    if ((unsigned)fd < GUEST_FD_SLOTS && linux_epoll_et_quiet[fd] != 0)
+        linux_epoll_note_io_slow(fd);
+}
 /* After a native dup: destination shares source's object, or becomes native. */
 int guest_fd_duplicate(int source, int destination);
 /* Referenced object or 0.  Validates identity; drops a mismatched record. */

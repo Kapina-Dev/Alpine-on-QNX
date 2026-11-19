@@ -12,7 +12,9 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 
 #define LINUX_NR_SELECT 82
@@ -70,6 +72,31 @@ int linux_poll_timespec_timeout(const void *address, int time64,
     if (seconds > (INT_MAX - 1) / 1000) *milliseconds = INT_MAX;
     else *milliseconds = (int)(seconds * 1000 + (nanoseconds + 999999) / 1000000);
     return 0;
+}
+
+/* QNX reports a pipe read end whose last writer closed as readable
+   (POLLRDNORM) with nothing to read, never POLLHUP (measured 2026-11-19 on
+   the Passport, docs/FINDINGS.md).  Linux reports POLLHUP there and, the
+   pipe being empty, no POLLIN.  An untyped FIFO that QNX calls readable
+   with FIONREAD 0 is at EOF: nothing else makes an empty pipe readable.
+   With data left Linux also sets POLLHUP; QNX gives no way to see that the
+   writer is gone, so it is reported only once the data is read.  Sockets
+   are left alone (their EOF is EPOLLRDHUP, not a hangup). */
+short linux_poll_pipe_hangup(int fd, short revents,
+    const struct stat64 *status)
+{
+    struct stat64 own;
+    int available = 0;
+    if ((revents & POLLRDNORM) == 0 || (revents & POLLHUP) != 0 ||
+            guest_fd_is_typed(fd) || ioctl(fd, FIONREAD, &available) != 0 ||
+            available != 0)
+        return revents;
+    if (status == 0) {
+        if (fstat64(fd, &own) != 0) return revents;
+        status = &own;
+    }
+    if (!S_ISFIFO(status->st_mode)) return revents;
+    return (short)((revents & ~(POLLIN | POLLRDNORM)) | POLLHUP);
 }
 
 /* Host write bits a typed fd's ready_now decides instead of the native
@@ -171,8 +198,11 @@ static int32_t do_poll(struct linux_pollfd *guest, uint32_t count, int timeout,
     if (result >= 0) {
         result = 0;
         for (i = 0; i != count; ++i) {
+            short revents = host[i].revents;
+            if (host[i].fd >= 0 && host[i].fd == guest[i].fd)
+                revents = linux_poll_pipe_hangup(guest[i].fd, revents, 0);
             guest[i].revents = linux_poll_events_to_linux(
-                (short)(host[i].revents | ready[i]));
+                (short)(revents | ready[i]));
             if (guest[i].fd >= 0 && guest_fd_is_hidden(guest[i].fd))
                 guest[i].revents = 0x20;
             if (guest[i].revents != 0) ++result;

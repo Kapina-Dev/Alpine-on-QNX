@@ -1474,6 +1474,9 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
+        /* After each guest I/O call: an EPOLLET item on the fd re-arms
+           (one load when none waits for it). */
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     case LINUX_NR_WRITE:
         if (!guest_fd_dispatch_write((int)context->uc_mcontext.cpu.gpr[0],
@@ -1483,6 +1486,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2]));
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     case LINUX_NR_PREAD64: {
         uint64_t offset = (uint64_t)context->uc_mcontext.cpu.gpr[4] |
@@ -1490,6 +1494,7 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_result(pread64((int)context->uc_mcontext.cpu.gpr[0],
             (void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2], (off64_t)offset));
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     }
     case LINUX_NR_PWRITE64: {
@@ -1505,6 +1510,7 @@ void linux_syscall_dispatch(ucontext_t *context)
         result = linux_result(pwrite64((int)context->uc_mcontext.cpu.gpr[0],
             (const void *)context->uc_mcontext.cpu.gpr[1],
             (size_t)context->uc_mcontext.cpu.gpr[2], (off64_t)offset));
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     }
     case 361: case 362: case 392: case 393: {
@@ -1560,6 +1566,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             result = linux_result(readv((int)context->uc_mcontext.cpu.gpr[0],
                 (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
                 (int)context->uc_mcontext.cpu.gpr[2]));
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     case LINUX_NR_WRITEV:
         if (!typed_vector_io((int)context->uc_mcontext.cpu.gpr[0],
@@ -1569,6 +1576,7 @@ void linux_syscall_dispatch(ucontext_t *context)
                 (int)context->uc_mcontext.cpu.gpr[0],
                 (const struct iovec *)context->uc_mcontext.cpu.gpr[1],
                 (int)context->uc_mcontext.cpu.gpr[2]);
+        linux_epoll_note_io((int)context->uc_mcontext.cpu.gpr[0]);
         break;
     case LINUX_NR_UMASK:
         result = (int32_t)umask((mode_t)context->uc_mcontext.cpu.gpr[0]);

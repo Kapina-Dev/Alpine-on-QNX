@@ -123,17 +123,23 @@ static int32_t vector_transfer(int fd, const struct iovec *vector,
 int32_t linux_preadv(int fd, const struct iovec *vector, int32_t count,
     int64_t offset, uint32_t flags, int vectored_kind)
 {
-    return vector_transfer(fd, vector, count, offset, flags, vectored_kind, 0);
+    int32_t result = vector_transfer(fd, vector, count, offset, flags,
+        vectored_kind, 0);
+    linux_epoll_note_io(fd);
+    return result;
 }
 
 int32_t linux_pwritev(int fd, const struct iovec *vector, int32_t count,
     int64_t offset, uint32_t flags, int vectored_kind)
 {
-    return vector_transfer(fd, vector, count, offset, flags, vectored_kind, 1);
+    int32_t result = vector_transfer(fd, vector, count, offset, flags,
+        vectored_kind, 1);
+    linux_epoll_note_io(fd);
+    return result;
 }
 
-int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
-    uint32_t count)
+static int32_t sendfile_transfer(int out_fd, int in_fd,
+    int64_t *offset_pointer, uint32_t count)
 {
     unsigned char buffer[SENDFILE_CHUNK];
     int64_t offset = 0;
@@ -196,6 +202,15 @@ int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
     }
     if (total > 0) return (int32_t)total;
     return error;
+}
+
+int32_t linux_sendfile64(int out_fd, int in_fd, int64_t *offset_pointer,
+    uint32_t count)
+{
+    int32_t result = sendfile_transfer(out_fd, in_fd, offset_pointer, count);
+    /* in_fd is a seekable file (no poll on Linux); out_fd may be watched. */
+    linux_epoll_note_io(out_fd);
+    return result;
 }
 
 int32_t linux_fallocate(int fd, uint32_t mode, int64_t offset, int64_t length)

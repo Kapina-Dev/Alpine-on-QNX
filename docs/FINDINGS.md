@@ -769,3 +769,46 @@ socket (0x1).
 For epoll, a closed watched socket therefore makes the waiter look at the
 number at once. That number may already name the new socket, so the close
 hook and the epoch must retire the item before the native close.
+
+## 2026-11-19 — Phase 3 part 1: QNX poll() shows no hangup at pipe EOF
+
+Passport, ordinary user, a native probe built with the SDK gcc (throwaway,
+not committed). It polls a pipe's read end with `POLLIN|POLLRDNORM` and
+with events 0, reads `FIONREAD` and `fstat`, at each step: open and empty,
+data written, writer closed with data left, data read, and a pipe whose
+writer closed before any write. Then a write end whose reader closed, and
+an `AF_UNIX` stream socket after the peer's `shutdown(SHUT_WR)`. Output
+(QNX bits: `POLLRDNORM` 0x1, `POLLWRNORM` 0x2, `POLLIN` 0x5, `POLLERR`
+0x20, `POLLHUP` 0x40):
+
+```
+open-empty:           poll=0 revents=0x0 fionread=0 fifo=1 mode=010666
+open-data:            poll=1 revents=0x1 fionread=2
+closed-data:          poll=1 revents=0x1 fionread=2   (writer closed)
+closed-empty:         poll=1 revents=0x1 fionread=0   (data read; read() then returns 0)
+never-written-closed: poll=1 revents=0x1 fionread=0
+  (events=0 on each of these: poll=0 revents=0x0)
+writer-reader-gone:   poll=1 revents=0x2              (no POLLERR)
+sock-shutwr:          poll=1 revents=0x1 fionread=0 fifo=0 sock=1 mode=0140000
+sock peek (1 byte, MSG_PEEK|MSG_DONTWAIT) = 0
+```
+
+What it shows:
+
+- **QNX never reports `POLLHUP` on a pipe's read end** when the last
+  writer closes, with or without data left, and not even with events 0.
+  It reports only readable. Linux reports `POLLHUP`, and `POLLIN` only
+  while data remains.
+- **An empty pipe at EOF is the only empty pipe QNX calls readable**
+  (`FIONREAD` 0), so that state can be recognised. With data left, nothing
+  shows that the writer is gone.
+- A write end whose reader closed shows only `POLLWRNORM`; Linux adds
+  `POLLERR`. Not handled.
+- A socket after `SHUT_WR` looks the same as a pipe at EOF (readable,
+  `FIONREAD` 0), so the EOF rule is limited to `S_ISFIFO`.
+
+Linuxemu now reports a pipe read end that QNX calls readable with
+`FIONREAD` 0 as `POLLHUP` without `POLLIN` (`linux_poll_pipe_hangup`), in
+`poll`/`ppoll` and in epoll (`EPOLLHUP`), as Linux does for an empty pipe
+with no writers. Known limit: with unread data left, the hangup shows only
+once the data is read. The `epoll-modes` fixture's check 18 pins this.

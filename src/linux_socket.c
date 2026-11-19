@@ -994,21 +994,30 @@ int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6])
     case LINUX_NR_GETPEERNAME: return address_call(number, arguments);
     case LINUX_NR_LISTEN:
         return socket_result(listen((int)arguments[0], (int)arguments[1]));
-    case LINUX_NR_ACCEPT: return accept_socket(arguments, 0);
-    case LINUX_NR_ACCEPT4: return accept_socket(arguments, 1);
     case LINUX_NR_SOCKETPAIR: return socket_pair(arguments);
-    case LINUX_NR_SEND:
-    case LINUX_NR_SENDTO:
-    case LINUX_NR_RECV:
-    case LINUX_NR_RECVFROM: return transfer(number, arguments);
     case LINUX_NR_SHUTDOWN:
         return socket_result(shutdown((int)arguments[0], (int)arguments[1]));
     case LINUX_NR_SETSOCKOPT:
     case LINUX_NR_GETSOCKOPT: return socket_option_call(number, arguments);
-    case LINUX_NR_SENDMSG:
-    case LINUX_NR_RECVMSG: return message_call(number, arguments);
-    case LINUX_NR_SENDMMSG: return multi_message_call(0, arguments);
-    case LINUX_NR_RECVMMSG: return multi_message_call(1, arguments);
-    default: return -ENOSYS;
+    default: break;
+    }
+    /* The I/O calls: an EPOLLET item on the fd re-arms afterwards. */
+    {
+        int32_t result;
+        switch (number) {
+        case LINUX_NR_ACCEPT: result = accept_socket(arguments, 0); break;
+        case LINUX_NR_ACCEPT4: result = accept_socket(arguments, 1); break;
+        case LINUX_NR_SEND:
+        case LINUX_NR_SENDTO:
+        case LINUX_NR_RECV:
+        case LINUX_NR_RECVFROM: result = transfer(number, arguments); break;
+        case LINUX_NR_SENDMSG:
+        case LINUX_NR_RECVMSG: result = message_call(number, arguments); break;
+        case LINUX_NR_SENDMMSG: result = multi_message_call(0, arguments); break;
+        case LINUX_NR_RECVMMSG: result = multi_message_call(1, arguments); break;
+        default: return -ENOSYS;
+        }
+        linux_epoll_note_io((int)arguments[0]);
+        return result;
     }
 }

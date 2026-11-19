@@ -185,6 +185,11 @@ int linux_poll_timespec_timeout(const void *address, int time64,
    Returns the host bits ready_now reports ready now (0 when none). */
 struct pollfd;
 short linux_poll_target_entry(int fd, short events, struct pollfd *entry);
+/* Host revents of an untyped fd, with POLLHUP added (and POLLIN taken out)
+   for a pipe read end at EOF, which QNX reports only as readable.  status
+   is the fd's fstat64, or 0 to take it when needed. */
+short linux_poll_pipe_hangup(int fd, short revents,
+    const struct stat64 *status);
 /* The ppoll/epoll_pwait signal-mask protocol: begin swaps in the guest's
    mask and opens the thread's signal-wait fd (signal_wait_fd, to poll
    beside the guest's fds); end restores the mask, as after an interrupted

@@ -39,10 +39,33 @@
  * older than the current generation, so with several waiters none misses
  * the wake.
  *
- * Not yet: EPOLLET, EPOLLONESHOT and EPOLLEXCLUSIVE (EINVAL, reported to
- * LINUXEMU_DIAGNOSTICS), EPOLLRDHUP reporting (accepted), nested epoll and
- * epoll in poll/select, and carrying the interest list across fork and
- * exec.
+ * Modes:
+ * - EPOLLONESHOT: a reported item is disabled (not polled, nothing
+ *   reported, still registered) until a MOD re-arms it, as on Linux.
+ * - EPOLLET (an approximation; QNX poll() is level-triggered): the bits an
+ *   item reported are "quiet" and left out of its poll set until the guest
+ *   does I/O on that fd number (read, write, the vector and positional
+ *   forms, send*, recv*, accept*, sendfile: linux_epoll_note_io) or a MOD.
+ *   Once HUP or ERR is quiet the item isn't polled at all (poll() reports
+ *   them whatever is asked).  Unlike Linux, new data that arrives while the
+ *   guest hasn't touched the fd gives no new event until it does; ET
+ *   programs read or write until EAGAIN, which re-arms.  Clearing quiet
+ *   bits wakes the instance's waiters (changed()), so a write to an eventfd
+ *   from another thread wakes a wait blocked on its quiet item.
+ * - EPOLLRDHUP: QNX poll() shows a peer's shutdown(SHUT_WR) only as
+ *   readable.  For a socket with EPOLLRDHUP requested and readable, a
+ *   one-byte recv(MSG_PEEK|MSG_DONTWAIT) that returns 0 on a stream socket
+ *   is the shutdown; POLLHUP (a full close) also gives it.  Unlike Linux,
+ *   while unread data remains the shutdown isn't seen until it is read.
+ * - EPOLLHUP at pipe EOF, which QNX reports only as readable
+ *   (linux_poll_pipe_hangup).
+ * - EPOLLEXCLUSIVE: Linux's validation (ADD only, with IN/OUT/ERR/HUP/
+ *   WAKEUP/ET only, never on an epoll; a MOD of an exclusive item fails
+ *   EINVAL), then a plain registration: every waiter may wake.
+ * - EPOLLWAKEUP: accepted and dropped (Linux without CAP_BLOCK_SUSPEND).
+ *
+ * Not yet: nested epoll and epoll in poll/select, and carrying the
+ * interest list across fork and exec.
  */
 #include "linuxemu.h"
 #include "guest_fd.h"
@@ -55,6 +78,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -76,6 +100,10 @@
 #define LINUX_EPOLLWAKEUP (1u << 29)
 #define LINUX_EPOLLONESHOT (1u << 30)
 #define LINUX_EPOLLET (1u << 31)
+/* Linux's EPOLLEXCLUSIVE_OK_BITS: IN, OUT, ERR, HUP, WAKEUP, ET and
+   EXCLUSIVE itself. */
+#define LINUX_EPOLLEXCLUSIVE_OK_BITS (0x001u | 0x004u | LINUX_EPOLLERR | \
+    LINUX_EPOLLHUP | LINUX_EPOLLWAKEUP | LINUX_EPOLLET | LINUX_EPOLLEXCLUSIVE)
 
 /* ARM EABI: 16 bytes, not packed; data at offset 8. */
 struct linux_epoll_event {
@@ -93,6 +121,9 @@ struct epoll_item {
     ino64_t inode;
     uint32_t events;        /* Linux mask as registered (EPOLLWAKEUP off) */
     uint64_t data;          /* guest user data, returned unchanged */
+    uint32_t quiet;         /* EPOLLET: Linux bits reported, until the
+                               guest's next I/O on fd or a MOD (set_quiet) */
+    int disabled;           /* EPOLLONESHOT: reported, until a MOD */
 };
 
 struct epoll_instance {
@@ -118,6 +149,10 @@ static struct epoll_instance *registry;
    hook returns at once for a number with none.  Changed atomically, under
    the owning instance's lock. */
 static volatile unsigned watched[GUEST_FD_SLOTS];
+/* Items with quiet bits on each number, over all instances (guest_fd.h):
+   linux_epoll_note_io's one-load fast path.  Changed atomically, under the
+   owning instance's lock, only through set_quiet. */
+volatile unsigned linux_epoll_et_quiet[GUEST_FD_SLOTS];
 
 /* Per-wait state for one pollfd entry that is an item. */
 struct wait_slot {
@@ -203,8 +238,12 @@ static void epoll_release(struct guest_fd_object *object)
     else if (registry == instance) registry = instance->next;
     if (instance->next != 0) instance->next->previous = instance->previous;
     pthread_mutex_unlock(&registry_lock);
-    for (i = 0; i != instance->count; ++i)
+    for (i = 0; i != instance->count; ++i) {
         __sync_sub_and_fetch(&watched[instance->items[i].fd], 1u);
+        if (instance->items[i].quiet != 0)
+            __sync_sub_and_fetch(&linux_epoll_et_quiet[instance->items[i].fd],
+                1u);
+    }
     epoll_storage_free(instance->items,
         instance->capacity * sizeof(*instance->items));
     if (instance->wake_write >= 0) close(instance->wake_write);
@@ -347,8 +386,19 @@ static void changed(struct epoll_instance *instance)
     }
 }
 
+/* Keeps linux_epoll_et_quiet in step.  Caller holds the lock. */
+static void set_quiet(struct epoll_item *item, uint32_t quiet)
+{
+    if (item->quiet == 0 && quiet != 0)
+        __sync_add_and_fetch(&linux_epoll_et_quiet[item->fd], 1u);
+    else if (item->quiet != 0 && quiet == 0)
+        __sync_sub_and_fetch(&linux_epoll_et_quiet[item->fd], 1u);
+    item->quiet = quiet;
+}
+
 static void remove_item(struct epoll_instance *instance, size_t index)
 {
+    set_quiet(&instance->items[index], 0);
     __sync_sub_and_fetch(&watched[instance->items[index].fd], 1u);
     memmove(instance->items + index, instance->items + index + 1,
         (instance->count - index - 1) * sizeof(*instance->items));
@@ -378,6 +428,28 @@ void linux_epoll_note_close(int fd)
         pthread_mutex_lock(&instance->lock);
         for (i = instance->count; i != 0; --i)
             if (instance->items[i - 1].fd == fd) remove_item(instance, i - 1);
+        pthread_mutex_unlock(&instance->lock);
+    }
+    pthread_mutex_unlock(&registry_lock);
+}
+
+/* The guest did I/O on fd: its edge-triggered items report again what is
+   ready.  The waiters rebuild their sets with the bits back in. */
+void linux_epoll_note_io_slow(int fd)
+{
+    struct epoll_instance *instance;
+    if (fd < 0 || fd >= GUEST_FD_SLOTS) return;
+    pthread_mutex_lock(&registry_lock);
+    for (instance = registry; instance != 0; instance = instance->next) {
+        size_t i;
+        int rearmed = 0;
+        pthread_mutex_lock(&instance->lock);
+        for (i = 0; i != instance->count; ++i)
+            if (instance->items[i].fd == fd && instance->items[i].quiet != 0) {
+                set_quiet(&instance->items[i], 0);
+                rearmed = 1;
+            }
+        if (rearmed) changed(instance);
         pthread_mutex_unlock(&instance->lock);
     }
     pthread_mutex_unlock(&registry_lock);
@@ -428,32 +500,33 @@ static int32_t epoll_ctl_locked(int epfd, int op, int fd,
         return linux_error(EINVAL);
     }
     if (has_event) {
-        const char *detail = 0;
+        int exclusive, nested;
         if ((requested.events & ~(LINUX_EPOLL_POLL_BITS | LINUX_EPOLLRDHUP |
                 LINUX_EPOLLEXCLUSIVE | LINUX_EPOLLWAKEUP |
-                LINUX_EPOLLONESHOT | LINUX_EPOLLET)) != 0)
-            detail = "epoll-events-unknown";
-        else if ((requested.events & LINUX_EPOLLET) != 0)
-            detail = "epoll-et";
-        else if ((requested.events & LINUX_EPOLLONESHOT) != 0)
-            detail = "epoll-oneshot";
-        else if ((requested.events & LINUX_EPOLLEXCLUSIVE) != 0)
-            detail = "epoll-exclusive";
-        if (detail != 0) {
+                LINUX_EPOLLONESHOT | LINUX_EPOLLET)) != 0) {
             guest_fd_put(object);
             return linux_report_unsupported(LINUX_NR_EPOLL_CTL,
-                linux_errno_number(EINVAL), detail, args);
+                linux_errno_number(EINVAL), "epoll-events-unknown", args);
         }
         /* Linux drops EPOLLWAKEUP without CAP_BLOCK_SUSPEND. */
         requested.events &= ~LINUX_EPOLLWAKEUP;
         target = guest_fd_is_typed(fd) ? guest_fd_acquire(fd) : 0;
-        if (target != 0 && guest_fd_object_type(target) == GUEST_FD_EPOLL) {
-            guest_fd_put(target);
+        nested = target != 0 &&
+            guest_fd_object_type(target) == GUEST_FD_EPOLL;
+        guest_fd_put(target);
+        /* Linux: EPOLLEXCLUSIVE only on ADD, only beside the OK bits, and
+           never on an epoll file. */
+        exclusive = (requested.events & LINUX_EPOLLEXCLUSIVE) != 0;
+        if (exclusive && (op == LINUX_EPOLL_CTL_MOD || nested ||
+                (requested.events & ~LINUX_EPOLLEXCLUSIVE_OK_BITS) != 0)) {
+            guest_fd_put(object);
+            return linux_error(EINVAL);
+        }
+        if (nested) {
             guest_fd_put(object);
             return linux_report_unsupported(LINUX_NR_EPOLL_CTL,
                 linux_errno_number(EINVAL), "epoll-nested", args);
         }
-        guest_fd_put(target);
     }
     instance = guest_fd_object_data(object);
     pthread_mutex_lock(&instance->lock);
@@ -479,14 +552,26 @@ static int32_t epoll_ctl_locked(int epfd, int op, int fd,
             item->inode = status.st_ino;
             item->events = requested.events;
             item->data = requested.data;
+            item->quiet = 0;
+            item->disabled = 0;
             __sync_add_and_fetch(&watched[fd], 1u);
             changed(instance);
         }
     } else if (index < 0) result = linux_error(ENOENT);
     else if (op == LINUX_EPOLL_CTL_MOD) {
-        instance->items[index].events = requested.events;
-        instance->items[index].data = requested.data;
-        changed(instance);
+        struct epoll_item *item = &instance->items[index];
+        /* Linux refuses to modify an exclusive item. */
+        if ((item->events & LINUX_EPOLLEXCLUSIVE) != 0)
+            result = linux_error(EINVAL);
+        else {
+            /* MOD re-arms: a disabled one-shot item and the quiet bits of
+               an edge-triggered one (Linux re-checks readiness). */
+            item->events = requested.events;
+            item->data = requested.data;
+            set_quiet(item, 0);
+            item->disabled = 0;
+            changed(instance);
+        }
     } else remove_item(instance, (size_t)index);
     pthread_mutex_unlock(&instance->lock);
     guest_fd_put(object);
@@ -581,14 +666,40 @@ static long build_set(struct epoll_instance *instance,
     for (i = 0; i != instance->count; ++i) {
         const struct epoll_item *item = &instance->items[i];
         short events = linux_poll_events_to_host(
-            (short)(item->events & LINUX_EPOLL_POLL_BITS));
+            (short)(item->events & ~item->quiet & LINUX_EPOLL_POLL_BITS));
         arrays->slots[i].reported = 0;
         arrays->slots[i].stale = 0;
+        /* A disabled one-shot item, or an edge-triggered one whose HUP or
+           ERR is quiet (poll() reports those whatever is asked): QNX
+           skips a negative fd. */
+        if (item->disabled ||
+                (item->quiet & (LINUX_EPOLLERR | LINUX_EPOLLHUP)) != 0) {
+            arrays->host[i].fd = -1;
+            arrays->host[i].events = 0;
+            arrays->host[i].revents = 0;
+            arrays->slots[i].ready = 0;
+            continue;
+        }
         arrays->slots[i].ready = linux_poll_target_entry(item->fd, events,
             &arrays->host[i]);
         if (arrays->slots[i].ready != 0) *any_ready = 1;
     }
     return (long)instance->count;
+}
+
+/* A readable stream socket whose peer shut down writing: QNX poll() shows
+   only POLLRDNORM (measured, Task 1), and a peek returns 0 with nothing
+   left to read.  A zero-length datagram also peeks as 0, hence the type. */
+static int peer_shut_down(int fd)
+{
+    char byte;
+    int type = 0, saved_errno = errno;
+    socklen_t length = sizeof(type);
+    int shut = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0 &&
+        getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 &&
+        type == SOCK_STREAM;
+    errno = saved_errno;
+    return shut;
 }
 
 /* Marks what each item reports, up to maxevents, from the rotation start;
@@ -617,9 +728,18 @@ static int collect(struct epoll_instance *instance, struct wait_arrays *arrays,
             *stale_any = 1;
             continue;
         }
+        if (arrays->slots[i].ready == 0)
+            revents = linux_poll_pipe_hangup(item->fd, revents, &status);
         /* EPOLLERR and EPOLLHUP are reported whether requested or not. */
         linux_events = (uint16_t)linux_poll_events_to_linux(revents) &
             (item->events | LINUX_EPOLLERR | LINUX_EPOLLHUP);
+        if ((item->events & LINUX_EPOLLRDHUP) != 0 &&
+                S_ISSOCK(status.st_mode) &&
+                ((revents & POLLHUP) != 0 ||
+                ((revents & POLLRDNORM) != 0 && peer_shut_down(item->fd))))
+            linux_events |= LINUX_EPOLLRDHUP;
+        /* EPOLLET: what was reported stays quiet until the next I/O. */
+        linux_events &= ~item->quiet;
         if (linux_events == 0) continue;
         arrays->slots[i].reported = linux_events;
         *last = i;
@@ -741,17 +861,28 @@ int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
                 struct linux_epoll_event *out = events;
                 size_t k, start = instance->next_start < (size_t)count ?
                     instance->next_start : 0;
-                int written = 0;
+                int written = 0, marked = 0;
                 for (k = 0; k != (size_t)count && written != reported; ++k) {
                     struct linux_epoll_event event;
+                    struct epoll_item *item;
                     i = (start + k) % (size_t)count;
                     if (arrays.slots[i].reported == 0) continue;
+                    item = &instance->items[i];
                     event.events = arrays.slots[i].reported;
                     event.padding = 0;
-                    event.data = instance->items[i].data;
+                    event.data = item->data;
                     memcpy(out + written, &event, sizeof(event));
                     ++written;
+                    if ((item->events & LINUX_EPOLLONESHOT) != 0)
+                        item->disabled = 1;
+                    else if ((item->events & LINUX_EPOLLET) != 0)
+                        set_quiet(item, item->quiet | event.events);
+                    else continue;
+                    marked = 1;
                 }
+                /* Another thread polling the old set must not report the
+                   same one-shot or edge event: it rebuilds. */
+                if (marked) changed(instance);
             }
             instance->next_start = (last + 1) % (size_t)count;
         }
