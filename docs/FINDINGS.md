@@ -698,3 +698,74 @@ epoll_ctl_devctl=not attempted (protocol recovery out of scope)
   (owner 1000, group 10011, mode 660, `EACCES` in the 2026-11-17 spike).
   The `epoll_ctl` devctl was not attempted: identifying it needs protocol
   recovery, which is out of scope.
+
+## 2026-11-19 — Phase 3 part 1: sockets share one (st_dev, st_ino)
+
+Passport, ordinary user, native probes. Each was a throwaway file built with
+the SDK gcc and not committed. **Disproves an assumption of the epoll
+design:** that the (st_dev, st_ino) recorded at `EPOLL_CTL_ADD` identifies
+the file behind an fd number.
+
+**Probe 1 (identity).** It creates two pipes, two `AF_UNIX` socketpairs,
+and a loopback TCP listener with two clients and two accepted sockets. It
+prints `fstat64`, `iofdinfo(_FDINFO_FLAG_LOCALPATH)` and
+`ConnectServerInfo` for each fd. Then it closes one pipe, one socketpair
+end, one client and one accepted socket, and creates another of the same
+kind on the freed number. Output, trimmed to the identity fields:
+
+```
+pipe1 r/w         fd=3,4   dev=0x1 ino=0x10655430 mode=010666
+pipe2 r/w         fd=5,6   dev=0x1 ino=0x107b8738 mode=010666
+spair1 a/b        fd=7,8   dev=0x1 ino=0x30503523 mode=0140000  fdinfo path=/dev/socket/1, /dev/socket/2
+spair2 a/b        fd=9,10  dev=0x1 ino=0x30503523 mode=0140000  fdinfo path=/dev/socket/2
+tcp listen        fd=11    dev=0x1 ino=0x3050385b mode=0140000  fdinfo path=/dev/socket/2
+tcp client1/2     fd=12,13 dev=0x1 ino=0x3050385b
+tcp accepted1/2   fd=14,15 dev=0x1 ino=0x3050385b ctime=0
+pipe reused num   fd=3     dev=0x1 ino=0x107b8690   (differs from the closed pipe)
+spair reused num  fd=3     dev=0x1 ino=0x30503523
+tcp reused num    fd=3     dev=0x1 ino=0x3050385b
+tcp accept reused fd=7     dev=0x1 ino=0x3050385b
+all sockets: rdev=0x0 size=0 nlink=0; fdinfo mode=0140666 ioflag=0x3
+  offset=0 size=0; server pid=3706951 chid=2 scoid=1073741934 (coid = fd)
+```
+
+What it shows:
+
+- **Pipes:** each pipe has its own `st_ino`, shared by its two ends. A new
+  pipe on a reused number gets a different one.
+- **Sockets:** every socket of one family has the same (st_dev, st_ino):
+  - all `AF_UNIX` sockets are `0x1/0x30503523`;
+  - all TCP sockets (listening, client and accepted) are `0x1/0x3050385b`.
+- **Nothing else tells two sockets apart.** That covers `st_rdev`,
+  `st_size`, `st_nlink`, the `iofdinfo` fields (path is only
+  `/dev/socket/N`) and the server connection info.
+
+So a stale epoll item can't be found by identity when one socket replaces
+another on the same number.
+
+Linuxemu now gives every guest fd number an epoch, kept in `guest_fd.c`.
+It is bumped whenever the number is closed, replaced by dup2/dup3, or
+handed out again. Each epoll item records its number's epoch at ADD, and
+(st_dev, st_ino) stays as a second check. The `epoll-concurrent` fixture's
+check 33 pins this case. The Task 5 core, which used identity alone, fails
+it (exit 33); the Task 6 core passes it.
+
+**Probe 2 (close of a polled socket).** Thread A polls an accepted TCP
+socket and an idle pipe. Thread B closes the socket after 50 ms, accepts a
+pending connection onto the same number and writes to it. Output:
+
+```
+round 0 blocked poll: n=1 revents fd6=0x41 x=0x0
+closer: accepted fd=6 (old 6)
+round 0 fresh poll: n=1 revents fd6=0x1 x=0x0
+```
+
+So `poll()` **is** woken when another thread closes a *socket* it watches.
+It reports `POLLRDNORM|POLLHUP` (0x41) as the close happens, before the
+accept. A pipe behaves the other way: the `poll_close_race` result above
+shows no wake at all. A poll that starts after the replacement sees the new
+socket (0x1).
+
+For epoll, a closed watched socket therefore makes the waiter look at the
+number at once. That number may already name the new socket, so the close
+hook and the epoch must retire the item before the native close.

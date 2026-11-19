@@ -266,6 +266,10 @@ void linux_eventfd_register(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);
+/* Serialises a number's registration with close, dup2 and dup3 on it. */
+void linux_fd_replace_lock(void);
+void linux_fd_replace_unlock(void);
+void linux_epoll_after_fork(void);
 int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event);
 /* epoll_wait (252), epoll_pwait (346) and epoll_pwait2 (441, timespec
    converted by the caller); sigmask 0 means none. */

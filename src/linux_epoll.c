@@ -9,12 +9,20 @@
  * process-local, in mmap-backed storage (this runs inside the syscall
  * handler: no malloc or stdio).
  *
- * Items are keyed by guest fd number plus the identity (st_dev, st_ino) of
- * the file the number named at ADD.  Linux drops an item when its file is
- * closed; here a wait drops, without reporting it, an item whose number is
- * closed (POLLNVAL) or names another file now.  The identity is checked
- * only for items with something to report, so a wait costs one fstat per
- * reported item, not per registered one.
+ * Items are keyed by guest fd number plus the number's epoch
+ * (guest_fd_epoch) and the identity (st_dev, st_ino) of the file it named
+ * at ADD.  The fd layer bumps the epoch whenever the number is closed,
+ * replaced (dup2/dup3) or handed out again, and calls
+ * linux_epoll_note_close, which drops the number's items from every
+ * instance and wakes their waiters: QNX poll() is not woken by a close
+ * from another thread, and keeps watching the old file.  A wait also drops,
+ * without reporting it, an item whose epoch changed, whose number is closed
+ * (POLLNVAL) or whose identity differs.  The epoch is what catches one
+ * socket replacing another: QNX gives every socket of a family the same
+ * (st_dev, st_ino).  ADD runs under the fd-replace lock, so a close or
+ * dup2 of its number is wholly before or after it (see linux_epoll_ctl).
+ * The identity is checked only for items with something to report, so a
+ * wait costs one fstat per reported item, not per registered one.
  *
  * epoll_wait builds a pollfd array from the items (the native poll target
  * and translated events for each, typed fds' ready_now bits beside it),
@@ -25,10 +33,16 @@
  * remaining timeout.  The first item examined rotates between calls, so a
  * busy fd can't starve the others when maxevents is small.
  *
+ * Every change to the list (ctl, a close, a dropped stale item) bumps
+ * generation and, while a thread is waiting, writes one byte into the wake
+ * channel.  The byte is drained only when no waiter still polls a set
+ * older than the current generation, so with several waiters none misses
+ * the wake.
+ *
  * Not yet: EPOLLET, EPOLLONESHOT and EPOLLEXCLUSIVE (EINVAL, reported to
  * LINUXEMU_DIAGNOSTICS), EPOLLRDHUP reporting (accepted), nested epoll and
- * epoll in poll/select, ctl and close waking a waiter in another thread,
- * and carrying the interest list across fork and exec.
+ * epoll in poll/select, and carrying the interest list across fork and
+ * exec.
  */
 #include "linuxemu.h"
 #include "guest_fd.h"
@@ -74,6 +88,7 @@ typedef char linux_epoll_event_is_16_bytes
 
 struct epoll_item {
     int fd;                 /* guest fd number as registered */
+    unsigned epoch;         /* guest_fd_epoch(fd), read before ADD's fstat */
     dev_t device;           /* identity of its file at ADD */
     ino64_t inode;
     uint32_t events;        /* Linux mask as registered (EPOLLWAKEUP off) */
@@ -89,7 +104,20 @@ struct epoll_instance {
     size_t next_start;      /* rotation: first item a wait examines */
     int wake_write;         /* hidden write end of the wake channel */
     int nonblock;           /* O_NONBLOCK as the guest set it */
+    unsigned waiters;       /* threads polling this instance's set */
+    unsigned stale_waiters; /* of those, polling a set older than generation */
+    struct epoll_instance *previous, *next;     /* registry links */
 };
+
+/* Every instance of the process, for linux_epoll_note_close.  Lock order:
+   the fd-replace lock, registry_lock, an instance lock, then the guest_fd
+   table lock. */
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct epoll_instance *registry;
+/* Items registered on each guest fd number, over all instances: the close
+   hook returns at once for a number with none.  Changed atomically, under
+   the owning instance's lock. */
+static volatile unsigned watched[GUEST_FD_SLOTS];
 
 /* Per-wait state for one pollfd entry that is an item. */
 struct wait_slot {
@@ -169,6 +197,14 @@ static int epoll_set_status(struct guest_fd_object *object, int fd,
 static void epoll_release(struct guest_fd_object *object)
 {
     struct epoll_instance *instance = guest_fd_object_data(object);
+    size_t i;
+    pthread_mutex_lock(&registry_lock);
+    if (instance->previous != 0) instance->previous->next = instance->next;
+    else if (registry == instance) registry = instance->next;
+    if (instance->next != 0) instance->next->previous = instance->previous;
+    pthread_mutex_unlock(&registry_lock);
+    for (i = 0; i != instance->count; ++i)
+        __sync_sub_and_fetch(&watched[instance->items[i].fd], 1u);
     epoll_storage_free(instance->items,
         instance->capacity * sizeof(*instance->items));
     if (instance->wake_write >= 0) close(instance->wake_write);
@@ -220,6 +256,11 @@ int32_t linux_epoll_create(uint32_t linux_flags)
         instance->lock = fresh_lock;
     }
     instance->wake_write = channel[1];
+    pthread_mutex_lock(&registry_lock);
+    instance->next = registry;
+    if (registry != 0) registry->previous = instance;
+    registry = instance;
+    pthread_mutex_unlock(&registry_lock);
     if (guest_fd_attach(channel[0], object) != 0) {
         saved_errno = errno;
         instance->wake_write = -1;
@@ -294,35 +335,85 @@ static int grow_items(struct epoll_instance *instance)
     return 0;
 }
 
+/* The list changed: waiters must rebuild.  Caller holds the lock. */
+static void changed(struct epoll_instance *instance)
+{
+    ++instance->generation;
+    if (instance->waiters != 0) {
+        char byte = 1;
+        instance->stale_waiters = instance->waiters;
+        /* nonblocking: a full channel is already readable */
+        (void)write(instance->wake_write, &byte, 1);
+    }
+}
+
 static void remove_item(struct epoll_instance *instance, size_t index)
 {
+    __sync_sub_and_fetch(&watched[instance->items[index].fd], 1u);
     memmove(instance->items + index, instance->items + index + 1,
         (instance->count - index - 1) * sizeof(*instance->items));
     --instance->count;
     if (instance->next_start >= instance->count) instance->next_start = 0;
-    ++instance->generation;
+    changed(instance);
 }
 
-int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event)
+/* The item still names what its number named at ADD.  Identity alone
+   can't tell two sockets apart on QNX; the epoch can. */
+static int item_current(const struct epoll_item *item,
+    const struct stat64 *status)
 {
-    struct linux_epoll_event requested;
+    return guest_fd_epoch(item->fd) == item->epoch &&
+        status->st_dev == item->device && status->st_ino == item->inode;
+}
+
+void linux_epoll_note_close(int fd)
+{
+    struct epoll_instance *instance;
+    if (fd < 0 || fd >= GUEST_FD_SLOTS ||
+            __sync_add_and_fetch(&watched[fd], 0u) == 0)
+        return;
+    pthread_mutex_lock(&registry_lock);
+    for (instance = registry; instance != 0; instance = instance->next) {
+        size_t i;
+        pthread_mutex_lock(&instance->lock);
+        for (i = instance->count; i != 0; --i)
+            if (instance->items[i - 1].fd == fd) remove_item(instance, i - 1);
+        pthread_mutex_unlock(&instance->lock);
+    }
+    pthread_mutex_unlock(&registry_lock);
+}
+
+/* Only the forking thread exists in the child: nothing waits, and a lock
+   another thread held is free again. */
+void linux_epoll_after_fork(void)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    struct epoll_instance *instance;
+    registry_lock = fresh;
+    for (instance = registry; instance != 0; instance = instance->next) {
+        instance->lock = fresh;
+        instance->waiters = 0;
+        instance->stale_waiters = 0;
+    }
+}
+
+/* Runs under the fd-replace lock, which close, dup2 and dup3 hold while
+   they bump fd's epoch and replace the native fd: the epoch read here and
+   the fstat that follows name the same file, and a close of fd is wholly
+   before this call (fd is EBADF or another file, with a new epoch) or
+   after it (and its note_close drops the new item). */
+static int32_t epoll_ctl_locked(int epfd, int op, int fd,
+    const struct linux_epoll_event *requested_in, const uint32_t *args)
+{
+    struct linux_epoll_event requested = *requested_in;
     struct stat64 status;
     struct guest_fd_object *object, *target;
     struct epoll_instance *instance;
     int32_t result = 0;
     long index;
+    unsigned epoch;
     int has_event = op == LINUX_EPOLL_CTL_ADD || op == LINUX_EPOLL_CTL_MOD;
-    uint32_t args[4];
-    args[0] = (uint32_t)epfd; args[1] = (uint32_t)op;
-    args[2] = (uint32_t)fd; args[3] = (uint32_t)(uintptr_t)event;
-    /* Linux's order: the event copy, both fds, a file without poll, then
-       the epoll checks and the op. */
-    memset(&requested, 0, sizeof(requested));
-    if (has_event) {
-        if (!guest_range_mapped(event, sizeof(requested)))
-            return linux_error(EFAULT);
-        memcpy(&requested, event, sizeof(requested));
-    }
+    epoch = guest_fd_epoch(fd);
     if (epfd < 0 || guest_fd_is_hidden(epfd) || fcntl(epfd, F_GETFD) < 0 ||
             fd < 0 || guest_fd_is_hidden(fd) || fstat64(fd, &status) != 0)
         return linux_error(EBADF);
@@ -369,7 +460,8 @@ int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event)
     index = find_item(instance, fd);
     /* An item whose number now names another file is stale: gone, as
        Linux dropped it when its file closed. */
-    if (index >= 0 && (instance->items[index].device != status.st_dev ||
+    if (index >= 0 && (instance->items[index].epoch != epoch ||
+            instance->items[index].device != status.st_dev ||
             instance->items[index].inode != status.st_ino)) {
         remove_item(instance, (size_t)index);
         index = -1;
@@ -382,20 +474,43 @@ int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event)
         else {
             struct epoll_item *item = &instance->items[instance->count++];
             item->fd = fd;
+            item->epoch = epoch;
             item->device = status.st_dev;
             item->inode = status.st_ino;
             item->events = requested.events;
             item->data = requested.data;
-            ++instance->generation;
+            __sync_add_and_fetch(&watched[fd], 1u);
+            changed(instance);
         }
     } else if (index < 0) result = linux_error(ENOENT);
     else if (op == LINUX_EPOLL_CTL_MOD) {
         instance->items[index].events = requested.events;
         instance->items[index].data = requested.data;
-        ++instance->generation;
+        changed(instance);
     } else remove_item(instance, (size_t)index);
     pthread_mutex_unlock(&instance->lock);
     guest_fd_put(object);
+    return result;
+}
+
+int32_t linux_epoll_ctl(int epfd, int op, int fd, const void *event)
+{
+    struct linux_epoll_event requested;
+    int32_t result;
+    uint32_t args[4];
+    args[0] = (uint32_t)epfd; args[1] = (uint32_t)op;
+    args[2] = (uint32_t)fd; args[3] = (uint32_t)(uintptr_t)event;
+    /* Linux's order: the event copy, both fds, a file without poll, then
+       the epoll checks and the op. */
+    memset(&requested, 0, sizeof(requested));
+    if (op == LINUX_EPOLL_CTL_ADD || op == LINUX_EPOLL_CTL_MOD) {
+        if (!guest_range_mapped(event, sizeof(requested)))
+            return linux_error(EFAULT);
+        memcpy(&requested, event, sizeof(requested));
+    }
+    linux_fd_replace_lock();
+    result = epoll_ctl_locked(epfd, op, fd, &requested, args);
+    linux_fd_replace_unlock();
     return result;
 }
 
@@ -446,7 +561,8 @@ static int wait_arrays_fit(struct wait_arrays *arrays, size_t entries,
     return 0;
 }
 
-/* Fills host[0..count) from the items and returns the item count, or -1
+/* Drops the items whose number was closed or replaced since ADD, then
+   fills host[0..count) from the rest and returns the item count, or -1
    (errno) when the arrays can't grow.  *any_ready is set when ready_now
    already reports something.  Caller holds the lock. */
 static long build_set(struct epoll_instance *instance,
@@ -455,6 +571,10 @@ static long build_set(struct epoll_instance *instance,
 {
     size_t i;
     *any_ready = 0;
+    for (i = instance->count; i != 0; --i)
+        if (guest_fd_epoch(instance->items[i - 1].fd) !=
+                instance->items[i - 1].epoch)
+            remove_item(instance, i - 1);
     if (wait_arrays_fit(arrays, instance->count + 2, stack_host,
             stack_slots) != 0)
         return -1;
@@ -473,8 +593,10 @@ static long build_set(struct epoll_instance *instance,
 
 /* Marks what each item reports, up to maxevents, from the rotation start;
    items closed or now naming another file are marked stale and report
-   nothing.  Returns the reported count; *last is the last reported index.
-   Caller holds the lock. */
+   nothing.  The fd layer bumps a number's epoch before the native close or
+   dup2, so revents that came from a new file on the number always meet a
+   changed epoch here.  Returns the reported count; *last is the last
+   reported index.  Caller holds the lock. */
 static int collect(struct epoll_instance *instance, struct wait_arrays *arrays,
     size_t count, int maxevents, size_t *last, int *stale_any)
 {
@@ -490,8 +612,7 @@ static int collect(struct epoll_instance *instance, struct wait_arrays *arrays,
         uint32_t linux_events;
         if (revents == 0) continue;
         if ((revents & POLLNVAL) != 0 || fstat64(item->fd, &status) != 0 ||
-                status.st_dev != item->device ||
-                status.st_ino != item->inode) {
+                !item_current(item, &status)) {
             arrays->slots[i].stale = 1;
             *stale_any = 1;
             continue;
@@ -559,6 +680,7 @@ int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
         count = build_set(instance, &arrays, stack_host, stack_slots,
             &any_ready);
         generation = instance->generation;
+        if (count >= 0) ++instance->waiters;
         pthread_mutex_unlock(&instance->lock);
         if (count < 0) { result = linux_error(errno); break; }
         arrays.host[count].fd = epfd;
@@ -574,16 +696,29 @@ int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
             any_ready ? 0 : timeout);
         if (polled < 0 && errno != EINTR) {
             result = linux_error(errno);
+            pthread_mutex_lock(&instance->lock);
+            --instance->waiters;
+            if (instance->generation != generation &&
+                    instance->stale_waiters != 0)
+                --instance->stale_waiters;
+            pthread_mutex_unlock(&instance->lock);
             break;
         }
         if (polled < 0 || (mask.signal_wait_fd >= 0 &&
                 arrays.host[count + 1].revents != 0))
             interrupted = 1;
-        if (polled > 0 && arrays.host[count].revents != 0) {
+        pthread_mutex_lock(&instance->lock);
+        --instance->waiters;
+        if (instance->generation != generation &&
+                instance->stale_waiters != 0)
+            --instance->stale_waiters;
+        /* The wake bytes stay while another waiter still polls an old set:
+           it must see them too. */
+        if (polled > 0 && arrays.host[count].revents != 0 &&
+                instance->stale_waiters == 0) {
             char sink[64];
             while (read(epfd, sink, sizeof(sink)) > 0) {}
         }
-        pthread_mutex_lock(&instance->lock);
         if (instance->generation != generation) {
             /* The list changed while polling: results may name other
                items.  Poll the new list (an interrupt still ends it). */

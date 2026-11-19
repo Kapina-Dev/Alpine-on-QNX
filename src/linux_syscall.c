@@ -307,6 +307,18 @@ static int32_t linux_host_result(int result)
    dup2, dup3 and close on one number, so the emulator does too. */
 static pthread_mutex_t fd_replace_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* epoll_ctl takes it too, so a registration never races a close or dup2
+   of its number (see linux_epoll.c). */
+void linux_fd_replace_lock(void)
+{
+    pthread_mutex_lock(&fd_replace_lock);
+}
+
+void linux_fd_replace_unlock(void)
+{
+    pthread_mutex_unlock(&fd_replace_lock);
+}
+
 static int32_t linux_fork_process(ucontext_t *context, uint32_t child_stack)
 {
     pid_t process;
@@ -1746,7 +1758,11 @@ void linux_syscall_dispatch(ucontext_t *context)
             pthread_mutex_lock(&fd_replace_lock);
             if (fcntl(source, F_GETFD, 0) < 0)
                 result = -(int32_t)linux_errno_number(errno);
-            else result = linux_host_result(dup2(source, destination));
+            else {
+                /* before the number names the new file */
+                guest_fd_retire(destination);
+                result = linux_host_result(dup2(source, destination));
+            }
             if (result >= 0 &&
                 (int)context->uc_mcontext.cpu.gpr[0] != result)
                 (void)guest_fd_duplicate((int)context->uc_mcontext.cpu.gpr[0], result);
@@ -2094,6 +2110,7 @@ void linux_syscall_dispatch(ucontext_t *context)
             result = -(int32_t)linux_errno_number(errno);
         else {
             pthread_mutex_lock(&fd_replace_lock);
+            guest_fd_retire(destination);
             result = linux_host_result(dup2(source, destination));
             if (result >= 0 && (flags & LINUX_O_CLOEXEC) != 0 &&
                 fcntl(destination, F_SETFD, FD_CLOEXEC) != 0)

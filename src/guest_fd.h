@@ -15,6 +15,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Every guest fd number is below this (the hidden base is at most 4032). */
+#define GUEST_FD_SLOTS 4096
+
 enum guest_fd_type {
     GUEST_FD_PATH = 1,
     GUEST_FD_WAKE_EVENTFD,
@@ -62,6 +65,19 @@ void guest_fd_put(struct guest_fd_object *object);
 int guest_fd_attach(int fd, struct guest_fd_object *object);
 /* The number becomes native again. */
 void guest_fd_clear(int fd);
+/* clear, attach and duplicate (its destination) also bump the number's
+   epoch and call linux_epoll_note_close: every path that closes, replaces
+   or hands out a guest number goes through one of them.  The epoch changes
+   whenever the number may name another file than before. */
+unsigned guest_fd_epoch(int fd);
+/* Bumps the epoch and notifies epoll without touching the record: called
+   before a native dup2 replaces fd, so the number never names the new file
+   under the old epoch. */
+void guest_fd_retire(int fd);
+/* In linux_epoll.c: drops every epoll item registered on fd and wakes the
+   instances' waiters.  Cheap when no epoll watches fd.  Takes epoll locks,
+   so it is never called with table_lock or an epoll instance lock held. */
+void linux_epoll_note_close(int fd);
 /* After a native dup: destination shares source's object, or becomes native. */
 int guest_fd_duplicate(int source, int destination);
 /* Referenced object or 0.  Validates identity; drops a mismatched record. */

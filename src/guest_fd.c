@@ -15,7 +15,6 @@
 /* Guest-visible fds stay below the hidden base, which is at most
    HIDDEN_BASE_CAP, so a fixed table covers every guest number and the
    lock-free typed check reads memory that never moves. */
-#define GUEST_FD_SLOTS 4096
 #define HIDDEN_BASE_CAP 4032
 /* Emulator-owned fds per process: an eventfd holds two (readiness pipe
    write end, shm page) and an epoll one, so 256 fits 64 eventfd+epoll
@@ -34,6 +33,11 @@ struct guest_fd_object {
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct guest_fd_object *slots[GUEST_FD_SLOTS];
 static volatile unsigned char typed[GUEST_FD_SLOTS];
+/* Bumped (atomically, and also under table_lock where the table changes)
+   each time a guest number is released, replaced or handed out again, so
+   a registration keyed by number can tell it names another file now even
+   where QNX gives every socket of a family the same (st_dev, st_ino). */
+static volatile unsigned epochs[GUEST_FD_SLOTS];
 static int hidden_base = HIDDEN_BASE_CAP;
 static uint64_t nofile_soft = HIDDEN_BASE_CAP;
 static uint64_t nofile_hard = HIDDEN_BASE_CAP;
@@ -89,6 +93,7 @@ void guest_fd_put(struct guest_fd_object *object)
 static struct guest_fd_object *detach_locked(int fd)
 {
     struct guest_fd_object *old = slots[fd];
+    __sync_add_and_fetch(&epochs[fd], 1u);
     slots[fd] = 0;
     typed[fd] = 0;
     return old;
@@ -104,6 +109,7 @@ int guest_fd_attach(int fd, struct guest_fd_object *object)
     slots[fd] = object;
     typed[fd] = object->type != GUEST_FD_PATH;
     pthread_mutex_unlock(&table_lock);
+    linux_epoll_note_close(fd);
     guest_fd_put(old);
     return 0;
 }
@@ -115,7 +121,20 @@ void guest_fd_clear(int fd)
     pthread_mutex_lock(&table_lock);
     old = detach_locked(fd);
     pthread_mutex_unlock(&table_lock);
+    linux_epoll_note_close(fd);
     guest_fd_put(old);
+}
+
+unsigned guest_fd_epoch(int fd)
+{
+    return valid_fd(fd) ? __sync_add_and_fetch(&epochs[fd], 0u) : 0u;
+}
+
+void guest_fd_retire(int fd)
+{
+    if (!valid_fd(fd)) return;
+    __sync_add_and_fetch(&epochs[fd], 1u);
+    linux_epoll_note_close(fd);
 }
 
 /* Narrow adoption (Phase 1): a received pipe-backed object that this
@@ -167,6 +186,7 @@ int guest_fd_duplicate(int source, int destination)
         typed[destination] = object->type != GUEST_FD_PATH;
     }
     pthread_mutex_unlock(&table_lock);
+    linux_epoll_note_close(destination);
     guest_fd_put(old);
     return 0;
 }

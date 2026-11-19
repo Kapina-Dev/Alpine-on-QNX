@@ -45,6 +45,7 @@ run_rootfs_fixture eventfd-semantics
 run_rootfs_fixture eventfd-blocking
 run_rootfs_fixture eventfd-share
 run_rootfs_fixture epoll-basic
+run_rootfs_fixture epoll-concurrent
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"
