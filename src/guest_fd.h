@@ -40,7 +40,14 @@ struct guest_fd_ops {
     /* Host poll bits (POLLOUT, ...) that are ready without the native
        poll target's help, or 0.  Used by poll, select and epoll. */
     short (*ready_now)(struct guest_fd_object *, int fd);
+    /* SCM_RIGHTS: writes the hidden fds a receiving process needs to
+       rebuild the object (at most max; still owned by the object) and
+       returns how many, or -1. */
+    int (*companions)(struct guest_fd_object *, int fd, int *out, int max);
 };
+
+/* Most companions one object sends with it. */
+#define GUEST_FD_COMPANIONS_MAX 4
 
 /* Created with one reference owned by the caller; identity is taken from
    fstat64(backing_fd).  Returns 0 on failure (errno set). */
@@ -63,6 +70,42 @@ struct guest_fd_object *guest_fd_acquire(int fd);
    stale record, then adopt a live pipe-backed object of this process with
    the same (st_dev, st_ino); otherwise the number starts native. */
 void guest_fd_received(int fd);
+
+/* SCM_RIGHTS between Linuxemu processes.  When at least one sent fd has
+   companions, the sender appends, after the guest's fds, every companion
+   fd and then one descriptor-map fd: a fresh unnamed shm page holding
+   "LXRIGHT1", the guest fd count, the companion total, and per guest fd
+   its object type and companion count.  The receiver recognises the map
+   as the last fd, rebuilds each object from its companions (or adopts the
+   live object of this process with the same identity), closes the map and
+   the companions, and hands the guest only its own fds.  A non-Linuxemu
+   peer gets the extra fds (documented limit). */
+
+/* Rebuilds an object of its type on the received fd from copies of the
+   companions (the caller closes the companions afterwards).  0 or -1. */
+typedef int (*guest_fd_receive_fn)(int fd, const int *companions, int count);
+void guest_fd_register_receive(enum guest_fd_type type,
+    guest_fd_receive_fn receive);
+/* Sender: fds[0..count) are the guest's fds.  Writes the companions and
+   then the map fd into extra (room for count * GUEST_FD_COMPANIONS_MAX + 1)
+   and returns how many, or 0 when no fd has companions (send unchanged),
+   or -1 with errno.  The objects whose companions are listed stay
+   referenced in held[] (room for count) until guest_fd_rights_sent, which
+   also closes the map fd. */
+int guest_fd_rights_extra(const int *fds, int count, int *extra,
+    struct guest_fd_object **held, int *held_count);
+void guest_fd_rights_sent(int map_fd, struct guest_fd_object **held,
+    int held_count);
+/* Receiver: fds[0..count) arrived in one SCM_RIGHTS message.  Strips a
+   trailing descriptor map (closing it and the companions; their slots
+   become -1), gives every guest fd its object, and returns the guest's fd
+   count.  When a guest fd landed in the hidden range (the guest is out of
+   numbers) every fd is closed and -1 returned: the caller reports
+   MSG_CTRUNC, as Linux does when it cannot install a received fd. */
+int guest_fd_rights_received(int *fds, int count);
+/* A fresh shm object of size bytes, already unlinked; a plain (not
+   hidden) fd, or -1 with errno. */
+int guest_fd_unnamed_shm(const char *prefix, size_t size);
 /* Lock-free hint: the number carries an object with its own I/O behaviour
    (any type except GUEST_FD_PATH).  Gates the slower dispatch paths. */
 int guest_fd_is_typed(int fd);

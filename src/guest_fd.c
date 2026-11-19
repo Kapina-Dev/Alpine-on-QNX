@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -121,14 +122,13 @@ void guest_fd_clear(int fd)
    process still holds, e.g. one inherited across fork, is the same object,
    because a pipe's (st_dev, st_ino) is unique to it.  Path records are
    never adopted: two opens of one directory share an inode but not an
-   open-file description.  Anything else starts native. */
-void guest_fd_received(int fd)
+   open-file description.  Returns 1 when fd adopted such an object. */
+static int adopt_received(int fd)
 {
     struct stat64 status;
     struct guest_fd_object *match = 0;
     int other;
-    guest_fd_clear(fd);
-    if (!valid_fd(fd) || fstat64(fd, &status) != 0) return;
+    if (!valid_fd(fd) || fstat64(fd, &status) != 0) return 0;
     pthread_mutex_lock(&table_lock);
     for (other = 0; other != GUEST_FD_SLOTS && match == 0; ++other) {
         struct guest_fd_object *object = slots[other];
@@ -140,9 +140,17 @@ void guest_fd_received(int fd)
         }
     }
     pthread_mutex_unlock(&table_lock);
-    if (match == 0) return;
+    if (match == 0) return 0;
     (void)guest_fd_attach(fd, match);
     guest_fd_put(match);
+    return 1;
+}
+
+/* Anything not adopted starts native. */
+void guest_fd_received(int fd)
+{
+    guest_fd_clear(fd);
+    (void)adopt_received(fd);
 }
 
 int guest_fd_duplicate(int source, int destination)
@@ -234,7 +242,7 @@ static int path_serialize(struct guest_fd_object *object, int fd,
 }
 
 static const struct guest_fd_ops path_ops = {
-    0, 0, 0, 0, 0, path_release, path_serialize, 0
+    0, 0, 0, 0, 0, path_release, path_serialize, 0, 0
 };
 
 int guest_fd_record_path(int fd, const char *host_path)
@@ -670,4 +678,204 @@ int guest_fd_hide(int fd)
     }
     close(fd);
     return hidden;
+}
+
+static char *append_decimal(char *cursor, unsigned value)
+{
+    char digits[12];
+    int count = 0;
+    do { digits[count++] = (char)('0' + value % 10); value /= 10; }
+    while (value != 0);
+    while (count != 0) *cursor++ = digits[--count];
+    return cursor;
+}
+
+/* The name (prefix, pid and a sequence number; no stdio, this runs inside
+   the syscall handler) is unlinked at once.  A name left behind by a
+   process killed between open and unlink is skipped. */
+int guest_fd_unnamed_shm(const char *prefix, size_t size)
+{
+    static unsigned sequence;
+    size_t length = strlen(prefix);
+    int attempt;
+    if (length > 32) { errno = ENAMETOOLONG; return -1; }
+    for (attempt = 0; attempt != 8; ++attempt) {
+        char name[64], *cursor = name + length;
+        int fd;
+        memcpy(name, prefix, length);
+        cursor = append_decimal(cursor, (unsigned)getpid());
+        *cursor++ = '-';
+        cursor = append_decimal(cursor, __sync_fetch_and_add(&sequence, 1));
+        *cursor = '\0';
+        fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) {
+            if (errno == EEXIST) continue;
+            return -1;
+        }
+        shm_unlink(name);
+        if (ftruncate(fd, (off_t)size) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+        return fd;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+/* The SCM_RIGHTS descriptor map: this header, then one entry per guest fd,
+   (object type << 16) | companion count (0 for an fd without companions). */
+#define RIGHTS_MAGIC "LXRIGHT1"
+struct rights_map {
+    char magic[8];
+    uint32_t guest_count;
+    uint32_t companion_total;
+    uint32_t entries[];
+};
+
+static guest_fd_receive_fn receive_functions[GUEST_FD_BINDER + 1];
+
+void guest_fd_register_receive(enum guest_fd_type type,
+    guest_fd_receive_fn receive)
+{
+    if ((int)type > 0 && type <= GUEST_FD_BINDER)
+        receive_functions[type] = receive;
+}
+
+static int has_companions(int fd)
+{
+    struct guest_fd_object *object = typed_object(fd);
+    int result = object != 0 && object->ops->companions != 0;
+    guest_fd_put(object);
+    return result;
+}
+
+int guest_fd_rights_extra(const int *fds, int count, int *extra,
+    struct guest_fd_object **held, int *held_count)
+{
+    struct rights_map *map;
+    size_t size = sizeof(*map) + (size_t)count * sizeof(map->entries[0]);
+    int i, total = 0, map_fd, hidden;
+    *held_count = 0;
+    for (i = 0; i != count; ++i)
+        if (has_companions(fds[i])) break;
+    if (i == count) return 0;
+    map_fd = guest_fd_unnamed_shm("/linuxemu-rights-", size);
+    if (map_fd < 0) return -1;
+    /* Out of the guest's numbers while it exists, and close-on-exec either
+       way: a fork and exec in another thread must not inherit it. */
+    hidden = guest_fd_hide(map_fd);
+    if (hidden >= 0) map_fd = hidden;
+    else (void)fcntl(map_fd, F_SETFD, FD_CLOEXEC);
+    map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0);
+    if (map == MAP_FAILED) {
+        int saved_errno = errno;
+        close(map_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (i = 0; i != count; ++i) {
+        struct guest_fd_object *object = typed_object(fds[i]);
+        int n = 0;
+        if (object != 0 && object->ops->companions != 0)
+            n = object->ops->companions(object, fds[i], extra + total,
+                GUEST_FD_COMPANIONS_MAX);
+        if (n <= 0 || n > GUEST_FD_COMPANIONS_MAX) {
+            guest_fd_put(object);
+            map->entries[i] = 0;
+            continue;
+        }
+        map->entries[i] = ((uint32_t)object->type << 16) | (uint32_t)n;
+        total += n;
+        held[(*held_count)++] = object;
+    }
+    memcpy(map->magic, RIGHTS_MAGIC, sizeof(map->magic));
+    map->guest_count = (uint32_t)count;
+    map->companion_total = (uint32_t)total;
+    munmap(map, size);
+    extra[total] = map_fd;
+    return total + 1;
+}
+
+void guest_fd_rights_sent(int map_fd, struct guest_fd_object **held,
+    int held_count)
+{
+    int i;
+    if (map_fd >= 0) close(map_fd);
+    for (i = 0; i != held_count; ++i) guest_fd_put(held[i]);
+}
+
+/* The descriptor map, when fds[count - 1] is one that describes exactly
+   this message of count fds: mapped read-only, *size set for munmap.
+   0 otherwise (a message from a non-Linuxemu peer, or a truncated one). */
+static const struct rights_map *received_map(const int *fds, int count,
+    size_t *size)
+{
+    struct stat64 status;
+    const struct rights_map *map;
+    uint32_t i, total = 0;
+    int ok;
+    if (count < 2 || fds[count - 1] < 0 ||
+            fstat64(fds[count - 1], &status) != 0) return 0;
+#ifdef S_TYPEISSHM
+    if (!S_TYPEISSHM(&status)) return 0;
+#endif
+    if (status.st_size < (off64_t)sizeof(*map)) return 0;
+    *size = sizeof(*map) + (size_t)(count - 1) * sizeof(map->entries[0]);
+    if ((off64_t)*size > status.st_size) *size = (size_t)status.st_size;
+    map = mmap(0, *size, PROT_READ, MAP_SHARED, fds[count - 1], 0);
+    if (map == MAP_FAILED) return 0;
+    ok = memcmp(map->magic, RIGHTS_MAGIC, sizeof(map->magic)) == 0 &&
+        map->guest_count >= 1 && map->guest_count < (uint32_t)count &&
+        map->companion_total == (uint32_t)count - 1 - map->guest_count &&
+        sizeof(*map) + map->guest_count * sizeof(map->entries[0]) <= *size;
+    for (i = 0; ok && i != map->guest_count; ++i) {
+        uint32_t n = map->entries[i] & 0xffffu, type = map->entries[i] >> 16;
+        if (n > GUEST_FD_COMPANIONS_MAX || type > GUEST_FD_BINDER ||
+                (n != 0 && type == 0)) ok = 0;
+        total += n;
+    }
+    if (ok && total == map->companion_total) return map;
+    munmap((void *)map, *size);
+    return 0;
+}
+
+int guest_fd_rights_received(int *fds, int count)
+{
+    size_t size = 0;
+    const struct rights_map *map = received_map(fds, count, &size);
+    int guest_count = map != 0 ? (int)map->guest_count : count, i, next;
+    for (i = 0; i != guest_count; ++i)
+        if (guest_fd_is_hidden(fds[i])) break;
+    if (i != guest_count) {
+        for (i = 0; i != count; ++i) {
+            close(fds[i]);
+            fds[i] = -1;
+        }
+        if (map != 0) munmap((void *)map, size);
+        return -1;
+    }
+    next = guest_count;
+    for (i = 0; i != guest_count; ++i) {
+        uint32_t n = map != 0 ? map->entries[i] & 0xffffu : 0;
+        uint32_t type = map != 0 ? map->entries[i] >> 16 : 0;
+        guest_fd_clear(fds[i]);
+        /* An object this process still holds (sent to itself, or inherited
+           across fork) is the same object: adopt it rather than map a
+           second copy of its state. */
+        if (!adopt_received(fds[i]) && n != 0 &&
+                receive_functions[type] != 0)
+            (void)receive_functions[type](fds[i], fds + next, (int)n);
+        next += (int)n;
+    }
+    if (map != 0) {
+        munmap((void *)map, size);
+        for (i = guest_count; i != count; ++i) {
+            close(fds[i]);
+            fds[i] = -1;
+        }
+    }
+    return guest_count;
 }

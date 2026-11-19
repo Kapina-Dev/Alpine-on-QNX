@@ -271,14 +271,40 @@ static int message_flags(uint32_t linux_flags, int *host_flags)
     return 0;
 }
 
+/* Linux SCM_MAX_FD: the most fds one sendmsg passes. */
+#define LINUX_SCM_MAX_FD 253
+
+/* What a send with companions must release after sendmsg: the descriptor
+   map fd and the references that keep the companions open. */
+struct sent_rights {
+    int map_fd;
+    int held_count;
+    struct guest_fd_object **held;
+};
+
+static void release_sent_rights(struct sent_rights *rights)
+{
+    guest_fd_rights_sent(rights->map_fd, rights->held, rights->held_count);
+    rights->map_fd = -1;
+    rights->held_count = 0;
+}
+
+/* Converts the guest's SCM_RIGHTS control data.  *allocation is what the
+   caller frees; host->msg_control and msg_controllen are set.  When a sent
+   fd has companions (guest_fd_rights_extra), all the guest's fds go into
+   one message followed by the companions and the descriptor map, built in
+   room after the plain conversion inside the same allocation. */
 static int send_control(const void *guest_control, uint32_t guest_length,
-    void **host_control, size_t *host_length)
+    void **allocation, struct msghdr *host, struct sent_rights *rights)
 {
     const unsigned char *guest = guest_control;
     size_t guest_offset = 0;
     size_t required = 0;
+    size_t descriptor_total = 0, merged_space, extra_capacity;
     unsigned char *converted;
     size_t host_offset = 0;
+    struct cmsghdr *merged;
+    int *merged_fds, extra_count;
     while (guest_offset != guest_length) {
         struct linux_cmsghdr header;
         size_t payload_length;
@@ -300,12 +326,22 @@ static int send_control(const void *guest_control, uint32_t guest_length,
             if (header.length != guest_length - guest_offset) return -EINVAL;
             space = header.length;
         }
-        if (CMSG_SPACE(payload_length) > SIZE_MAX - required) return -EINVAL;
+        descriptor_total += payload_length / sizeof(int);
+        if (descriptor_total > LINUX_SCM_MAX_FD) return -EINVAL;
         required += CMSG_SPACE(payload_length);
         guest_offset += space;
     }
-    converted = calloc(1, required);
+    /* At most 253 fds, so none of these sizes can overflow. */
+    extra_capacity = descriptor_total * GUEST_FD_COMPANIONS_MAX + 1;
+    merged_space = CMSG_SPACE((descriptor_total + extra_capacity) *
+        sizeof(int));
+    converted = calloc(1, required + merged_space +
+        descriptor_total * sizeof(struct guest_fd_object *));
     if (converted == 0) return -ENOMEM;
+    merged = (struct cmsghdr *)(converted + required);
+    merged_fds = (int *)CMSG_DATA(merged);
+    rights->held = (struct guest_fd_object **)(converted + required +
+        merged_space);
     guest_offset = 0;
     while (guest_offset != guest_length) {
         struct linux_cmsghdr header;
@@ -320,13 +356,36 @@ static int send_control(const void *guest_control, uint32_t guest_length,
         host_header->cmsg_type = SCM_RIGHTS;
         memcpy(CMSG_DATA(host_header), guest + guest_offset + sizeof(header),
             payload_length);
+        memcpy(merged_fds, CMSG_DATA(host_header), payload_length);
+        merged_fds += payload_length / sizeof(int);
         host_offset += CMSG_SPACE(payload_length);
         guest_space = linux_cmsg_align(header.length);
         guest_offset += guest_space <= guest_length - guest_offset ?
             guest_space : header.length;
     }
-    *host_control = converted;
-    *host_length = required;
+    merged_fds = (int *)CMSG_DATA(merged);
+    extra_count = guest_fd_rights_extra(merged_fds, (int)descriptor_total,
+        merged_fds + descriptor_total, rights->held, &rights->held_count);
+    if (extra_count < 0) {
+        int saved_errno = errno;
+        free(converted);
+        rights->held = 0;
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    *allocation = converted;
+    if (extra_count == 0) {
+        host->msg_control = converted;
+        host->msg_controllen = required;
+        return 0;
+    }
+    rights->map_fd = merged_fds[descriptor_total + (size_t)extra_count - 1];
+    merged->cmsg_len = CMSG_LEN((descriptor_total + (size_t)extra_count) *
+        sizeof(int));
+    merged->cmsg_level = SOL_SOCKET;
+    merged->cmsg_type = SCM_RIGHTS;
+    host->msg_control = merged;
+    host->msg_controllen = CMSG_SPACE((descriptor_total +
+        (size_t)extra_count) * sizeof(int));
     return 0;
 }
 
@@ -345,7 +404,9 @@ static int receive_control(const struct msghdr *host, void *guest_control,
         size_t converted_length;
         size_t converted_space;
         size_t index;
+        size_t fit;
         int *descriptors;
+        int guest_count;
         if (header->cmsg_len < minimum) return -EINVAL;
         if (header->cmsg_level != SOL_SOCKET ||
             header->cmsg_type != SCM_RIGHTS)
@@ -354,19 +415,35 @@ static int receive_control(const struct msghdr *host, void *guest_control,
         if (payload_length == 0 || payload_length % sizeof(int) != 0)
             return -EINVAL;
         descriptors = (int *)CMSG_DATA(header);
-        /* A received fd in the hidden range means the guest is out of
-           numbers: drop them all and report MSG_CTRUNC, as Linux does when
-           it cannot install a received fd. */
-        for (index = 0; index != payload_length / sizeof(int); ++index)
-            if (guest_fd_is_hidden(descriptors[index])) break;
-        if (index != payload_length / sizeof(int)) {
+        /* Strips a Linuxemu sender's companions and descriptor map (their
+           slots become -1, so close_received_rights skips them) and gives
+           each fd its object.  -1: a received fd landed in the hidden
+           range, so the guest is out of numbers; all are closed and
+           MSG_CTRUNC reported, as Linux does when it cannot install a
+           received fd. */
+        guest_count = guest_fd_rights_received(descriptors,
+            (int)(payload_length / sizeof(int)));
+        if (guest_count < 0) {
             *linux_flags |= 0x0008u;
-            for (index = 0; index != payload_length / sizeof(int); ++index)
-                close(descriptors[index]);
             continue;
         }
-        for (index = 0; index != payload_length / sizeof(int); ++index)
-            guest_fd_received(descriptors[index]);
+        payload_length = (size_t)guest_count * sizeof(int);
+        /* As Linux: the fds that fit the guest's remaining buffer are
+           installed, the rest closed, and MSG_CTRUNC reported.  The host
+           buffer has room for the extra fds, so a short guest buffer is
+           met here rather than by the host's own truncation. */
+        fit = guest_capacity - guest_offset < sizeof(converted) ? 0 :
+            (guest_capacity - guest_offset - sizeof(converted)) / sizeof(int);
+        if (fit < (size_t)guest_count) {
+            *linux_flags |= 0x0008u;
+            for (index = fit; index != (size_t)guest_count; ++index) {
+                guest_fd_clear(descriptors[index]);
+                close(descriptors[index]);
+                descriptors[index] = -1;
+            }
+            payload_length = fit * sizeof(int);
+            if (fit == 0) continue;
+        }
         if (close_on_exec)
             for (index = 0; index != payload_length / sizeof(int); ++index) {
                 int flags = fcntl(descriptors[index], F_GETFD);
@@ -710,6 +787,7 @@ static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
     void *control = 0;
     size_t control_length = 0;
     size_t payload_length = 0;
+    struct sent_rights rights = { -1, 0, 0 };
     int flags;
     int converted;
     ssize_t result;
@@ -726,21 +804,32 @@ static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
     if (!receiving && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         converted = send_control((void *)guest.control, guest.control_length,
-            &control, &control_length);
+            &control, &host, &rights);
         if (converted != 0) return converted;
-        host.msg_control = control;
-        host.msg_controllen = control_length;
     } else if (receiving && guest.control_length != 0) {
+        /* Room for the companions and descriptor map a Linuxemu sender
+           adds after the guest's fds (stripped again before the guest
+           sees them): up to GUEST_FD_COMPANIONS_MAX per fd that fits the
+           guest's buffer, plus the map. */
+        size_t fd_room = guest.control_length;
+        if (fd_room > CMSG_SPACE(LINUX_SCM_MAX_FD * sizeof(int)))
+            fd_room = CMSG_SPACE(LINUX_SCM_MAX_FD * sizeof(int));
+        control_length = (size_t)guest.control_length +
+            fd_room * GUEST_FD_COMPANIONS_MAX + CMSG_SPACE(sizeof(int));
         if (guest.control == 0) return -EFAULT;
-        control = calloc(1, guest.control_length);
+        control = calloc(1, control_length);
         if (control == 0) return -ENOMEM;
         host.msg_control = control;
-        host.msg_controllen = guest.control_length;
+        host.msg_controllen = control_length;
     }
     if (!receiving && guest.name != 0) {
         converted = guest_address((void *)guest.name, guest.name_length, 0,
             &address, &address_length);
-        if (converted != 0) { free(control); return converted; }
+        if (converted != 0) {
+            release_sent_rights(&rights);
+            free(control);
+            return converted;
+        }
         host.msg_name = &address;
         host.msg_namelen = address_length;
     } else if (receiving && guest.name != 0) {
@@ -750,6 +839,7 @@ static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
     result = !receiving ?
         sendmsg(fd, &host, flags) :
         recvmsg(fd, &host, flags);
+    if (!receiving) release_sent_rights(&rights);
     if (result < 0) {
         int saved_errno = errno;
         free(control);

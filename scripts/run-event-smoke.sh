@@ -43,6 +43,7 @@ run_guest()
 
 run_rootfs_fixture eventfd-semantics
 run_rootfs_fixture eventfd-blocking
+run_rootfs_fixture eventfd-share
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"

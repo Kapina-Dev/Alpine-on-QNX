@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define LINUX_EFD_SEMAPHORE 0x00000001u
@@ -323,9 +324,23 @@ static short eventfd_ready_now(struct guest_fd_object *object, int fd)
     return ready;
 }
 
+/* SCM_RIGHTS companions: the channel write end, then the shm page.  The
+   guest's fd (the channel read end) travels as itself. */
+static int eventfd_companions(struct guest_fd_object *object, int fd,
+    int *out, int max)
+{
+    struct eventfd_data *data = guest_fd_object_data(object);
+    (void)fd;
+    if (max < 2 || data->write_fd < 0 || data->shm_fd < 0) return -1;
+    out[0] = data->write_fd;
+    out[1] = data->shm_fd;
+    return 2;
+}
+
 static const struct guest_fd_ops eventfd_ops = {
     eventfd_read, eventfd_write, eventfd_poll_fd, eventfd_get_status,
-    eventfd_set_status, eventfd_release, eventfd_serialize, eventfd_ready_now
+    eventfd_set_status, eventfd_release, eventfd_serialize, eventfd_ready_now,
+    eventfd_companions
 };
 
 static void *map_page(int shm_fd)
@@ -377,38 +392,11 @@ static int hide(int fd)
     return hidden;
 }
 
-static char *append_decimal(char *cursor, unsigned value)
-{
-    char digits[12];
-    int count = 0;
-    do { digits[count++] = (char)('0' + value % 10); value /= 10; }
-    while (value != 0);
-    while (count != 0) *cursor++ = digits[--count];
-    return cursor;
-}
-
-/* A fresh unnamed shm page, hidden.  The name (from the pid and a
-   sequence number; no stdio here) is unlinked at once. */
+/* A fresh unnamed shm page, hidden. */
 static int create_page(void)
 {
-    static const char prefix[] = "/linuxemu-eventfd-";
-    static unsigned sequence;
-    char name[64], *cursor = name + sizeof(prefix) - 1;
-    int fd, hidden;
-    memcpy(name, prefix, sizeof(prefix) - 1);
-    cursor = append_decimal(cursor, (unsigned)getpid());
-    *cursor++ = '-';
-    cursor = append_decimal(cursor, __sync_fetch_and_add(&sequence, 1));
-    *cursor = '\0';
-    fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    int fd = guest_fd_unnamed_shm("/linuxemu-eventfd-", EVENTFD_PAGE), hidden;
     if (fd < 0) return -1;
-    shm_unlink(name);
-    if (ftruncate(fd, EVENTFD_PAGE) != 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        return -1;
-    }
     hidden = hide(fd);
     if (hidden < 0) {
         int saved_errno = errno;
@@ -488,7 +476,45 @@ static int eventfd_restore(int fd, int hidden_fd, int second_hidden_fd,
     return attach_object(fd, second_hidden_fd, hidden_fd, page);
 }
 
+/* A hidden copy of a companion that arrived over SCM_RIGHTS (the caller
+   closes the original). */
+static int hidden_copy(int fd)
+{
+    int copy = fcntl(fd, F_DUPFD, 0), hidden;
+    if (copy < 0) return -1;
+    hidden = hide(copy);
+    if (hidden < 0) close(copy);
+    return hidden;
+}
+
+/* An eventfd received from another process: fd is the channel read end
+   (its native O_NONBLOCK belongs to the shared description), and the
+   companions are the channel write end and the shm page. */
+static int eventfd_receive(int fd, const int *companions, int count)
+{
+    struct stat64 status;
+    int write_fd, shm_fd;
+    void *page;
+    if (count != 2 || fstat64(companions[1], &status) != 0 ||
+            status.st_size < EVENTFD_PAGE) return -1;
+    write_fd = hidden_copy(companions[0]);
+    if (write_fd < 0) return -1;
+    shm_fd = hidden_copy(companions[1]);
+    if (shm_fd < 0) {
+        close(write_fd);
+        return -1;
+    }
+    page = map_page(shm_fd);
+    if (page == 0 || attach_object(fd, write_fd, shm_fd, page) != 0) {
+        close(write_fd);
+        close(shm_fd);
+        return -1;
+    }
+    return 0;
+}
+
 void linux_eventfd_register(void)
 {
     guest_fd_register_restore(GUEST_FD_EVENTFD, eventfd_restore);
+    guest_fd_register_receive(GUEST_FD_EVENTFD, eventfd_receive);
 }

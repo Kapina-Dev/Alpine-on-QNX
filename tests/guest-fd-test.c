@@ -28,7 +28,7 @@ static void count_release(struct guest_fd_object *object)
 }
 
 static const struct guest_fd_ops counting_ops = {
-    0, 0, 0, 0, 0, count_release, 0, 0
+    0, 0, 0, 0, 0, count_release, 0, 0, 0
 };
 
 static struct guest_fd_object *new_object(int backing_fd)
@@ -209,7 +209,7 @@ static int carried_serialize(struct guest_fd_object *object, int fd,
 }
 
 static const struct guest_fd_ops carried_ops = {
-    0, 0, 0, 0, 0, carried_release, carried_serialize, 0
+    0, 0, 0, 0, 0, carried_release, carried_serialize, 0, 0
 };
 
 static int carried_restore(int fd, int hidden_fd, int second_hidden_fd,
@@ -293,7 +293,7 @@ static int carried_two_serialize(struct guest_fd_object *object, int fd,
 }
 
 static const struct guest_fd_ops carried_two_ops = {
-    0, 0, 0, 0, 0, carried_two_release, carried_two_serialize, 0
+    0, 0, 0, 0, 0, carried_two_release, carried_two_serialize, 0, 0
 };
 
 static void exec_records_two_hidden(void)
