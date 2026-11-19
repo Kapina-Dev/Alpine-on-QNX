@@ -291,13 +291,47 @@ static int restartable_syscall(uint32_t number)
     }
 }
 
+/* Signals with a guest handler. */
+void guest_signal_handled_mask(uint32_t words[2])
+{
+    int linux_signal;
+    words[0] = words[1] = 0;
+    for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal)
+        if (guest_actions[linux_signal].handler > 1u)
+            words[(linux_signal - 1) / 32] |=
+                1u << ((linux_signal - 1) % 32);
+}
+
+/* The next signal this thread takes now: its own queue first, then the
+   process queue (signals the collector took), as Linux takes private
+   pending signals before shared ones.  From the process queue only
+   signals the thread doesn't block and that have a guest handler; the
+   default and ignore actions of collected signals stay queued (Task 5
+   applies them here). */
+static int take_deliverable(siginfo_t *information, int *has_information)
+{
+    uint32_t pending[2], mask[2], allowed[2];
+    int linux_signal = guest_thread_take_pending(information,
+        has_information);
+    if (linux_signal != 0) return linux_signal;
+    guest_process_pending_mask(pending, 1);
+    if ((pending[0] | pending[1]) == 0) return 0;
+    guest_thread_signal_mask_get(mask);
+    guest_signal_handled_mask(allowed);
+    allowed[0] &= ~mask[0] & pending[0];
+    allowed[1] &= ~mask[1] & pending[1];
+    if ((allowed[0] | allowed[1]) == 0) return 0;
+    linux_signal = guest_process_take_pending(allowed, information);
+    *has_information = linux_signal != 0;
+    return linux_signal;
+}
+
 int guest_signal_deliver_pending(ucontext_t *context, uint32_t syscall_number,
     uint32_t original_r0, uint32_t instruction_width)
 {
     siginfo_t information;
     int has_information;
-    int linux_signal = guest_thread_take_pending(&information,
-        &has_information);
+    int linux_signal = take_deliverable(&information, &has_information);
     if (linux_signal == 0) return 0;
     if (context->uc_mcontext.cpu.gpr[0] == (uint32_t)-EINTR &&
         (guest_actions[linux_signal].flags & LINUX_SA_RESTART) != 0 &&
@@ -376,6 +410,151 @@ static void host_signal_handler(int host_signal, siginfo_t *information,
     guest_thread_signal_pending(linux_signal, information);
 }
 
+/*
+ * The poke: the host signal signalfd's collector sends a guest thread
+ * after routing it a signal it took but the thread has unblocked
+ * (guest_thread_route_signal).  QNX's SIGEMT (7): no Linux signal maps
+ * to it (Linux 7, SIGBUS, is QNX 10), so a guest can neither send nor
+ * block it, and Linuxemu uses it for nothing else.  In guest code the
+ * handler delivers the routed signal at once, as host_signal_handler does
+ * for a direct one; inside a syscall it only wakes the thread's wait,
+ * and the syscall's return delivers it (guest_signal_deliver_pending).
+ */
+#define GUEST_SIGNAL_POKE SIGEMT
+
+static void poke_handler(int host_signal, siginfo_t *information,
+    void *argument)
+{
+    ucontext_t *context = argument;
+    uintptr_t pc = context->uc_mcontext.cpu.gpr[15];
+    siginfo_t pending;
+    int has_information, linux_signal;
+    (void)host_signal;
+    (void)information;
+    if (guest_thread_syscall_active() || !guest_memory_is_executable(pc, 4)) {
+        guest_thread_signal_wake();
+        return;
+    }
+    linux_signal = take_deliverable(&pending, &has_information);
+    if (linux_signal == 0 ||
+            guest_signal_deliver(context, linux_signal,
+                has_information ? &pending : 0) != 0) return;
+    /* More routed signals: the next poke arrives once this frame is set
+       up (the poke is blocked until this handler returns), so they nest
+       as Linux delivers several pending signals. */
+    {
+        uint32_t queued[2];
+        guest_process_pending_mask(queued, 1);
+        if ((queued[0] | queued[1]) != 0)
+            (void)pthread_kill(pthread_self(), GUEST_SIGNAL_POKE);
+    }
+}
+
+int guest_signal_poke_install(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = poke_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    return sigaction(GUEST_SIGNAL_POKE, &action, 0);
+}
+
+/* The collector took host_signal.  A guest thread that has it unblocked
+   gets it through normal delivery (routed); otherwise it goes into the
+   process queue.  Returns the Linux signal queued for signalfd, or 0. */
+int guest_signal_collected(int host_signal, const siginfo_t *information)
+{
+    int linux_signal = guest_signal_from_host(host_signal);
+    if (linux_signal == 0 || linux_signal == 9 || linux_signal == 19)
+        return 0;
+    if (guest_thread_route_signal(linux_signal, information,
+            guest_actions[linux_signal].handler > 1u ? 0 : host_signal,
+            GUEST_SIGNAL_POKE))
+        return 0;
+    guest_process_signal_queue(linux_signal, information);
+    return linux_signal;
+}
+
+/* QNX si_code to Linux: the user codes differ (QNX SI_QUEUE -2, SI_TIMER
+   -3, SI_MESGQ -5; Linux -1, -2, -3); the kernel codes (CLD_*, SEGV_*,
+   ...) have the same values.  QNX SI_NOINFO (127) says only si_signo is
+   valid. */
+static int32_t linux_si_code(int host_code)
+{
+    switch (host_code) {
+    case SI_QUEUE: return -1;
+    case SI_TIMER: return -2;
+    case SI_MESGQ: return -3;
+    case SI_ASYNCIO: return -4;
+    case SI_NOINFO: return 0;
+    default: return host_code;
+    }
+}
+
+static void put32(unsigned char *record, size_t offset, uint32_t value)
+{
+    memcpy(record + offset, &value, sizeof(value));
+}
+
+static void put64(unsigned char *record, size_t offset, uint64_t value)
+{
+    memcpy(record + offset, &value, sizeof(value));
+}
+
+/*
+ * One 128-byte Linux struct signalfd_siginfo.  QNX's sigwaitinfo reports
+ * si_uid 0 whoever sent the signal (FINDINGS 2026-11-19, Phase 3 part 2
+ * probes); every BB10 app process runs as the same user, so a sender uid
+ * of 0 with a sender pid is reported as this process's real uid
+ * (documented: a root sender shows as the user's uid).
+ */
+void guest_signal_signalfd_record(unsigned char record[128], int linux_signal,
+    const siginfo_t *source)
+{
+    int32_t code;
+    memset(record, 0, 128);
+    put32(record, 0, (uint32_t)linux_signal);
+    if (source == 0) return;
+    if (source->si_signo == GUEST_NATIVE_SIGINFO) {
+        put32(record, 4, (uint32_t)source->si_errno);
+        put32(record, 8, (uint32_t)source->si_code);
+        put32(record, 12, (uint32_t)source->si_pid);
+        put32(record, 16, (uint32_t)source->si_uid);
+        put32(record, 44, (uint32_t)source->si_value.sival_int);
+        put64(record, 48, (uint32_t)source->si_value.sival_int);
+        return;
+    }
+    if (source->si_code == SI_NOINFO) return;
+    code = linux_si_code(source->si_code);
+    if (source->si_errno != 0)
+        put32(record, 4, (uint32_t)linux_errno_number(source->si_errno));
+    put32(record, 8, (uint32_t)code);
+    if (linux_signal == 4 || linux_signal == 7 || linux_signal == 8 ||
+            linux_signal == 11) {
+        if (source->si_code > 0) {
+            put64(record, 72, (uint32_t)(uintptr_t)source->si_addr);
+            return;
+        }
+    }
+    put32(record, 12, (uint32_t)source->si_pid);
+    if (linux_signal == 17 && source->si_code > 0) {
+        /* SIGCHLD from the kernel: status and the child's times; the
+           child runs as this user. */
+        put32(record, 16, (uint32_t)getuid());
+        put32(record, 40, (uint32_t)source->si_status);
+        put64(record, 56, (uint64_t)source->si_utime);
+        put64(record, 64, (uint64_t)source->si_stime);
+        return;
+    }
+    put32(record, 16, source->si_uid == 0 && source->si_pid != 0 ?
+        (uint32_t)getuid() : (uint32_t)source->si_uid);
+    if (source->si_code <= 0) {
+        put32(record, 44, (uint32_t)source->si_value.sival_int);
+        put64(record, 48, (uint32_t)(uintptr_t)source->si_value.sival_ptr);
+    }
+}
+
 /* Linux signals whose default action does not end the process: SIGCHLD,
    SIGCONT, SIGURG and SIGWINCH are ignored; SIGSTOP/TSTP/TTIN/TTOU stop. */
 static int default_action_terminates(int linux_signal)
@@ -437,19 +616,62 @@ static int diagnostics_catchable(int linux_signal)
         linux_signal != 9 && linux_signal != 11 && linux_signal != 19;
 }
 
+static void diagnostics_terminate_action(int host_signal,
+    siginfo_t *information, void *argument)
+{
+    (void)information;
+    (void)argument;
+    diagnostics_terminate_handler(host_signal);
+}
+
+/*
+ * The host action for a guest's default action (into a zeroed sigaction).
+ * QNX queues a real-time signal only when its action has SA_SIGINFO
+ * (SIG_DFL without it: one of three sigqueues stays pending, FINDINGS
+ * 2026-11-19, signalfd task), and Linux always queues them, so a
+ * real-time default action carries the flag.
+ */
+static void default_host_action(int linux_signal, struct sigaction *action)
+{
+    int queued = linux_signal >= 32;
+    if (diagnostics_handlers && diagnostics_catchable(linux_signal)) {
+        if (queued) action->sa_sigaction = diagnostics_terminate_action;
+        else action->sa_handler = diagnostics_terminate_handler;
+    } else action->sa_handler = SIG_DFL;
+    if (queued) action->sa_flags |= SA_SIGINFO;
+}
+
+/* At start-up: the real-time signals still at SIG_DFL get the queueing
+   default (an inherited SIG_IGN stays). */
+void guest_signal_queue_defaults(void)
+{
+    int linux_signal;
+    for (linux_signal = 32; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        struct sigaction current, action;
+        int host_signal = linux_signal_to_host(linux_signal);
+        if (host_signal == 0 || sigaction(host_signal, 0, &current) != 0 ||
+                current.sa_handler != SIG_DFL ||
+                (current.sa_flags & SA_SIGINFO) != 0) continue;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        default_host_action(linux_signal, &action);
+        (void)sigaction(host_signal, &action, 0);
+    }
+}
+
 void guest_signal_diagnostics_initialize(void)
 {
-    struct sigaction action;
     int linux_signal;
 
     diagnostics_handlers = 1;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = diagnostics_terminate_handler;
-    sigemptyset(&action.sa_mask);
     for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        struct sigaction action;
         int host_signal = linux_signal_to_host(linux_signal);
         if (host_signal == 0 || !diagnostics_catchable(linux_signal) ||
             guest_actions[linux_signal].handler != 0) continue;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        default_host_action(linux_signal, &action);
         sigaction(host_signal, &action, 0);
     }
 }
@@ -520,6 +742,39 @@ int32_t guest_signal_queue_thread(int32_t process, int32_t thread,
     return 0;
 }
 
+/*
+ * rt_sigqueueinfo (178), the call under musl's sigqueue.  QNX's sigqueue
+ * carries the signal and si_value; the receiver sees this process as the
+ * sender and SI_QUEUE as the code, whatever si_code the caller wrote (a
+ * Linux process may write any negative code to itself; QNX can't send
+ * one).  As on Linux, another process may only be sent a negative code
+ * other than SI_TKILL (-6): EPERM otherwise.
+ */
+int32_t guest_signal_queue_process(pid_t process, int linux_signal,
+    const void *guest_information, uint32_t number, const uint32_t *args)
+{
+    int32_t words[6];
+    union sigval value;
+    int host_signal;
+    if (linux_signal < 0 || linux_signal > LINUX_SIGNAL_COUNT) return -EINVAL;
+    host_signal = linux_signal == 0 ? 0 : linux_signal_to_host(linux_signal);
+    if (linux_signal != 0 && host_signal == 0)
+        return linux_report_unsupported(number, EINVAL, "signal-unmapped",
+            args);
+    if (guest_information == 0) return -EFAULT;
+    memcpy(words, guest_information, sizeof(words));
+    if (process != getpid() && (words[2] >= 0 || words[2] == -6))
+        return -EPERM;
+    if (process == getpid()) flush_before_self_signal(linux_signal);
+    if (linux_signal == 0)
+        return kill(process, 0) == 0 ? 0 :
+            -(int32_t)linux_errno_number(errno);
+    memset(&value, 0, sizeof(value));
+    value.sival_int = words[5];
+    return sigqueue(process, host_signal, value) == 0 ? 0 :
+        -(int32_t)linux_errno_number(errno);
+}
+
 int32_t guest_signal_action(int linux_signal, const void *guest_action,
     void *guest_old_action, size_t signal_set_size)
 {
@@ -540,9 +795,7 @@ int32_t guest_signal_action(int linux_signal, const void *guest_action,
     memset(&host_action, 0, sizeof(host_action));
     if (action.handler == 1) host_action.sa_handler = SIG_IGN;
     else if (action.handler == 0)
-        host_action.sa_handler = diagnostics_handlers &&
-            diagnostics_catchable(linux_signal) ?
-            diagnostics_terminate_handler : SIG_DFL;
+        default_host_action(linux_signal, &host_action);
     else {
         host_action.sa_sigaction = host_signal_handler;
         host_action.sa_flags = SA_SIGINFO;
@@ -606,6 +859,99 @@ int32_t guest_signal_mask(int how, const void *guest_set, void *guest_old_set,
         guest_thread_signal_mask_set(new_words);
     }
     return 0;
+}
+
+/*
+ * The guest's mask on the host thread.  Syscalls run inside the trap's
+ * SIGILL handler, and when a QNX handler returns, SignalReturn restores
+ * the thread's mask from the frame QNX built for it, not from the
+ * thread's current mask and not from the ucontext (QNX leaves uc_sigmask
+ * zero and ignores it; FINDINGS 2026-11-19, signalfd task).  The frame is
+ * struct _sighandler_info { siginfo_t siginfo; handler; context; data[] }
+ * (sys/neutrino.h), and the saved sigset_t is the start of data[], right
+ * after the fixed fields.  So a pthread_sigmask in an emulated
+ * rt_sigprocmask was undone at the syscall's return, and a signal the
+ * guest blocked stayed unblocked on QNX: a blocked default-action signal
+ * ended the process, a handled one was queued by the host handler.
+ *
+ * guest_signal_frame_probe checks that layout once at start-up (a handler
+ * on a spare signal must find a known mask there); only then does
+ * guest_signal_apply_frame_mask write the guest's mask into the trap's
+ * frame: every host signal a Linux signal maps to is blocked exactly when
+ * the guest blocks it (SIGILL and SIGSEGV never); the other host signals
+ * keep their saved state.
+ */
+#define FRAME_MASK_OFFSET (sizeof(siginfo_t) + 2 * sizeof(void *))
+static int frame_mask_ok;
+static volatile int frame_probe_matched;
+static sigset_t frame_probe_expected;
+
+/* Same membership for every signal a mask can change (QNX keeps its top
+   eight, SIGRTMAX + 1 and up, masked whatever is asked). */
+static int same_signals(const sigset_t *first, const sigset_t *second)
+{
+    int host_signal;
+    for (host_signal = 1; host_signal <= SIGRTMAX; ++host_signal)
+        if (sigismember(first, host_signal) !=
+                sigismember(second, host_signal)) return 0;
+    return 1;
+}
+
+static void frame_probe_handler(int host_signal, siginfo_t *information,
+    void *argument)
+{
+    sigset_t saved;
+    (void)host_signal;
+    (void)argument;
+    memcpy(&saved, (const char *)information + FRAME_MASK_OFFSET,
+        sizeof(saved));
+    frame_probe_matched = same_signals(&saved, &frame_probe_expected);
+}
+
+void guest_signal_frame_probe(void)
+{
+    struct sigaction action, old_action;
+    sigset_t old_mask, after;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = frame_probe_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGEMT, &action, &old_action) != 0) return;
+    pthread_sigmask(SIG_SETMASK, 0, &old_mask);
+    /* A distinctive saved mask: SIGHUP, SIGQUIT, SIGPIPE, SIGTTOU. */
+    sigemptyset(&frame_probe_expected);
+    sigaddset(&frame_probe_expected, SIGHUP);
+    sigaddset(&frame_probe_expected, SIGQUIT);
+    sigaddset(&frame_probe_expected, SIGPIPE);
+    sigaddset(&frame_probe_expected, SIGTTOU);
+    pthread_sigmask(SIG_SETMASK, &frame_probe_expected, 0);
+    frame_probe_matched = 0;
+    pthread_kill(pthread_self(), SIGEMT);
+    pthread_sigmask(SIG_SETMASK, 0, &after);
+    pthread_sigmask(SIG_SETMASK, &old_mask, 0);
+    sigaction(SIGEMT, &old_action, 0);
+    frame_mask_ok = frame_probe_matched &&
+        same_signals(&after, &frame_probe_expected);
+}
+
+void guest_signal_apply_frame_mask(siginfo_t *trap_information)
+{
+    sigset_t *saved;
+    uint32_t words[2];
+    sigset_t guest_set;
+    int linux_signal;
+    if (!frame_mask_ok || trap_information == 0) return;
+    saved = (sigset_t *)(void *)((char *)trap_information + FRAME_MASK_OFFSET);
+    guest_thread_signal_mask_get(words);
+    linux_set_to_host(words, &guest_set);
+    for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
+        int host_signal = linux_signal_to_host(linux_signal);
+        if (host_signal == 0 || host_signal == SIGILL ||
+                host_signal == SIGSEGV) continue;
+        if (sigismember(&guest_set, host_signal) == 1)
+            sigaddset(saved, host_signal);
+        else sigdelset(saved, host_signal);
+    }
 }
 
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size)

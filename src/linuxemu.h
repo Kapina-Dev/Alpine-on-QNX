@@ -168,6 +168,31 @@ int guest_signal_return(ucontext_t *context, int realtime);
 int32_t guest_signal_altstack(ucontext_t *context, const void *guest_stack,
     void *guest_old_stack);
 int guest_signal_from_host(int host_signal);
+/* Checks once, at start-up, where QNX's signal frame keeps the mask that
+   SignalReturn restores (guest_signal.c). */
+void guest_signal_frame_probe(void);
+/* Gives real-time signals at SIG_DFL the queueing default action (QNX
+   queues a real-time signal only with SA_SIGINFO). */
+void guest_signal_queue_defaults(void);
+/* Makes the calling thread's guest mask the host mask the trap handler
+   returns with (after rt_sigprocmask and sigreturn); trap_information is
+   the trap handler's siginfo.  Does nothing if the probe failed. */
+void guest_signal_apply_frame_mask(siginfo_t *trap_information);
+/* rt_sigqueueinfo (178): 0 or a negative Linux errno. */
+int32_t guest_signal_queue_process(pid_t process, int linux_signal,
+    const void *guest_information, uint32_t number, const uint32_t *args);
+/* Linux signals that have a guest handler (action above SIG_IGN). */
+void guest_signal_handled_mask(uint32_t words[2]);
+/* Installs the handler of the host signal the collector pokes a guest
+   thread with after routing it a signal (0 or -1). */
+int guest_signal_poke_install(void);
+/* signalfd's collector took host_signal: routes it to a guest thread that
+   has it unblocked, or queues it in the process queue.  Returns the
+   Linux signal queued for signalfd readers, or 0. */
+int guest_signal_collected(int host_signal, const siginfo_t *information);
+/* One 128-byte Linux struct signalfd_siginfo for a taken signal. */
+void guest_signal_signalfd_record(unsigned char record[128], int linux_signal,
+    const siginfo_t *information);
 extern void linuxemu_signal_return_trampoline(void);
 extern void linuxemu_rt_signal_return_trampoline(void);
 
@@ -224,6 +249,33 @@ void guest_thread_after_fork(void);
 void guest_thread_exit(int status) __attribute__((noreturn));
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information);
 int guest_thread_take_pending(siginfo_t *information, int *has_information);
+/* The calling thread's queue: takes the next signal in mask (lowest
+   standard first, then real-time in order), or 0; and the signals it
+   holds. */
+int guest_thread_take_pending_mask(const uint32_t mask[2],
+    siginfo_t *information);
+void guest_thread_pending_mask(uint32_t words[2]);
+/* Wakes the calling thread's futex and signal-wait waits. */
+void guest_thread_signal_wake(void);
+/* See guest_thread.c: hands a collected signal to a guest thread that has
+   it unblocked (1), or 0 when every guest thread blocks it. */
+int guest_thread_route_signal(int linux_signal, const siginfo_t *information,
+    int resend_host_signal, int poke_host_signal);
+/* The process-wide pending queue (guest_thread.c), fed by signalfd's
+   collector.  queue: standard signals coalesce, real-time ones queue in
+   order.  take_pending: the next signal in mask for normal delivery
+   (routed entries included), or 0.  take_visible: the same for a signalfd
+   read (routed entries skipped); *freed set when a full real-time ring
+   got room (call linux_signalfd_collector_update once done).
+   pending_mask: the signals queued (routed ones only with
+   include_routed); full_mask: the real-time signals whose ring is full
+   (the collector doesn't take them). */
+void guest_process_signal_queue(int linux_signal, const siginfo_t *info);
+int guest_process_take_pending(const uint32_t mask[2], siginfo_t *info);
+int guest_process_take_visible(const uint32_t mask[2], siginfo_t *info,
+    int *freed);
+void guest_process_pending_mask(uint32_t words[2], int include_routed);
+void guest_process_full_mask(uint32_t words[2]);
 int32_t guest_thread_kill(int32_t tid, int host_signal);
 void guest_thread_signal_mask_get(uint32_t words[2]);
 void guest_thread_signal_mask_set(const uint32_t words[2]);
@@ -338,6 +390,16 @@ int32_t linux_timerfd_set_ticks(int fd, const void *guest_ticks);
 void linux_timerfd_after_fork(void);
 /* Registers the timerfd exec-record restore and SCM_RIGHTS receive. */
 void linux_timerfd_register(void);
+/* signalfd (linux_signalfd.c): signalfd (349, flags 0) and signalfd4
+   (355).  fd -1 creates; an existing signalfd gets the new mask.  The
+   guest fd or a negative Linux errno. */
+int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
+    uint32_t flags);
+/* Recomputes the union of the live signalfds' masks and wakes the
+   collector to wait on it (cheap; does nothing before the collector
+   exists).  Async-signal-safe. */
+void linux_signalfd_collector_update(void);
+void linux_signalfd_after_fork(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);

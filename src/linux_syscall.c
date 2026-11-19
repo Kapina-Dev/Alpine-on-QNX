@@ -76,6 +76,7 @@
 #define LINUX_NR_POLL 168
 #define LINUX_NR_RT_SIGACTION 174
 #define LINUX_NR_RT_SIGPROCMASK 175
+#define LINUX_NR_RT_SIGQUEUEINFO 178
 #define LINUX_NR_RT_SIGSUSPEND 179
 #define LINUX_NR_PREAD64 180
 #define LINUX_NR_PWRITE64 181
@@ -143,6 +144,8 @@
 #define LINUX_NR_EPOLL_PWAIT 346
 #define LINUX_NR_EPOLL_CREATE1 357
 #define LINUX_NR_EPOLL_PWAIT2 441
+#define LINUX_NR_SIGNALFD 349
+#define LINUX_NR_SIGNALFD4 355
 #define LINUX_NR_EVENTFD 351
 #define LINUX_NR_TIMERFD_CREATE 350
 #define LINUX_NR_TIMERFD_SETTIME 353
@@ -2059,6 +2062,24 @@ void linux_syscall_dispatch(ucontext_t *context)
             (int)context->uc_mcontext.cpu.gpr[2],
             (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[3],
             LINUX_NR_RT_TGSIGQUEUEINFO, (const uint32_t *)context->uc_mcontext.cpu.gpr);
+        break;
+    case LINUX_NR_RT_SIGQUEUEINFO:
+        result = guest_signal_queue_process(
+            (pid_t)(int32_t)context->uc_mcontext.cpu.gpr[0],
+            (int)context->uc_mcontext.cpu.gpr[1],
+            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[2],
+            LINUX_NR_RT_SIGQUEUEINFO,
+            (const uint32_t *)context->uc_mcontext.cpu.gpr);
+        break;
+    case LINUX_NR_SIGNALFD:
+        result = linux_signalfd((int)context->uc_mcontext.cpu.gpr[0],
+            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], 0);
+        break;
+    case LINUX_NR_SIGNALFD4:
+        result = linux_signalfd((int)context->uc_mcontext.cpu.gpr[0],
+            (const void *)(uintptr_t)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2], context->uc_mcontext.cpu.gpr[3]);
         break;
     case LINUX_NR_PERSONALITY:
         result = (int32_t)guest_process_personality(

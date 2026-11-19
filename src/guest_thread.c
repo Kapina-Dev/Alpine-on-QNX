@@ -116,6 +116,8 @@ __asm__(
 
 extern void linuxemu_resume_guest(uint32_t registers[16]);
 
+static void process_queue_reset(void);
+
 static struct guest_thread_state *current_thread(void)
 {
     return pthread_getspecific(thread_state_key);
@@ -351,13 +353,35 @@ void guest_thread_after_fork(void)
     guest_fd_after_fork();
     linux_epoll_after_fork();
     linux_timerfd_after_fork();
+    /* Linux doesn't pass pending signals to a child; the lock may have
+       been held by a parent thread that doesn't exist here. */
+    process_queue_reset();
+    linux_signalfd_after_fork();
     linux_resource_after_fork();
+}
+
+/* Wakes the thread's interruptible waits (futex semaphore, signal-wait
+   channel).  Async-signal-safe. */
+static void signal_wake(struct guest_thread_state *state)
+{
+    unsigned char byte = 1;
+    if (state->futex_semaphore != 0) {
+        state->futex_interrupted = 1;
+        sem_post(state->futex_semaphore);
+    }
+    if (state->signal_wait_active && state->signal_wait_write_fd >= 0)
+        write(state->signal_wait_write_fd, &byte, sizeof(byte));
+}
+
+void guest_thread_signal_wake(void)
+{
+    struct guest_thread_state *state = current_thread();
+    if (state != 0) signal_wake(state);
 }
 
 void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)
 {
     struct guest_thread_state *state = current_thread();
-    unsigned char byte = 1;
     if (state != 0 && linux_signal > 0 && linux_signal <= 64) {
         if (linux_signal >= LINUX_FIRST_REALTIME_SIGNAL &&
             linux_signal <= LINUX_LAST_REALTIME_SIGNAL) {
@@ -385,51 +409,54 @@ void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)
             __sync_or_and_fetch(
                 &state->pending_signals[(linux_signal - 1) / 32], bit);
         }
-        if (state->futex_semaphore != 0) {
-            state->futex_interrupted = 1;
-            sem_post(state->futex_semaphore);
-        }
-        if (state->signal_wait_active && state->signal_wait_write_fd >= 0)
-            write(state->signal_wait_write_fd, &byte, sizeof(byte));
+        signal_wake(state);
     }
 }
 
-int guest_thread_take_pending(siginfo_t *information, int *has_information)
+static int mask_has(const uint32_t mask[2], int signal_number)
 {
-    struct guest_thread_state *state = current_thread();
+    return (mask[(signal_number - 1) / 32] &
+        (1u << ((signal_number - 1) % 32))) != 0;
+}
+
+static void mask_add(uint32_t mask[2], int signal_number)
+{
+    mask[(signal_number - 1) / 32] |= 1u << ((signal_number - 1) % 32);
+}
+
+/* Takes the lowest standard signal in allowed, else the first real-time
+   one in allowed, from the thread's queue (Linux dequeue order). */
+static int take_thread(struct guest_thread_state *state,
+    const uint32_t allowed[2], siginfo_t *information, int *has_information)
+{
     uint32_t old_value;
     uint32_t candidates;
     uint32_t new_value;
     siginfo_t selected_information;
-    int word;
     int signal_number;
     if (has_information != 0) *has_information = 0;
     if (information != 0) memset(information, 0, sizeof(*information));
     if (state == 0) return 0;
-    for (word = 0; word != 1; ++word) {
-        do {
-            old_value = state->pending_signals[word];
-            candidates = old_value & ~state->signal_mask[word];
-            if (candidates == 0) break;
-            signal_number = __builtin_ctz(candidates) + 1 + word * 32;
-            selected_information =
-                state->pending_information[signal_number - 1];
-            new_value = old_value & ~(1u << ((signal_number - 1) % 32));
-        } while (!__sync_bool_compare_and_swap(&state->pending_signals[word],
-            old_value, new_value));
-        if (candidates != 0) {
-            if (information != 0)
-                *information = selected_information;
-            if (has_information != 0) *has_information = 1;
-            return signal_number;
-        }
+    do {
+        old_value = state->pending_signals[0];
+        /* Bit 31 would be signal 32, which lives in its ring. */
+        candidates = old_value & allowed[0] & 0x7fffffffu;
+        if (candidates == 0) break;
+        signal_number = __builtin_ctz(candidates) + 1;
+        selected_information = state->pending_information[signal_number - 1];
+        new_value = old_value & ~(1u << (signal_number - 1));
+    } while (!__sync_bool_compare_and_swap(&state->pending_signals[0],
+        old_value, new_value));
+    if (candidates != 0) {
+        if (information != 0) *information = selected_information;
+        if (has_information != 0) *has_information = 1;
+        return signal_number;
     }
     for (signal_number = LINUX_FIRST_REALTIME_SIGNAL;
         signal_number <= LINUX_LAST_REALTIME_SIGNAL; ++signal_number) {
         int index = signal_number - LINUX_FIRST_REALTIME_SIGNAL;
         sig_atomic_t head;
-        if ((state->signal_mask[(signal_number - 1) / 32] &
-                (1u << ((signal_number - 1) % 32))) != 0) continue;
+        if (!mask_has(allowed, signal_number)) continue;
         head = state->realtime_head[index];
         if (head == state->realtime_tail[index]) continue;
         if (information != 0)
@@ -441,6 +468,272 @@ int guest_thread_take_pending(siginfo_t *information, int *has_information)
         return signal_number;
     }
     return 0;
+}
+
+int guest_thread_take_pending(siginfo_t *information, int *has_information)
+{
+    struct guest_thread_state *state = current_thread();
+    uint32_t allowed[2];
+    if (state == 0) return take_thread(0, 0, information, has_information);
+    allowed[0] = ~state->signal_mask[0];
+    allowed[1] = ~state->signal_mask[1];
+    return take_thread(state, allowed, information, has_information);
+}
+
+int guest_thread_take_pending_mask(const uint32_t mask[2],
+    siginfo_t *information)
+{
+    return take_thread(current_thread(), mask, information, 0);
+}
+
+void guest_thread_pending_mask(uint32_t words[2])
+{
+    struct guest_thread_state *state = current_thread();
+    int index;
+    words[0] = words[1] = 0;
+    if (state == 0) return;
+    words[0] = state->pending_signals[0] & 0x7fffffffu;
+    for (index = 0; index < REALTIME_SIGNALS; ++index)
+        if (state->realtime_head[index] != state->realtime_tail[index])
+            mask_add(words, LINUX_FIRST_REALTIME_SIGNAL + index);
+}
+
+/*
+ * The process-wide pending queue, fed by signalfd's collector
+ * (linux_signalfd.c).
+ *
+ * A process-directed signal that every guest thread blocks stays pending
+ * in the QNX kernel; the collector takes it with sigwaitinfo and queues it
+ * here with its siginfo.  Standard signals coalesce (one pending instance,
+ * the first siginfo kept); real-time signals queue in order in a ring per
+ * signal as deep as the per-thread ones (REALTIME_QUEUE_LENGTH).  A full
+ * ring never overflows: the collector stops waiting for that signal while
+ * it is full (guest_process_full_mask), so later instances stay queued in
+ * the QNX kernel, in order, and are taken once a reader makes room (the
+ * kernel's own limit then applies: sigqueue fails EAGAIN, as on Linux).
+ *
+ * An entry is "routed" when the collector took a signal that some guest
+ * thread had unblocked: normal delivery must get it, so delivery takes
+ * routed entries and signalfd reads and readiness don't see them.
+ *
+ * Consumers are any thread (delivery after a syscall or in the poke
+ * handler, signalfd reads); producers are the collector and routing.
+ * process_queue.lock is a spin lock and a leaf: nothing is taken under
+ * it.  It is taken only by emulator code, and by the poke handler only
+ * when the handler interrupted guest code, so no thread ever spins on a
+ * lock it holds itself.  The summary words are written under it and read
+ * without it.
+ */
+static struct {
+    volatile int lock;
+    uint32_t standard;                  /* signals 1..31: bit n-1 */
+    uint32_t standard_routed;
+    siginfo_t standard_information[31];
+    int realtime_head[REALTIME_SIGNALS];
+    int realtime_tail[REALTIME_SIGNALS];
+    unsigned char realtime_routed[REALTIME_SIGNALS][REALTIME_QUEUE_LENGTH];
+    siginfo_t realtime_information[REALTIME_SIGNALS][REALTIME_QUEUE_LENGTH];
+    volatile uint32_t any[2];           /* signals with an entry */
+    volatile uint32_t visible[2];       /* ... whose next one is unrouted */
+    volatile uint32_t full[2];          /* real-time rings that are full */
+} process_queue;
+
+static void process_queue_reset(void)
+{
+    memset(&process_queue, 0, sizeof(process_queue));
+}
+
+static void process_lock(void)
+{
+    while (__sync_lock_test_and_set(&process_queue.lock, 1) != 0)
+        sched_yield();
+}
+
+static void process_unlock(void)
+{
+    __sync_lock_release(&process_queue.lock);
+}
+
+/* Lock held. */
+static void process_summarize(void)
+{
+    uint32_t any[2], visible[2], full[2];
+    int index;
+    any[0] = process_queue.standard;
+    visible[0] = process_queue.standard & ~process_queue.standard_routed;
+    any[1] = visible[1] = full[0] = full[1] = 0;
+    for (index = 0; index < REALTIME_SIGNALS; ++index) {
+        int head = process_queue.realtime_head[index];
+        int count = process_queue.realtime_tail[index] - head;
+        int signal_number = LINUX_FIRST_REALTIME_SIGNAL + index;
+        if (count == 0) continue;
+        mask_add(any, signal_number);
+        if (!process_queue.realtime_routed[index]
+                [head % REALTIME_QUEUE_LENGTH])
+            mask_add(visible, signal_number);
+        if (count >= REALTIME_QUEUE_LENGTH) mask_add(full, signal_number);
+    }
+    __sync_synchronize();
+    process_queue.any[0] = any[0];
+    process_queue.any[1] = any[1];
+    process_queue.visible[0] = visible[0];
+    process_queue.visible[1] = visible[1];
+    process_queue.full[0] = full[0];
+    process_queue.full[1] = full[1];
+    __sync_synchronize();
+}
+
+/* 0 when the signal is out of range or its ring is full (lost: only a
+   routed signal or a race with a ring filling can meet a full ring, since
+   the collector doesn't wait for a signal whose ring is full). */
+static int process_enqueue(int linux_signal, const siginfo_t *information,
+    int routed)
+{
+    int queued = 1;
+    if (linux_signal <= 0 || linux_signal > LINUX_LAST_REALTIME_SIGNAL)
+        return 0;
+    process_lock();
+    if (linux_signal < LINUX_FIRST_REALTIME_SIGNAL) {
+        uint32_t bit = 1u << (linux_signal - 1);
+        if ((process_queue.standard & bit) == 0) {
+            if (information != 0)
+                process_queue.standard_information[linux_signal - 1] =
+                    *information;
+            else memset(&process_queue.standard_information[linux_signal - 1],
+                0, sizeof(siginfo_t));
+            process_queue.standard |= bit;
+            process_queue.standard_routed &= ~bit;
+        }
+        /* Coalesced onto a pending instance: a routed arrival keeps it
+           for normal delivery. */
+        if (routed) process_queue.standard_routed |= bit;
+    } else {
+        int index = linux_signal - LINUX_FIRST_REALTIME_SIGNAL;
+        int tail = process_queue.realtime_tail[index];
+        if (tail - process_queue.realtime_head[index] >=
+                REALTIME_QUEUE_LENGTH) queued = 0;
+        else {
+            int slot = tail % REALTIME_QUEUE_LENGTH;
+            if (information != 0)
+                process_queue.realtime_information[index][slot] = *information;
+            else memset(&process_queue.realtime_information[index][slot], 0,
+                sizeof(siginfo_t));
+            process_queue.realtime_routed[index][slot] = (unsigned char)routed;
+            process_queue.realtime_tail[index] = tail + 1;
+        }
+    }
+    process_summarize();
+    process_unlock();
+    return queued;
+}
+
+void guest_process_signal_queue(int linux_signal, const siginfo_t *information)
+{
+    (void)process_enqueue(linux_signal, information, 0);
+}
+
+/* Lowest standard signal, else the first real-time one, in mask; routed
+   entries only when include_routed.  *freed is set when a full ring got
+   room (the collector must re-arm to take that signal again). */
+static int process_take(const uint32_t mask[2], int include_routed,
+    siginfo_t *information, int *freed)
+{
+    uint32_t candidates;
+    int signal_number = 0, index;
+    const volatile uint32_t *summary = include_routed ? process_queue.any :
+        process_queue.visible;
+    *freed = 0;
+    if (information != 0) memset(information, 0, sizeof(*information));
+    if ((summary[0] & mask[0]) == 0 && (summary[1] & mask[1]) == 0) return 0;
+    process_lock();
+    candidates = process_queue.standard & mask[0] & 0x7fffffffu;
+    if (!include_routed) candidates &= ~process_queue.standard_routed;
+    if (candidates != 0) {
+        signal_number = __builtin_ctz(candidates) + 1;
+        if (information != 0)
+            *information =
+                process_queue.standard_information[signal_number - 1];
+        process_queue.standard &= ~(1u << (signal_number - 1));
+        process_queue.standard_routed &= ~(1u << (signal_number - 1));
+    } else {
+        for (index = 0; index < REALTIME_SIGNALS; ++index) {
+            int head = process_queue.realtime_head[index];
+            int count = process_queue.realtime_tail[index] - head;
+            int slot = head % REALTIME_QUEUE_LENGTH;
+            if (count == 0 || !mask_has(mask,
+                    LINUX_FIRST_REALTIME_SIGNAL + index)) continue;
+            if (!include_routed && process_queue.realtime_routed[index][slot])
+                continue;
+            signal_number = LINUX_FIRST_REALTIME_SIGNAL + index;
+            if (information != 0)
+                *information = process_queue.realtime_information[index][slot];
+            process_queue.realtime_head[index] = head + 1;
+            if (count >= REALTIME_QUEUE_LENGTH) *freed = 1;
+            break;
+        }
+    }
+    if (signal_number != 0) process_summarize();
+    process_unlock();
+    return signal_number;
+}
+
+int guest_process_take_pending(const uint32_t mask[2], siginfo_t *information)
+{
+    int freed;
+    int signal_number = process_take(mask, 1, information, &freed);
+    if (freed) linux_signalfd_collector_update();
+    return signal_number;
+}
+
+int guest_process_take_visible(const uint32_t mask[2], siginfo_t *information,
+    int *freed)
+{
+    return process_take(mask, 0, information, freed);
+}
+
+void guest_process_pending_mask(uint32_t words[2], int include_routed)
+{
+    const volatile uint32_t *summary = include_routed ? process_queue.any :
+        process_queue.visible;
+    words[0] = summary[0];
+    words[1] = summary[1];
+}
+
+void guest_process_full_mask(uint32_t words[2])
+{
+    words[0] = process_queue.full[0];
+    words[1] = process_queue.full[1];
+}
+
+/* The collector took linux_signal, but a guest thread has it unblocked,
+   so normal delivery must get it (the collector never steals such a
+   signal).  With resend_host_signal (the guest's action is the default or
+   ignore) the signal is sent again to that thread and the kernel applies
+   the action; otherwise it is queued routed, with the sender's siginfo,
+   and the thread is poked with poke_host_signal, whose handler delivers
+   it at once (in guest code) or wakes the thread's wait (in a syscall).
+   Lock order: thread_registry_lock, then the process queue's leaf lock.
+   Returns 1, or 0 when every guest thread blocks the signal. */
+int guest_thread_route_signal(int linux_signal, const siginfo_t *information,
+    int resend_host_signal, int poke_host_signal)
+{
+    struct guest_thread_state *state;
+    int routed = 0;
+    if (linux_signal <= 0 || linux_signal > 64) return 0;
+    pthread_mutex_lock(&thread_registry_lock);
+    for (state = thread_registry; state != 0; state = state->next) {
+        if (mask_has(state->signal_mask, linux_signal)) continue;
+        if (resend_host_signal != 0)
+            (void)pthread_kill(state->host_thread, resend_host_signal);
+        else {
+            (void)process_enqueue(linux_signal, information, 1);
+            (void)pthread_kill(state->host_thread, poke_host_signal);
+        }
+        routed = 1;
+        break;
+    }
+    pthread_mutex_unlock(&thread_registry_lock);
+    return routed;
 }
 
 void guest_thread_signal_mask_get(uint32_t words[2])
@@ -539,7 +832,20 @@ void guest_thread_signal_wait_arm(void)
     struct guest_thread_state *state = current_thread();
     unsigned char byte = 1;
     int signal_number;
+    uint32_t process[2], handled[2];
     if (state == 0 || state->signal_wait_write_fd < 0) return;
+    /* A signal in the process queue this thread would take now: one the
+       collector routed to it, or one its (temporary) mask now lets in.
+       Default and ignored actions are left to delivery (Task 5). */
+    guest_process_pending_mask(process, 1);
+    if ((process[0] | process[1]) != 0) {
+        guest_signal_handled_mask(handled);
+        if ((process[0] & handled[0] & ~state->signal_mask[0]) != 0 ||
+                (process[1] & handled[1] & ~state->signal_mask[1]) != 0) {
+            write(state->signal_wait_write_fd, &byte, sizeof(byte));
+            return;
+        }
+    }
     if ((state->pending_signals[0] & ~state->signal_mask[0]) != 0) {
         write(state->signal_wait_write_fd, &byte, sizeof(byte));
         return;

@@ -974,3 +974,45 @@ realtime_change_detect=procmgr_event_tod_unverified (registration ok, only a man
   pulse are verified; delivery on a real clock change is not. A grep of
   `time.h`, `sys/neutrino.h` and `sys/procmgr.h` in the SDK for clock-change
   and time-change names found no other notification mechanism.
+
+## 2026-11-19 — Phase 3 part 2: signal masks in handlers and real-time queueing (signalfd task)
+
+Passport (QNX 8.0.0), ordinary user. Native probes written while building
+signalfd (Task 4); not committed (one-off `pthread_sigmask`/`sigqueue`
+programs).
+
+- **A mask change inside a signal handler does not survive the handler's
+  return.** Neither `pthread_sigmask` in the handler nor editing the
+  handler's `ucontext_t` `uc_sigmask` (which QNX leaves zeroed) changes the
+  mask after return: 0 of 4 combinations kept SIGUSR1 blocked.
+  `SignalReturn` restores the mask saved in the frame QNX builds for the
+  handler, `struct _sighandler_info` (`sys/neutrino.h`): the saved
+  `sigset_t` is the start of `data[]`, right after `siginfo_t`, `handler`
+  and `context` (offset 48). Writing there does persist (USR1 blocked
+  after return = 1).
+- **Consequence for Linuxemu:** syscalls run inside the SIGILL trap handler,
+  so a guest `sigprocmask` never reached the host thread. A guest that
+  blocked a signal and then received it either had the host handler queue
+  it (guest handler installed) or was killed by the default action:
+  `block SIGUSR1; kill(getpid(), SIGUSR1)` ended the process with SIGUSR1
+  on the pre-Task-4 core (exit 144, with and without a second thread). The
+  signalfd design assumed the host mask followed the guest's.
+- **Fix (Task 4):** after `rt_sigprocmask` and `sigreturn` the trap writes
+  the guest's mask into its own frame's saved mask
+  (`guest_signal_apply_frame_mask`). A start-up self-check
+  (`guest_signal_frame_probe`: a handler on SIGEMT must find a known mask
+  at that offset, and the mask must be back after return) enables it; if
+  the layout ever differs the old behaviour stays. The same probe program
+  shows the saved mask also carries QNX's always-masked top eight signals.
+- **Real-time signals queue only with `SA_SIGINFO`.** With SIGRTMIN+3
+  blocked and three `sigqueue`s, a zero-timeout `sigtimedwait` loop took 1
+  with `SIG_DFL` and flags 0, 3 with `SIG_DFL` + `SA_SIGINFO`, 0 with
+  `SIG_IGN` + `SA_SIGINFO`. Linux always queues them, so Linuxemu now gives
+  real-time signals at the default action `SA_SIGINFO` (at start-up, in
+  `rt_sigaction` and for the diagnostics handlers).
+- **`sigwaitinfo` with `SIG_DFL`:** a thread blocking all signals in
+  `sigwaitinfo({SIGUSR1, SIGRTMAX+8})` receives a process-directed SIGUSR1
+  whose action is the default (the Task 1 probe had a handler installed),
+  and `pthread_kill(thread, SIGRTMAX + 8)` (one of the top eight,
+  always masked) wakes it with 64. signalfd's collector uses that signal
+  to re-arm.

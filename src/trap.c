@@ -55,12 +55,18 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
         original == THUMB_LINUX_SVC_0 : original == ARM_LINUX_SVC_0);
 
     if (sig == SIGILL && pc == (uintptr_t)linuxemu_signal_return_trampoline) {
-        if (guest_signal_return(context, 0) == 0) return;
+        if (guest_signal_return(context, 0) == 0) {
+            guest_signal_apply_frame_mask(info);
+            return;
+        }
         fatal_signal(sig, info, pc);
     }
     if (sig == SIGILL &&
         pc == (uintptr_t)linuxemu_rt_signal_return_trampoline) {
-        if (guest_signal_return(context, 1) == 0) return;
+        if (guest_signal_return(context, 1) == 0) {
+            guest_signal_apply_frame_mask(info);
+            return;
+        }
         fatal_signal(sig, info, pc);
     }
 
@@ -111,16 +117,26 @@ static void trap_handler(int sig, siginfo_t *info, void *argument)
         uint32_t syscall_number = context->uc_mcontext.cpu.gpr[7];
         uint32_t original_r0 = context->uc_mcontext.cpu.gpr[0];
         if (context->uc_mcontext.cpu.gpr[7] == 119u) {
-            if (guest_signal_return(context, 0) == 0) return;
+            if (guest_signal_return(context, 0) == 0) {
+                guest_signal_apply_frame_mask(info);
+                return;
+            }
             fatal_signal(sig, info, pc);
         }
         if (context->uc_mcontext.cpu.gpr[7] == 173u) {
-            if (guest_signal_return(context, 1) == 0) return;
+            if (guest_signal_return(context, 1) == 0) {
+                guest_signal_apply_frame_mask(info);
+                return;
+            }
             fatal_signal(sig, info, pc);
         }
         guest_thread_syscall_enter();
         linux_syscall_dispatch(context);
         guest_thread_syscall_leave();
+        /* rt_sigprocmask: the guest's mask must outlive this handler
+           (QNX restores the mask saved in the handler's frame). */
+        if (syscall_number == 175u)
+            guest_signal_apply_frame_mask(info);
         context->uc_mcontext.cpu.gpr[15] = (uint32_t)(pc + width);
         guest_signal_deliver_pending(context, syscall_number, original_r0,
             width);

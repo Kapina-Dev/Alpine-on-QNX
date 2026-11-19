@@ -77,6 +77,8 @@ int main(int argc, char **argv)
         perror("linuxemu initialization");
         return 1;
     }
+    guest_signal_frame_probe();
+    guest_signal_queue_defaults();
     if (guest_fd_initialize() != 0) {
         perror("linuxemu fd table");
         return 1;
