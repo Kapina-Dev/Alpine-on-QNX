@@ -18,6 +18,11 @@
  *   16 select with the eventfd in the write set reports it writable
  *   17 a forked child blocks in read and is SIGKILLed while blocked; the
  *      parent's write and read still work afterwards
+ *   18 200 threads block in reads of one EFD_SEMAPHORE eventfd at once;
+ *      none fails (EMFILE included: a two-fd signal-wait pipe per blocked
+ *      thread ran the emulator's 256 hidden fds out at 127 threads); one
+ *      write of 200 then completes every read with 1
+ *      (EVENTFD_BLOCKING_THREADS=N changes the count)
  *
  * Not checked: a counter above 0 with an empty readiness channel (left by
  * a process killed inside the few instructions between draining the
@@ -31,6 +36,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/select.h>
@@ -328,6 +334,53 @@ static int check_fork_kill(void)
     return 0;
 }
 
+#define MANY_READERS 200
+
+static int check_many_readers(void)
+{
+    static struct blocked_io io[1024];
+    static pthread_t threads[1024];
+    pthread_attr_t attributes;
+    const char *text = getenv("EVENTFD_BLOCKING_THREADS");
+    int count = text != 0 ? atoi(text) : MANY_READERS, started = 0, i;
+    int e = eventfd(0, EFD_SEMAPHORE), result = 0;
+    if (count <= 0 || count > 1024) count = MANY_READERS;
+    if (e < 0) return fail(10, "eventfd(0, EFD_SEMAPHORE)");
+    if (pthread_attr_init(&attributes) != 0 ||
+            pthread_attr_setstacksize(&attributes, 64 * 1024) != 0)
+        return fail(10, "pthread_attr");
+    memset(io, 0, sizeof(io));
+    for (i = 0; i != count; ++i) {
+        io[i].fd = e;
+        if (pthread_create(&threads[i], &attributes, blocking_reader,
+                &io[i]) != 0) {
+            result = fail(10, "pthread_create");
+            break;
+        }
+        ++started;
+    }
+    pthread_attr_destroy(&attributes);
+    /* Every reader is in its read by now (or failed out of it). */
+    for (i = 0; i != 20; ++i) sleep_ms(50);
+    for (i = 0; i != started && result == 0; ++i)
+        if (io[i].done) {
+            errno = io[i].error;
+            fprintf(stderr, "eventfd-blocking reader %d of %d returned "
+                "%ld\n", i, started, (long)io[i].result);
+            result = fail(18, "a read on an empty blocking eventfd returned");
+        }
+    if (!write_value(e, (uint64_t)count) && result == 0)
+        result = fail(18, "write of the reader count");
+    for (i = 0; i != started; ++i) pthread_join(threads[i], 0);
+    for (i = 0; i != started && result == 0; ++i)
+        if (io[i].result != 8 || io[i].value != 1) {
+            errno = io[i].error;
+            result = fail(18, "a blocked read did not return 1");
+        }
+    close(e);
+    return result;
+}
+
 int main(void)
 {
     int result;
@@ -345,5 +398,7 @@ int main(void)
     if ((result = check_select()) != 0) return result;
     arm(17);
     if ((result = check_fork_kill()) != 0) return result;
+    arm(18);
+    if ((result = check_many_readers()) != 0) return result;
     return 0;
 }

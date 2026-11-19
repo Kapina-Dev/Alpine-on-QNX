@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define LINUX_CLONE_VM 0x00000100u
@@ -56,8 +58,14 @@ struct guest_thread_state {
     int suspend_restore_valid;
     sem_t *futex_semaphore;
     volatile sig_atomic_t futex_interrupted;
+    /* The thread's signal-wait channel (guest_thread_signal_wait_begin):
+       made on first use and kept until the thread ends.  One fd when it
+       is a self-connected loopback datagram socket (read == write), two
+       for the pipe fallback.  Posters are this thread's own signal
+       handlers; they write only while signal_wait_active. */
     volatile sig_atomic_t signal_wait_write_fd;
     int signal_wait_read_fd;
+    volatile sig_atomic_t signal_wait_active;
     volatile sig_atomic_t syscall_active;
     uint32_t altstack_pointer;
     uint32_t altstack_size;
@@ -115,6 +123,21 @@ static struct guest_thread_state *current_thread(void)
     return pthread_getspecific(thread_state_key);
 }
 
+/* Closes the thread's signal-wait channel.  The numbers are withdrawn
+   before the close: a handler on this thread that runs from then on sees
+   -1 and never writes to a number the close has freed for reuse. */
+static void signal_wait_close(struct guest_thread_state *state)
+{
+    int read_fd = state->signal_wait_read_fd;
+    int write_fd = state->signal_wait_write_fd;
+    state->signal_wait_active = 0;
+    state->signal_wait_write_fd = -1;
+    __sync_synchronize();
+    state->signal_wait_read_fd = -1;
+    if (read_fd >= 0) close(read_fd);
+    if (write_fd >= 0 && write_fd != read_fd) close(write_fd);
+}
+
 static void finish_guest_thread(struct guest_thread_state *state)
 {
     struct guest_thread_state **cursor;
@@ -148,8 +171,7 @@ static void finish_guest_thread(struct guest_thread_state *state)
         __sync_lock_test_and_set(clear_child_tid, 0);
         linux_futex_wake(clear_child_tid, INT_MAX, 0xffffffffu);
     }
-    if (state->signal_wait_read_fd >= 0) close(state->signal_wait_read_fd);
-    if (state->signal_wait_write_fd >= 0) close(state->signal_wait_write_fd);
+    signal_wait_close(state);
     pthread_setspecific(thread_state_key, 0);
     free(state);
 }
@@ -306,14 +328,10 @@ void guest_thread_after_fork(void)
         memcpy(signal_mask, state->signal_mask, sizeof(signal_mask));
         memcpy(name, state->name, sizeof(name));
     }
-    for (cursor = thread_registry; cursor != 0; cursor = cursor->next) {
-        if (cursor->signal_wait_read_fd >= 0)
-            close(cursor->signal_wait_read_fd);
-        if (cursor->signal_wait_write_fd >= 0)
-            close(cursor->signal_wait_write_fd);
-        cursor->signal_wait_read_fd = -1;
-        cursor->signal_wait_write_fd = -1;
-    }
+    /* The channels are the parent's threads' (the child's copies of the
+       same pipe or socket): the child makes its own on first use. */
+    for (cursor = thread_registry; cursor != 0; cursor = cursor->next)
+        signal_wait_close(cursor);
     if (state != 0 && state != &main_thread) free(state);
     memset(&main_thread, 0, sizeof(main_thread));
     main_thread.signal_wait_read_fd = -1;
@@ -372,7 +390,7 @@ void guest_thread_signal_pending(int linux_signal, const siginfo_t *information)
             state->futex_interrupted = 1;
             sem_post(state->futex_semaphore);
         }
-        if (state->signal_wait_write_fd >= 0)
+        if (state->signal_wait_active && state->signal_wait_write_fd >= 0)
             write(state->signal_wait_write_fd, &byte, sizeof(byte));
     }
 }
@@ -460,17 +478,50 @@ void guest_thread_signal_delivery_mask(uint32_t words[2])
     } else guest_thread_signal_mask_get(words);
 }
 
-int guest_thread_signal_wait_begin(void)
+static int set_nonblocking(int fd)
 {
-    struct guest_thread_state *state = current_thread();
-    int descriptors[2];
-    int flags;
-    int i;
-    if (state == 0) { errno = EINVAL; return -1; }
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0 ? -1 : 0;
+}
+
+/* One fd: a datagram socket bound to loopback and connected to itself, so
+   a write to it makes it readable.  Emulator-owned, so it moves to the
+   hidden range (close-on-exec). */
+static int make_socket_channel(void)
+{
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0), hidden;
+    if (fd < 0) return -1;
+    hidden = guest_fd_hide(fd);
+    if (hidden < 0) {
+        int saved_errno = errno == EINVAL ? EMFILE : errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    fd = hidden;
+    memset(&address, 0, sizeof(address));
+    address.sin_len = sizeof(address);
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            getsockname(fd, (struct sockaddr *)&address, &length) != 0 ||
+            connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+            set_nonblocking(fd) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+/* The fallback, two fds: a nonblocking pipe, both ends hidden. */
+static int make_pipe_channel(int *read_fd, int *write_fd)
+{
+    int descriptors[2], i;
     if (pipe(descriptors) != 0) return -1;
-    /* Emulator-owned: both ends move to the hidden range (close-on-exec),
-       so the guest's fd numbering never sees them.  No hidden number
-       free means the process is out of fds. */
     for (i = 0; i != 2; ++i) {
         int hidden = guest_fd_hide(descriptors[i]);
         if (hidden < 0) {
@@ -481,18 +532,43 @@ int guest_thread_signal_wait_begin(void)
         }
         descriptors[i] = hidden;
     }
-    flags = fcntl(descriptors[0], F_GETFL, 0);
-    if (flags < 0 || fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) != 0) {
-        close(descriptors[0]); close(descriptors[1]); return -1;
+    if (set_nonblocking(descriptors[0]) != 0 ||
+            set_nonblocking(descriptors[1]) != 0) {
+        int saved_errno = errno;
+        close(descriptors[0]); close(descriptors[1]);
+        errno = saved_errno;
+        return -1;
     }
-    flags = fcntl(descriptors[1], F_GETFL, 0);
-    if (flags < 0 || fcntl(descriptors[1], F_SETFL, flags | O_NONBLOCK) != 0) {
-        close(descriptors[0]); close(descriptors[1]); return -1;
+    *read_fd = descriptors[0];
+    *write_fd = descriptors[1];
+    return 0;
+}
+
+/* The thread's signal-wait channel is made once and kept: a fresh pipe per
+   wait cost two hidden fds for every blocked thread (the hidden reserve
+   ran out near 127 of them, and the read failed EMFILE).  A byte left by
+   an earlier wait (a signal posted after its poll returned) is drained
+   here; a signal already pending is re-posted by
+   guest_thread_signal_wait_arm, which every caller runs next. */
+int guest_thread_signal_wait_begin(void)
+{
+    struct guest_thread_state *state = current_thread();
+    char sink[64];
+    if (state == 0) { errno = EINVAL; return -1; }
+    if (state->signal_wait_read_fd < 0) {
+        int read_fd = make_socket_channel(), write_fd = read_fd;
+        if (read_fd < 0) {
+            if (errno == EMFILE) return -1;
+            if (make_pipe_channel(&read_fd, &write_fd) != 0) return -1;
+        }
+        state->signal_wait_read_fd = read_fd;
+        __sync_synchronize();
+        state->signal_wait_write_fd = write_fd;
     }
-    state->signal_wait_read_fd = descriptors[0];
+    state->signal_wait_active = 1;
     __sync_synchronize();
-    state->signal_wait_write_fd = descriptors[1];
-    return descriptors[0];
+    while (read(state->signal_wait_read_fd, sink, sizeof(sink)) > 0) {}
+    return state->signal_wait_read_fd;
 }
 
 void guest_thread_signal_wait_arm(void)
@@ -529,18 +605,11 @@ void guest_thread_signal_wait_complete(const uint32_t old_words[2])
     guest_thread_signal_mask_set(old_words);
 }
 
+/* The channel stays open for the thread's next wait; posting stops. */
 void guest_thread_signal_wait_end(void)
 {
     struct guest_thread_state *state = current_thread();
-    int read_fd, write_fd;
-    if (state == 0) return;
-    write_fd = state->signal_wait_write_fd;
-    state->signal_wait_write_fd = -1;
-    __sync_synchronize();
-    read_fd = state->signal_wait_read_fd;
-    state->signal_wait_read_fd = -1;
-    if (read_fd >= 0) close(read_fd);
-    if (write_fd >= 0) close(write_fd);
+    if (state != 0) state->signal_wait_active = 0;
 }
 
 void guest_thread_syscall_enter(void)
