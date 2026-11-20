@@ -1049,3 +1049,101 @@ programs).
   snapshot of pending signals and before the host `execve` is not in the
   carry, and the QNX kernel drops it at `execve`, so it is lost. Nothing
   guards that window.
+
+## 2026-11-20 — QNX native inotify (Phase 3 part 3 probes)
+
+Passport (QNX 8.0.0), ordinary user (uid 101431000). Probes:
+`native-probes/phase3c-probes.c` (run twice: plain, and with `more`) and
+`native-probes/phase3c-facts.c`, built warning-free by
+`scripts/build-native-probes.sh` (`-Wall -Wextra -O2`; `phase3c-facts` links
+`-lsocket`). The fixture directories were under the dev tree's `build/` (qnx6).
+All three runs ended `probe_done=1` with no `probe_guard`. Every value below
+is **measured** in this run unless marked otherwise; they agree with the
+earlier design run.
+
+Key evidence lines:
+
+```
+native_inotify_symbols=init:yes add:yes rm:yes
+fsnotify_open=rdonly:3/0 rdwr:-1/13
+fsevents_open=rdonly:3/0 rdwr:-1/13
+ionotify_dir=ret:0xffffffff errno:22
+rename_cookie_qnx6=paired from=8799 to=8799
+subdir_qnx6=none
+nonblock_read=setfl:0 ret:0 errno:0
+poll_ready=ret:1 revents:0x1 latency_us:259339
+small_read=ret:-1 errno:22
+readd_same_wd=yes first:1 second:1
+oneshot=wd1 [wd1 CREATE c0 l16 'o1'] [wd1 IGNORED c0 l0 '']
+overflow=events:2069 q_overflow:yes
+scan_cost_us=4178000 entries:1003
+delivery_latency_us=n:40 min:7000 median:253000 p90:255000 max:255000
+blocking_read_empty=ret:-1 errno:4 waited_ms:2001
+blocking_read_wake=ret:32 waited_ms:581
+fork_shared_queue=child_read:32 parent_after:none
+# add_watch(/dev/shmem)=-1 errno=25   (/tmp, /pps, /proc likewise; qnx6, /base/bin, sdcard, / succeed)
+err_enoent=ret:-1 errno:2
+err_zero_mask=ret:1 errno:0
+err_bad_wd=ret:-1 errno:22
+onlydir_on_file=ret:-1 errno:20
+fionread=ret:0 errno:0 value:32
+dont_follow=ret:2 errno:0 [wd1 IGNORED c0 l0 '']
+max_instances=300+ errno=0
+max_watches=2000+ errno=0
+identity=a:1/871157257 mode:0220664 rdev:1 b:1/871157257 dev_fsnotify:1/871157257 rdev:1 same_ab:yes same_dev:yes
+# /dev/null identity=1/2 same_as_inotify:no
+exec_survives=events
+# rights sendmsg=1 errno=3
+# rights child recvmsg=-1 errno=13 flags=0x0 controllen=16
+rights_delivers=no_events
+# fionread_full=65536
+overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
+# overflow total_records=2049 overflow_records=1
+```
+
+- **Access and records.** libc exports `inotify_init`, `inotify_add_watch`
+  and `inotify_rm_watch`; there is no `inotify_init1`. `/dev/fsnotify` and
+  `/dev/fsevents` open read-only for us, `O_RDWR` gives `EACCES` (13).
+  `struct inotify_event` is Linux's: 16-byte header, same mask bits, names
+  NUL-padded to a multiple of 16 (`len` 16 for short names). Watch
+  descriptors count from 1 per instance; re-adding a path returns the same
+  wd. On qnx6 the events match Linux: `CREATE`, `OPEN`, `ACCESS`, `MODIFY`,
+  `ATTRIB`, `CLOSE_WRITE`, `CLOSE_NOWRITE`, `DELETE`, `ISDIR`,
+  `MOVED_FROM`/`MOVED_TO` with a shared cookie, `DELETE_SELF` then
+  `IGNORED`, `IGNORED` after `inotify_rm_watch`. Subdirectory changes are
+  not reported to the parent watch; changes by a forked child are.
+  `IN_ONESHOT`, `IN_MASK_ADD`, `IN_ONLYDIR` and `IN_DONT_FOLLOW` work
+  natively; the queue overflows (`IN_Q_OVERFLOW`) at 2,048 events. Blocking
+  read with nothing queued is ended by a signal (`EINTR`) and woken by an
+  event; a too-small buffer gives `EINVAL`; `FIONREAD` reports queued bytes;
+  a forked child shares the queue. Limits reached: 300 instances, 2,000
+  watches (no failure up to those counts).
+- **Five differences from Linux.** (1) A nonblocking read of an empty queue
+  returns 0, not `EAGAIN`. (2) A zero mask is accepted (wd returned), Linux
+  gives `EINVAL`. (3) Watches on `/dev/shmem`, `/pps` and `/proc` fail with
+  `ENOTTY` (25); the probe's `/tmp` on the device also failed that way
+  (it is not the guest's `/tmp`, which is the rootfs's qnx6 `tmp`). (4)
+  Delivery is batched: median 253 ms, p90/max 255 ms over 40 trials, with a
+  few at 7-39 ms when a batch boundary was near. (5) Background system
+  processes open files and directories after changes, so `OPEN`/
+  `CLOSE_NOWRITE`/`ACCESS` watches see extra, genuine events (the `initial`
+  and `unlink` lines above show such records).
+- **Identity, exec, dup, `SCM_RIGHTS`.** `fstat` of two inotify fds returns
+  the same `st_dev`/`st_ino` as `stat("/dev/fsnotify")` (1/871157257, mode
+  `020664`); `/dev/null` differs, so an inotify fd is recognised by that
+  comparison but two instances cannot be told apart. The native fd survives
+  `execve` and keeps delivering events. `SCM_RIGHTS` fails natively:
+  `sendmsg` returns 1 but the receiver's `recvmsg` fails with `EACCES` (13)
+  and the data is lost. `dup`/`F_DUPFD`/`dup2` working natively was reported
+  by the design run; these probes do not exercise them (not re-measured
+  here; the fork result above shows the open-file description is shared).
+- **Overflow record.** `wd` -1, mask `IN_Q_OVERFLOW` (0x4000), cookie 0, len
+  0, as Linux. It is queued **first** (position 1 of 2,049 records), ahead
+  of the 2,048 queued events; Linux appends it at the end. `FIONREAD` on a
+  full queue reported 65,536.
+- **Cost of scanning.** `readdir` + `lstat` over a 1,003-entry directory
+  took 4,178,000 us (4.2 s), and directory `st_mtime` has whole-second
+  resolution (1795182207 -> 1795182208), so a stat-scanning fallback is not
+  viable.
+- **`ionotify` returning `EINVAL`.** `ionotify()` on a directory fd returns
+  -1 with `EINVAL` (22): there is no other native change-notification path.
