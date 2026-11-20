@@ -289,13 +289,27 @@ static void release_sent_rights(struct sent_rights *rights)
     rights->held_count = 0;
 }
 
+/* An inotify fd (typed, or native with /dev/fsnotify's identity). */
+static int is_inotify_fd(int fd)
+{
+    struct guest_fd_object *object = guest_fd_acquire(fd);
+    int found = object != 0 &&
+        guest_fd_object_type(object) == GUEST_FD_INOTIFY;
+    guest_fd_put(object);
+    return found || linux_inotify_is_native(fd);
+}
+
 /* Converts the guest's SCM_RIGHTS control data.  *allocation is what the
    caller frees; host->msg_control and msg_controllen are set.  When a sent
    fd has companions (guest_fd_rights_extra), all the guest's fds go into
    one message followed by the companions and the descriptor map, built in
-   room after the plain conversion inside the same allocation. */
+   room after the plain conversion inside the same allocation.  An inotify
+   fd fails the call (number and arguments are the guest's sendmsg or
+   sendmmsg, for the diagnostic) before anything is sent: QNX cannot pass
+   one, and its receiver would fail EACCES and lose the message. */
 static int send_control(const void *guest_control, uint32_t guest_length,
-    void **allocation, struct msghdr *host, struct sent_rights *rights)
+    void **allocation, struct msghdr *host, struct sent_rights *rights,
+    uint32_t number, const uint32_t *arguments)
 {
     const unsigned char *guest = guest_control;
     size_t guest_offset = 0;
@@ -304,11 +318,11 @@ static int send_control(const void *guest_control, uint32_t guest_length,
     unsigned char *converted;
     size_t host_offset = 0;
     struct cmsghdr *merged;
-    int *merged_fds, extra_count;
+    int *merged_fds, extra_count, has_inotify = 0;
     while (guest_offset != guest_length) {
         struct linux_cmsghdr header;
         size_t payload_length;
-        size_t space;
+        size_t space, i;
         if (guest_length - guest_offset < sizeof(header))
             return -EINVAL;
         memcpy(&header, guest + guest_offset, sizeof(header));
@@ -321,6 +335,12 @@ static int send_control(const void *guest_control, uint32_t guest_length,
         payload_length = header.length - sizeof(header);
         if (payload_length == 0 || payload_length % sizeof(int) != 0)
             return -EINVAL;
+        for (i = 0; i != payload_length / sizeof(int) && !has_inotify; ++i) {
+            int fd;
+            memcpy(&fd, guest + guest_offset + sizeof(header) +
+                i * sizeof(int), sizeof(fd));
+            has_inotify = is_inotify_fd(fd);
+        }
         space = linux_cmsg_align(header.length);
         if (space > guest_length - guest_offset) {
             if (header.length != guest_length - guest_offset) return -EINVAL;
@@ -331,6 +351,9 @@ static int send_control(const void *guest_control, uint32_t guest_length,
         required += CMSG_SPACE(payload_length);
         guest_offset += space;
     }
+    if (has_inotify)
+        return linux_report_unsupported(number, LINUX_EOPNOTSUPP,
+            "inotify fd in SCM_RIGHTS: QNX cannot pass it", arguments);
     /* At most 253 fds, so none of these sizes can overflow. */
     extra_capacity = descriptor_total * GUEST_FD_COMPANIONS_MAX + 1;
     merged_space = CMSG_SPACE((descriptor_total + extra_capacity) *
@@ -778,7 +801,7 @@ static int32_t socket_option_call(uint32_t number, uint32_t *arguments)
    recvmsg, sendmmsg and recvmmsg.  On a successful receive *guest holds the
    updated header and the caller stores it back. */
 static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
-    uint32_t linux_flags)
+    uint32_t linux_flags, uint32_t number, const uint32_t *arguments)
 {
     struct linux_msghdr guest = *header;
     struct msghdr host;
@@ -804,7 +827,7 @@ static int32_t message_one(int fd, int receiving, struct linux_msghdr *header,
     if (!receiving && guest.control_length != 0) {
         if (guest.control == 0) return -EFAULT;
         converted = send_control((void *)guest.control, guest.control_length,
-            &control, &host, &rights);
+            &control, &host, &rights, number, arguments);
         if (converted != 0) return converted;
     } else if (receiving && guest.control_length != 0) {
         /* Room for the companions and descriptor map a Linuxemu sender
@@ -885,7 +908,7 @@ static int32_t message_call(uint32_t number, uint32_t *arguments)
     if (guest_fd_is_hidden((int)arguments[0])) return -EBADF;
     memcpy(&guest, (void *)arguments[1], sizeof(guest));
     result = message_one((int)arguments[0], number == LINUX_NR_RECVMSG,
-        &guest, arguments[2]);
+        &guest, arguments[2], number, arguments);
     if (result >= 0 && number == LINUX_NR_RECVMSG)
         memcpy((void *)arguments[1], &guest, sizeof(guest));
     return result;
@@ -944,7 +967,8 @@ static int32_t multi_message_call(int receiving, uint32_t *arguments)
         uint32_t length;
         memcpy(&header, &vector[done].header, sizeof(header));
         result = message_one((int)arguments[0], receiving, &header,
-            receiving ? flags & ~LINUX_MSG_WAITFORONE : flags);
+            receiving ? flags & ~LINUX_MSG_WAITFORONE : flags,
+            receiving ? LINUX_NR_RECVMMSG : LINUX_NR_SENDMMSG, arguments);
         if (result < 0) return done != 0 ? (int32_t)done : result;
         if (receiving) memcpy(&vector[done].header, &header, sizeof(header));
         length = (uint32_t)result;

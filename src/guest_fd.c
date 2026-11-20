@@ -165,11 +165,24 @@ static int adopt_received(int fd)
     return 1;
 }
 
-/* Anything not adopted starts native. */
+static guest_fd_identify_fn identify_function;
+
+void guest_fd_register_identify(guest_fd_identify_fn identify)
+{
+    identify_function = identify;
+}
+
+/* Not adopted: typed by its identity alone, if the hook knows it. */
+static void identify_received(int fd)
+{
+    if (identify_function != 0) (void)identify_function(fd);
+}
+
+/* Anything neither adopted nor identified starts native. */
 void guest_fd_received(int fd)
 {
     guest_fd_clear(fd);
-    (void)adopt_received(fd);
+    if (!adopt_received(fd)) identify_received(fd);
 }
 
 int guest_fd_duplicate(int source, int destination)
@@ -919,9 +932,12 @@ int guest_fd_rights_received(int *fds, int count)
         /* An object this process still holds (sent to itself, or inherited
            across fork) is the same object: adopt it rather than map a
            second copy of its state. */
-        if (!adopt_received(fds[i]) && n != 0 &&
-                receive_functions[type] != 0)
-            (void)receive_functions[type](fds[i], fds + next, (int)n);
+        if (!adopt_received(fds[i])) {
+            if (n != 0 && receive_functions[type] != 0)
+                (void)receive_functions[type](fds[i], fds + next, (int)n);
+            else
+                identify_received(fds[i]);
+        }
         next += (int)n;
     }
     if (map != 0) {

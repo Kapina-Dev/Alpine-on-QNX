@@ -97,8 +97,14 @@ int guest_fd_duplicate(int source, int destination);
 struct guest_fd_object *guest_fd_acquire(int fd);
 /* A number that arrived from outside the table (SCM_RIGHTS): drop any
    stale record, then adopt a live pipe-backed object of this process with
-   the same (st_dev, st_ino); otherwise the number starts native. */
+   the same (st_dev, st_ino); otherwise the identify hook may type it, and
+   else the number starts native. */
 void guest_fd_received(int fd);
+/* The identify hook: given a received number that adopted nothing,
+   attaches an object when the fd's identity alone says what it is (an
+   inotify fd has /dev/fsnotify's).  0 when it attached one, else -1. */
+typedef int (*guest_fd_identify_fn)(int fd);
+void guest_fd_register_identify(guest_fd_identify_fn identify);
 
 /* SCM_RIGHTS between Linuxemu processes.  When at least one sent fd has
    companions, the sender appends, after the guest's fds, every companion

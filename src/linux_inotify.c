@@ -21,7 +21,12 @@
  *     notification (native ENOTTY: /dev/shmem, /proc) are EOPNOTSUPP with
  *     a diagnostic; a bad path pointer is EFAULT;
  *   - read: a nonblocking read of an empty queue returns 0 natively, which
- *     Linux never does: it becomes EAGAIN.
+ *     Linux never does: it becomes EAGAIN;
+ *   - dup, fork and exec: the native fd carries the queue; the object is
+ *     shared by duplicates and fork copies, re-attached after exec, and
+ *     attached to a received number with /dev/fsnotify's identity.
+ *     SCM_RIGHTS refuses inotify fds (linux_socket.c): QNX cannot pass
+ *     one (the receiver fails EACCES and loses the message).
  *
  * Event names are relative to the watched directory, so records pass
  * through untranslated.  Events arrive batched (about 250 ms late).
@@ -86,7 +91,8 @@ static int inotify_poll_fd(struct guest_fd_object *object, int fd)
 }
 
 /* Exec record body: no hidden fd and no path (restore_one reads hidden -1
-   and an empty hex path).  The native fd itself survives exec. */
+   and an empty hex path).  The native fd itself survives exec, and
+   inotify_restore re-attaches the object in the new image. */
 static int inotify_serialize(struct guest_fd_object *object, int fd,
     char *buffer, size_t size)
 {
@@ -265,6 +271,26 @@ int linux_inotify_readv(int fd, const struct iovec *vectors, int count,
     return 1;
 }
 
+/* A number with /dev/fsnotify's identity and no record (a received fd
+   that adopted nothing) is an inotify fd: 0 when it now has its object. */
+static int inotify_identify(int fd)
+{
+    if (!linux_inotify_is_native(fd)) return -1;
+    return linux_inotify_attach(fd);
+}
+
+/* Exec restore: the native fd survived exec with its queue and watches;
+   the record only says it was an inotify fd, which its identity must
+   confirm. */
+static int inotify_restore(int fd, int hidden_fd, int second_hidden_fd,
+    const char *host_path)
+{
+    (void)hidden_fd;
+    (void)second_hidden_fd;
+    (void)host_path;
+    return inotify_identify(fd);
+}
+
 void linux_inotify_register(void)
 {
     struct stat64 status;
@@ -273,4 +299,6 @@ void linux_inotify_register(void)
         fsnotify_inode = status.st_ino;
         fsnotify_known = 1;
     }
+    guest_fd_register_restore(GUEST_FD_INOTIFY, inotify_restore);
+    guest_fd_register_identify(inotify_identify);
 }
