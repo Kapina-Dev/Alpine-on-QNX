@@ -1127,6 +1127,12 @@ overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
   few at 7-39 ms when a batch boundary was near. (5) Background system
   processes open files and directories after changes, so `OPEN`/
   `CLOSE_NOWRITE`/`ACCESS` watches see extra, genuine events.
+- **Device nodes can hang the call.** Measured 2026-11-20 during Task 2 with
+  a scratch probe (5 s `alarm`): native `inotify_add_watch` on `/dev/null`,
+  `/dev/ttyp0` and `/dev` returned `ENOTTY`, `/dev/tty` `ENXIO`, but on
+  `/dev/ttyp1` and `/dev/ttyp5` it blocked (REPLY-blocked on the fsnotify
+  server) until the signal arrived. Linuxemu therefore refuses character
+  and block devices with `EOPNOTSUPP` before the native call.
 - **Identity, exec, dup, `SCM_RIGHTS`.** `fstat` of two inotify fds returns
   the same `st_dev`/`st_ino` as `stat("/dev/fsnotify")` (1/871157257, mode
   `020664`); `/dev/null` differs, so an inotify fd is recognised by that

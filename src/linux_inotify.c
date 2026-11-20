@@ -16,9 +16,10 @@
  *     guest's cwd, through guest symlinks, or to the link itself with
  *     IN_DONT_FOLLOW) to a host path before the native call;
  *   - Linux's errors where QNX differs: a mask without event bits and
- *     IN_MASK_CREATE are EINVAL; a filesystem without change notification
- *     (native ENOTTY: /dev/shmem, /proc, devices) is EOPNOTSUPP with a
- *     diagnostic; a bad path pointer is EFAULT;
+ *     IN_MASK_CREATE are EINVAL; a device node (never passed to QNX,
+ *     where some ptys block the call) and a filesystem without change
+ *     notification (native ENOTTY: /dev/shmem, /proc) are EOPNOTSUPP with
+ *     a diagnostic; a bad path pointer is EFAULT;
  *   - read: a nonblocking read of an empty queue returns 0 natively, which
  *     Linux never does: it becomes EAGAIN.
  *
@@ -187,8 +188,21 @@ static int32_t check_guest_string(const char *path)
     }
 }
 
+/* EOPNOTSUPP with a diagnostic note. */
+static int32_t unsupported(int fd, const char *guest_path, uint32_t mask,
+    const char *detail)
+{
+    uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uintptr_t)guest_path;
+    args[2] = mask;
+    return linux_report_unsupported(LINUX_NR_INOTIFY_ADD_WATCH,
+        (int32_t)linux_errno_number(EOPNOTSUPP), detail, args);
+}
+
 int32_t linux_inotify_add_watch(int fd, const char *guest_path, uint32_t mask)
 {
+    struct stat64 status;
     char host_path[PATH_MAX];
     int32_t checked;
     int wd;
@@ -206,17 +220,20 @@ int32_t linux_inotify_add_watch(int fd, const char *guest_path, uint32_t mask)
             guest_path_resolve(guest_path, 0, host_path,
                 sizeof(host_path))) != 0)
         return linux_error(errno);
+    /* Device nodes never reach the native call: on some ptys
+       (/dev/ttyp1, /dev/ttyp5) it blocks until a signal arrives (FINDINGS
+       2026-11-20), and the others give ENOTTY anyway. */
+    if (((mask & LINUX_IN_DONT_FOLLOW) != 0 ? lstat64(host_path, &status) :
+            stat64(host_path, &status)) != 0)
+        return linux_error(errno);
+    if (S_ISCHR(status.st_mode) || S_ISBLK(status.st_mode))
+        return unsupported(fd, guest_path, mask,
+            "inotify: device nodes cannot be watched on QNX");
     wd = inotify_add_watch(fd, host_path, mask & INOTIFY_PASSED_BITS);
     if (wd >= 0) return wd;
-    if (errno == ENOTTY) {
-        uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
-        args[0] = (uint32_t)fd;
-        args[1] = (uint32_t)(uintptr_t)guest_path;
-        args[2] = mask;
-        return linux_report_unsupported(LINUX_NR_INOTIFY_ADD_WATCH,
-            (int32_t)linux_errno_number(EOPNOTSUPP),
-            "inotify: filesystem has no change notification", args);
-    }
+    if (errno == ENOTTY)
+        return unsupported(fd, guest_path, mask,
+            "inotify: filesystem has no change notification");
     return linux_error(errno);
 }
 

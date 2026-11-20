@@ -43,6 +43,10 @@
  *      gives that record
  *   28 a watch on /dev/null (a native device: QNX says ENOTTY) fails
  *      EOPNOTSUPP; "skip 28" when the guest can't reach it
+ *   29 a watch on a guest /dev/pts/N (the fixture's own terminal, else a
+ *      fresh pty from /dev/ptmx) fails EOPNOTSUPP promptly: device nodes
+ *      never reach QNX's call, which blocks on some ptys; "skip 29" when
+ *      no pty is reachable
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -53,6 +57,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
@@ -633,6 +638,39 @@ static int check_device(void)
     return result;
 }
 
+/* The fixture's own terminal, else a fresh pty (master kept in *master). */
+static const char *pty_path(int *master)
+{
+    static char path[64];
+    const char *name;
+    int fd;
+    *master = -1;
+    for (fd = 0; fd != 3; ++fd) {
+        name = ttyname(fd);
+        if (name != 0 && strncmp(name, "/dev/pts/", 9) == 0) return name;
+    }
+    *master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (*master < 0) return 0;
+    name = ptsname(*master);
+    if (name == 0 || strncmp(name, "/dev/pts/", 9) != 0) return 0;
+    snprintf(path, sizeof(path), "%s", name);
+    return path;
+}
+
+static int check_pty(void)
+{
+    int fd = inotify_init1(IN_NONBLOCK), master, result = 0;
+    const char *path;
+    if (fd < 0) return fail(29, "inotify_init1");
+    path = pty_path(&master);
+    if (path == 0) printf("skip 29: no /dev/pts/N reachable\n");
+    else result = expect_error(29, inotify_add_watch(fd, path, IN_ATTRIB),
+        EOPNOTSUPP, path);
+    if (master >= 0) close(master);
+    close(fd);
+    return result;
+}
+
 static int run(void)
 {
     int result, fd;
@@ -675,7 +713,9 @@ static int run(void)
     arm(27);
     if ((result = check_burst()) != 0) return result;
     arm(28);
-    return check_device();
+    if ((result = check_device()) != 0) return result;
+    arm(29);
+    return check_pty();
 }
 
 int main(void)
