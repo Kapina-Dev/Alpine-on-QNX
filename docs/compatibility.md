@@ -101,6 +101,30 @@ needs `inotify`, and Node.js gets past `epoll_create1` and then crashes at
 start-up (SIGSEGV, address 0). No corpus app hits an unsupported eventfd
 or epoll call.
 
+Phase 3 part 2 adds `timerfd` and `signalfd`, each covered by the
+`run-event-smoke` guest fixtures (the application corpus was not re-run):
+
+- `timerfd_create`, `timerfd_settime` and `timerfd_gettime` (and the time64
+  forms) with Linux semantics: one-shot, periodic and absolute deadlines on
+  `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` and the `*_ALARM`
+  clocks, an expiration count read as 8 bytes, `TFD_NONBLOCK`,
+  `TFD_CLOEXEC`, `TFD_TIMER_ABSTIME`, `TFD_TIMER_CANCEL_ON_SET`,
+  `TFD_IOC_SET_TICKS`, blocking reads (interrupted by signals, restarted
+  with `SA_RESTART`, ended by a close from another thread), readiness in
+  `poll`, `select` and epoll, and the same timer across `dup`, `fork`,
+  `execve` and `SCM_RIGHTS`. `clock_gettime` accepts the `CLOCK_BOOTTIME`
+  family, and the guest `clock_settime` calls exist (they fail `EPERM` for
+  an ordinary user).
+- `signalfd` and `signalfd4`: 128-byte `signalfd_siginfo` records, standard
+  signals coalescing and real-time signals queueing in order, nonblocking
+  and blocking reads, several signalfds, mask changes, readiness in `poll`
+  and epoll, and a signalfd across `fork`, `execve` and `SCM_RIGHTS`. A
+  signal read through a signalfd is not also delivered. A guest
+  `sigprocmask` now reaches the host thread's mask, so a blocked signal no
+  longer kills the process with its default action. `rt_sigsuspend`,
+  `ppoll`, `pselect6` and `epoll_pwait` see signals a signalfd's collector
+  took.
+
 ## Deliberate limits
 
 Limits of the Phase 2 calls:
@@ -238,6 +262,72 @@ Limits of the Phase 3 part 1 calls (eventfd and epoll):
 - `select` and `pselect6` accept descriptor numbers up to 4096 (QNX's own
   `FD_SETSIZE` is 256); Linux bounds them only by `RLIMIT_NOFILE`.
 
+Limits of the Phase 3 part 2 calls (timerfd and signalfd):
+
+- **Clocks.** `CLOCK_BOOTTIME` maps to `CLOCK_MONOTONIC`, and
+  `CLOCK_REALTIME_ALARM` and `CLOCK_BOOTTIME_ALARM` map to the plain
+  realtime and monotonic clocks. Alarm timers therefore fire only while the
+  device is awake and cannot wake it. Whether QNX's monotonic clock runs
+  during device sleep is unmeasured.
+- **Timers and processes.** A timerfd is armed by one process's timer
+  manager. When that process exits, the timer stops firing for every other
+  process that holds the descriptor (a fork child, an exec'd image or an
+  `SCM_RIGHTS` receiver keeps it only while the arming process lives).
+  Expirations are counted
+  from the clock; a sub-millisecond period counts correctly but the wake-up
+  rate is about one per millisecond, and pulses arrive about 2.5 ms late at
+  the median (p99 about 5.6 ms).
+- **`TFD_TIMER_CANCEL_ON_SET`.** Accepted for absolute `CLOCK_REALTIME`
+  timers, where a read fails `ECANCELED` after a clock change; accepted and
+  ignored for relative and non-realtime timers, as on Linux. A change is
+  detected from `PROCMGR_EVENT_TOD` plus a realtime-minus-monotonic offset
+  check. A real clock change could not be produced on the device
+  (`clock_settime` fails `EPERM` for the ordinary user), so this is
+  verified only with a manually triggered event.
+- Relative `CLOCK_REALTIME` timers shift when the clock steps (Linux keeps
+  them on the monotonic base). Counts are capped at 2^48-1 per arming. A
+  `timerfd_settime` in one process racing a read in another can, rarely,
+  let the read add the last few expirations of the old arming.
+- **signalfd and delivery.** A signal is read through a signalfd when it
+  is blocked in every thread, or in the thread that reads. A collector
+  thread takes such signals into a process-wide queue; if a thread has the
+  signal unblocked, the collector hands it to that thread instead, and
+  interrupts threads that have it unblocked, so their blocking calls can
+  return `EINTR` (as on Linux; a behaviour change from before part 2).
+- **Thread-directed signals.** A signal sent to one thread (`tgkill`) that
+  the thread blocks stays in the QNX kernel until that thread reads its
+  signalfd; `read` returns it but `poll` and epoll don't show it first.
+- **Sender details.** The sender pid, code and `sigqueue` value come
+  from the QNX siginfo. QNX reports `si_uid` 0 for a non-zero sender, so
+  `ssi_uid` is the receiver's real uid in that case. Across `execve`
+  pending signals are re-raised once each in the new image: sender details,
+  `sigqueue` values and real-time counts are lost, and a signal collected
+  between the exec snapshot and the host `execve` is lost. Thread-directed
+  signals come back process-directed (QNX `sigpending` can't tell them
+  apart), except signals only in the calling thread's queue, which go to
+  the main thread.
+- **`SCM_RIGHTS`.** A signalfd sent to another Linuxemu process is rebuilt
+  there; the receiver reads its own signals (as on Linux) and the mask is
+  shared with the sender. A mask change through `signalfd(fd, newmask)`
+  reaches other processes at their next read or poll; a process already
+  asleep keeps the old set.
+- **Capacity.** Each signalfd costs 4 hidden descriptors per process, so
+  about 64 signalfds fit in the 256 hidden descriptors, which timerfd,
+  eventfd and epoll share. If a fork child can't build its readiness
+  channel (hidden range full), `poll`, `select` or epoll on that signalfd
+  can sleep until their timeout; this is reported once in
+  `LINUXEMU_DIAGNOSTICS`.
+- **Spurious readiness.** Within one process the readiness byte can stay
+  after a handler or `sigwaitinfo` consumed the signal: `poll` reports
+  `POLLIN` and the read then fails `EAGAIN`.
+- **Still unimplemented.** `rt_sigpending` and `rt_sigtimedwait` return
+  `ENOSYS` (a follow-up; they must include the process queue). The
+  stop-default signals (`SIGTSTP`, `SIGTTIN`, `SIGTTOU` at `SIG_DFL`) end a
+  masked wait (`sigsuspend`, `ppoll`, ...) with a bare `EINTR`; Linux keeps
+  sleeping. The collector's race-path wake-up goes to every thread with the
+  signal unblocked and has no `SA_RESTART`, so a spurious `EINTR` is
+  possible, rarely.
+
 Other limits:
 
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
@@ -246,7 +336,7 @@ Other limits:
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
 - Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary
-  ioctls, `inotify`, `timerfd`, `signalfd`, graphics, kernel modules, and Linux service management are
+  ioctls, `inotify`, graphics, kernel modules, and Linux service management are
   outside the v0.1 surface.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.

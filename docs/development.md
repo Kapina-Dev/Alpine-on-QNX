@@ -111,7 +111,7 @@ thread-directed, and interruption checks:
 sh scripts/run-signal-smoke.sh
 ```
 
-Run the Phase 3 eventfd and epoll guest fixtures:
+Run the Phase 3 eventfd, epoll, timerfd and signalfd guest fixtures:
 
 ```sh
 sh scripts/run-event-smoke.sh
@@ -146,6 +146,27 @@ checks.
   (`EPOLL_NESTING_CHECK=N` runs check N alone).
 - `looper-pattern`: Android's Looper loop (an eventfd wake, pipes and a
   socketpair, timeouts, fds added and removed while waiting).
+- `timerfd-basic`: create and the `EINVAL` cases, one-shot, absolute and
+  periodic timers, `timerfd_gettime`, re-arming, `TFD_IOC_SET_TICKS`,
+  readiness in `poll`, `select` and epoll, a 1 us period without CPU
+  burn, and the time64 calls.
+- `timerfd-share`: blocking reads and signals, `fork` (every expiration
+  counted once), `execve`, close while blocked, `SCM_RIGHTS`,
+  `TFD_TIMER_CANCEL_ON_SET` (the `ECANCELED` half runs only where
+  `clock_settime` is allowed), 50 timers at once, the `CLOCK_BOOTTIME`
+  family, and re-arming against readers in other processes
+  (`--only N`; `--only 13-spin` runs the double-count half of check 13).
+- `signalfd-basic`: create, read, coalescing, real-time queueing,
+  readiness, several signalfds, mask updates, `EINVAL` cases and a signal
+  storm.
+- `signalfd-semantics`: a collected signal is delivered exactly once with
+  its handler, default or ignore action; masked waits (`ppoll`,
+  `pselect6`, `epoll_pwait`, `sigsuspend`); thread-directed signals; close
+  while blocked; a pending signal across `execve`.
+- `signalfd-share`: a signalfd across `fork`, `execve` and `SCM_RIGHTS`,
+  and a shared signalfd's per-process wake-up (`SIGNALFD_SHARE_ONLY=N`
+  runs check N alone). Check 15 polls 601 fds 2000 times and adds about
+  10 s to the event smoke.
 - `wake-eventfd-dup` (assembly, built by `build-native-probes.sh`): the
   libcurl wake eventfd through `dup`, `dup2` and closing the original
   number.
@@ -273,6 +294,8 @@ sh scripts/run-corpus.sh git nginx  # selected apps
 - `linux_poll.c`: poll-event, descriptor-set, timeout, and temporary signal-mask conversion, plus eventfd and epoll readiness in `poll`/`select`.
 - `linux_eventfd.c`: the eventfd object (shared-memory counter and readiness pipe).
 - `linux_epoll.c`: epoll instances, interest lists, waits, nesting, and fork/exec carry.
+- `linux_timerfd.c`: the timerfd object and the per-process timer manager.
+- `linux_signalfd.c`: the signalfd object, the collector thread and the process-wide signal queue.
 - `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
 - `linux_termios.c`: Linux terminal flags, baud rates, control characters, window sizes, and related ioctl conversion.
 - `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
@@ -355,6 +378,9 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current
   process only.
+- timerfd and signalfd limits are listed in
+  [compatibility.md](compatibility.md) ("Limits of the Phase 3 part 2
+  calls").
 - eventfd and epoll limits (fork-copied epoll, registrations keyed by fd
   number, the `EPOLLET` approximation, `EPOLLEXCLUSIVE`, `EPOLLRDHUP`, pipe
   hangups, `SCM_RIGHTS`, capacities) are listed in

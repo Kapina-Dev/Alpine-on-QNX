@@ -39,7 +39,10 @@
  *      1 ms ahead, while 3 forked children spin reading it; everything read
  *      never exceeds what the armings could have produced (+2), and the
  *      last arming's count is right (+-2): an old arming's total must
- *      never be added again under a new arming
+ *      never be added again under a new arming (the race is nanoseconds
+ *      wide: only a build with a delay injected into the count update
+ *      shows the old failure; on the normal core this check is a
+ *      regression guard)
  *
  * "timerfd-share --only N" runs check N alone; "--only 13-spin" runs
  * the nonblocking double-count half of check 13 alone.

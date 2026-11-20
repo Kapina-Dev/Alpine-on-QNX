@@ -325,3 +325,33 @@ limit above.
   io-pkt).
 - The exec record and `SCM_RIGHTS` formats for both objects.
 - Data structures and task order.
+
+## Corrections after implementation (2026-11-20)
+
+The text above is left as written. Three parts of it turned out wrong or
+were settled differently during the build:
+
+- **Signal-model premise.** The design assumed the host thread's signal
+  mask follows the guest's. It did not: a guest `sigprocmask` run inside
+  the SIGILL trap handler never reached the host thread, because QNX
+  restores the mask from the handler's frame on return. Task 4 writes the
+  guest mask into that saved frame, with a start-up self-check. QNX
+  real-time signals also queue only with `SA_SIGINFO`, so real-time
+  signals at the default action now get that flag. See `docs/FINDINGS.md`
+  ("signal masks in handlers and real-time queueing").
+- **exec.** The paragraph "re-raised to the process just before the host
+  `execve`" cannot work: QNX drops pending signals at `execve`. The exec
+  instead carries the pending signals' Linux numbers in
+  `LINUXEMU_GUEST_PENDING`, and the new image raises each again at
+  start-up under the inherited blocked set (one instance each; sender
+  details, `sigqueue` values and real-time counts are lost). Signals the
+  process or thread has pending go back as process-directed, except that
+  signals only in the calling thread's queue are raised at the main
+  thread. A signal collected between the snapshot and the host `execve`
+  is lost. See `docs/FINDINGS.md` ("QNX drops pending signals at
+  execve").
+- **`SCM_RIGHTS`.** The "builder's call" is settled: a signalfd received
+  over `SCM_RIGHTS` is rebuilt in the receiver from its shared page, so
+  the receiver reads its own signals, as on Linux, and the mask is shared
+  with the sender (a mask change through either copy reaches both). Each
+  process gets its own readiness channel for the shared signalfd.

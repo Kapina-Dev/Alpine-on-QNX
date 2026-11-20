@@ -1045,3 +1045,7 @@ programs).
   and the process queue) are raised again with `kill(getpid())`, so the
   new image's signalfd collector can take them; signals only in the
   calling thread's queue are raised at the main thread.
+- **Unguarded window:** a signal the collector takes after the exec's
+  snapshot of pending signals and before the host `execve` is not in the
+  carry, and the QNX kernel drops it at `execve`, so it is lost. Nothing
+  guards that window.

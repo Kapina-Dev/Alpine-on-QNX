@@ -371,7 +371,8 @@ Design and plan:
 `docs/superpowers/specs/2026-11-19-phase3a-eventfd-epoll-design.md` and
 `docs/superpowers/plans/2026-11-19-phase3a-eventfd-epoll.md`. Supported
 calls and limits: `docs/compatibility.md`; device facts: `docs/FINDINGS.md`.
-Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
+Part 2 (timerfd, signalfd) is done pending merge (below); part 3
+(inotify) follows; one release after part 3.
 
 **What landed.**
 
@@ -507,6 +508,66 @@ Parts 2 (timerfd, signalfd) and 3 (inotify) follow; one release after part 3.
   number, the `EPOLLET` approximation, `EPOLLEXCLUSIVE` waking all waiters,
   late `EPOLLRDHUP`, pipe hangups with data left, the near-full eventfd
   writer, epoll fds over `SCM_RIGHTS`, and the capacities.
+
+### Phase 3 part 2 status: done, pending merge (2026-11-20)
+
+timerfd and signalfd, on branch `phase3b-timers-signals` (base `37443ed`).
+Design and plan:
+`docs/superpowers/specs/2026-11-19-phase3b-timerfd-signalfd-design.md`
+(with a "Corrections after implementation" note) and the matching plan
+under `docs/superpowers/plans/`. Supported calls and limits:
+`docs/compatibility.md` ("Limits of the Phase 3 part 2 calls"); device
+facts: `docs/FINDINGS.md`. Part 3 (inotify) is next; one release after
+part 3.
+
+**What landed.**
+
+- timerfd: a per-process timer manager with one QNX timer per armed
+  timerfd delivering pulses, expirations computed from the clock,
+  `CLOCK_BOOTTIME` and the `*_ALARM` clocks mapped to the plain clocks,
+  `TFD_TIMER_CANCEL_ON_SET`, and sharing across `fork`, `execve` and
+  `SCM_RIGHTS`.
+- signalfd: a collector thread feeding a process-wide queue, delivery that
+  stays exact (a signal is consumed once, by a handler or by the signalfd),
+  masked waits that see the queue, and `fork`, `execve` and `SCM_RIGHTS`
+  carry with a readiness channel per process.
+- Signal fixes found on the way: a guest `sigprocmask` now reaches the host
+  mask (written into QNX's handler frame, with a start-up self-check),
+  real-time signals at the default action get `SA_SIGINFO`, and pending
+  signals survive `execve` through `LINUXEMU_GUEST_PENDING`.
+- Gate: `run-event-smoke` fixtures `timerfd-basic`, `timerfd-share`,
+  `signalfd-basic`, `signalfd-semantics`, `signalfd-share`; full regression
+  `linuxemu_full_regression_failures=0`.
+
+**Follow-ups (not blocking part 3).**
+
+- `rt_sigpending` and `rt_sigtimedwait` still return `ENOSYS`; whoever
+  adds them must include the process queue.
+- Stop-default signals (`SIGTSTP`, `SIGTTIN`, `SIGTTOU` at `SIG_DFL`) end
+  masked waits with a bare `EINTR`; Linux keeps sleeping or restarts.
+- The collector's race-path wake-up pokes every thread with the signal
+  unblocked and has no `SA_RESTART`: a rare spurious `EINTR`.
+- No masked-wait checks cover collected signals whose action is ignore or
+  a terminating default.
+- A signal collected between the exec snapshot and the host `execve` is
+  lost; sender details, `sigqueue` values and real-time counts are lost
+  across `execve`.
+- A signalfd mask change reaches a sleeping process only at its next read
+  or poll.
+- A signalfd costs 4 hidden descriptors per process (about 64 in the 256
+  reserve, shared with eventfd, timerfd and epoll); a fork child that
+  can't build its readiness channel can sleep in `poll` until the timeout.
+- The readiness byte can outlive a signal consumed by a handler or
+  `sigwaitinfo` (`POLLIN`, then `EAGAIN`).
+- timerfd: a timer stops firing for others when its arming process exits;
+  relative `CLOCK_REALTIME` timers shift on a clock step; a rare old-arming
+  residue when `settime` races a count update in another process.
+- Real `CLOCK_REALTIME` change detection and `monotonic_in_sleep` are
+  unverified on the device (`clock_settime` is `EPERM`; sleep can't be
+  forced unattended).
+- `snprintf` in the `execve` dispatch path (an existing pattern, not
+  signal-safe).
+- The io-pkt crash isolation from part 1 is still open.
 
 ## Phase 4: Thumb and stripped-binary support
 
@@ -943,11 +1004,11 @@ Compatibility measurement
         |
 [complete] Phase 2 contained syscalls (pipe2 / dup3 and more)
         |
-Full eventfd
+[complete] Full eventfd
         |
-epoll
+[complete] epoll
         |
-timerfd / signalfd
+[done, pending merge] timerfd / signalfd
         |
 inotify
         |
