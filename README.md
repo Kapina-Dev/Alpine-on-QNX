@@ -31,9 +31,9 @@ start-up, a basic workload, a concurrent workload, and clean shutdown:
 | SQLite | ✅ works | |
 | Vim | ✅ works | |
 | GCC and make | ✅ works | Compiles and runs programs on the phone |
+| inotify-tools | ✅ works | `inotify` on QNX's native one; events arrive about 250 ms late (limits in [compatibility.md](docs/compatibility.md)) |
 | nginx | ❌ not yet | Needs `epoll` |
 | Redis | ❌ not yet | Needs `epoll` |
-| inotify-tools | ❌ not yet | Needs `inotify` |
 | Node.js | ❌ not yet | Stops at start-up |
 
 tmux 3.7 also works, attached and detached, in Term49 and over SSH. All
@@ -91,7 +91,7 @@ Linux's.
 
 - Only 32-bit ARM Linux (armhf). It's tested with Alpine 3.24 (musl) and
   QNX 8.0.0 / BB10 10.3.
-- Not a Linux kernel. There is no `epoll`, `inotify`, graphics, kernel modules
+- Not a Linux kernel. There is no `epoll`, graphics, kernel modules
   or systemd yet, and calls Linuxemu doesn't support return Linux errors.
 - Default-speed `cmatrix` freezes the Term49 display. Use
   `cmatrix -s -u 10`.

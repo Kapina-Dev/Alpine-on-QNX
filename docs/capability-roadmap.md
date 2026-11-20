@@ -622,12 +622,15 @@ release follows this part.
   `run-python-smoke`: python3 died at start-up with a SIGSEGV (pc
   `0x11210964`, address `0x79616dcc`) before its first check, after every
   earlier suite, including `run-event-smoke`, had passed. Run alone, the
-  Python smoke then failed once in five fresh installs on this core (the
-  part 2 signature, pc `0x60067dc4`, address 0) and passed five of five on
-  the pre-phase core; the same workload run 15 times per core, alternating,
-  on one install passed all 30 times. This is the start-up crash first seen
-  in Phase 2 (also on that pre-phase core), and nothing ties it to
-  inotify: Python's start-up doesn't use inotify, and the only part 3 code
+  Python smoke then failed once in five fresh installs on this core and
+  passed five of five on the pre-phase core; the same workload run 15
+  times per core, alternating, on one install passed 15 of 15 on each.
+  Only that isolated failure had Phase 2's signature (pc `0x60067dc4`,
+  address 0, seen then on that phase's pre-phase core too); the regression
+  failure had a different one (a nonzero fault address). That both are
+  the same crash is an inference from matching conditions (the first
+  python3 run after a fresh install, a SIGSEGV at start-up), not shown, so
+  it isn't established as pre-existing. Nothing ties it to inotify: Python's start-up doesn't use inotify, and the only part 3 code
   on its path is one `stat` of `/dev/fsnotify` at start-up and a type check
   in `readv` on typed fds. The cause is still unknown (watch item, below).
 
@@ -664,8 +667,9 @@ is not met, so Phase 3 is not marked complete:
   message, `sendmsg` returns `EOPNOTSUPP` where Linux gives `EBADF`;
   a partial `sendmmsg` batch is untested.
 - The intermittent python3 start-up SIGSEGV in `run-python-smoke`, seen
-  only on the first run after a fresh install (2 of 7 on this core, 0 of 5
-  on the pre-phase core, 0 of 30 on a kept install). Not yet isolated: capture a
+  only on the first run after a fresh install (2 of 7 fresh installs on
+  this core, 0 of 5 on the pre-phase core; on a kept install 0 of 15 per
+  core). Not yet isolated: capture a
   core or a guest backtrace at the faulting pc next time it fires.
 - From part 1 and 2, still open: the io-pkt crash isolation, nginx's
   `FIOASYNC`/`F_SETOWN`, Node's start-up crash, and part 2's follow-ups.

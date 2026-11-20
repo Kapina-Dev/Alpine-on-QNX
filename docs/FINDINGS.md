@@ -1171,11 +1171,14 @@ Passport (QNX 8.0.0), ordinary user, core `13eac1ec…` (`phase3c-inotify` at
   | --- | --- | --- |
   | `run-python-smoke` alone, fresh install each, 5 times | part 3 | 1 failed (`pc=0x60067dc4 address=0x00000000`), 4 passed |
   | `run-python-smoke` alone, fresh install each, 5 times | pre-phase (`9a0f5844…`) | 5 passed |
-  | the smoke's Python workload on one install, alternating cores, 15 rounds | both | 30 of 30 passed |
+  | the smoke's Python workload on one install, alternating cores, 15 rounds | each | 15 of 15 passed per core |
   | second full regression | part 3 | passed (`linuxemu_full_regression_failures=0`) |
 
-  The `0x60067dc4`/address 0 signature is the one Phase 2 recorded on
-  2026-11-18, which also failed on that phase's pre-phase core. Every
+  The isolated failure's `0x60067dc4`/address 0 signature is the one
+  Phase 2 recorded on 2026-11-18, which also failed on that phase's
+  pre-phase core; the regression failure's signature differs (nonzero
+  fault address). Treating both as one crash is an inference from the
+  matching conditions, not shown. Every
   failure so far was the first Python run after a fresh install; none was
   seen on a kept install. The sample doesn't separate the two cores (2 of
   7 against 0 of 5), Python's start-up has no inotify use, and the part 3
