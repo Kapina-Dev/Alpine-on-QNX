@@ -269,14 +269,15 @@ Limits of the Phase 3 part 2 calls (timerfd and signalfd):
   realtime and monotonic clocks. Alarm timers therefore fire only while the
   device is awake and cannot wake it. Whether QNX's monotonic clock runs
   during device sleep is unmeasured.
-- **Timers and processes.** A timerfd is armed by one process's timer
-  manager. When that process exits, the timer stops firing for every other
-  process that holds the descriptor (a fork child, an exec'd image or an
-  `SCM_RIGHTS` receiver keeps it only while the arming process lives).
-  Expirations are counted
-  from the clock; a sub-millisecond period counts correctly but the wake-up
-  rate is about one per millisecond, and pulses arrive about 2.5 ms late at
-  the median (p99 about 5.6 ms).
+- **Timers and processes.** A timerfd fires from the timer manager of the
+  process that armed it. A fork child or an `SCM_RIGHTS` receiver gets
+  `poll`/epoll wake-ups only while that process lives; its blocking `read`
+  still counts from the clock. An exec'd image re-arms an inherited timer
+  in its own manager and fires it itself. When another process disarms or
+  re-arms a shared timerfd, the first process's timer follows at its next
+  pulse. Expirations are counted from the clock; a sub-millisecond period
+  counts correctly but the wake-up rate is about one per millisecond, and
+  pulses arrive about 2.5 ms late at the median (p99 about 5.6 ms).
 - **`TFD_TIMER_CANCEL_ON_SET`.** Accepted for absolute `CLOCK_REALTIME`
   timers, where a read fails `ECANCELED` after a clock change; accepted and
   ignored for relative and non-realtime timers, as on Linux. A change is
@@ -287,7 +288,8 @@ Limits of the Phase 3 part 2 calls (timerfd and signalfd):
 - Relative `CLOCK_REALTIME` timers shift when the clock steps (Linux keeps
   them on the monotonic base). Counts are capped at 2^48-1 per arming. A
   `timerfd_settime` in one process racing a read in another can, rarely,
-  let the read add the last few expirations of the old arming.
+  let the read add the old arming's uncounted expirations (bounded by what
+  it produced) after the reset.
 - **signalfd and delivery.** A signal is read through a signalfd when it
   is blocked in every thread, or in the thread that reads. A collector
   thread takes such signals into a process-wide queue; if a thread has the
@@ -296,7 +298,9 @@ Limits of the Phase 3 part 2 calls (timerfd and signalfd):
   return `EINTR` (as on Linux; a behaviour change from before part 2).
 - **Thread-directed signals.** A signal sent to one thread (`tgkill`) that
   the thread blocks stays in the QNX kernel until that thread reads its
-  signalfd; `read` returns it but `poll` and epoll don't show it first.
+  signalfd; `read` returns it but `poll` and epoll don't show it first,
+  and a `read` already blocked when it arrives isn't woken by it: it finds
+  the signal at its next one-second re-check (up to 1 s late).
 - **Sender details.** The sender pid, code and `sigqueue` value come
   from the QNX siginfo. QNX reports `si_uid` 0 for a non-zero sender, so
   `ssi_uid` is the receiver's real uid in that case. Across `execve`
@@ -311,9 +315,16 @@ Limits of the Phase 3 part 2 calls (timerfd and signalfd):
   shared with the sender. A mask change through `signalfd(fd, newmask)`
   reaches other processes at their next read or poll; a process already
   asleep keeps the old set.
-- **Capacity.** Each signalfd costs 4 hidden descriptors per process, so
-  about 64 signalfds fit in the 256 hidden descriptors, which timerfd,
-  eventfd and epoll share. If a fork child can't build its readiness
+- **Capacity.** Each signalfd costs 4 hidden descriptors per process and
+  each timerfd 2 (its readiness pipe's write end and its shared-memory
+  page), so about 64 signalfds or 128 timerfds fit in the 256 hidden
+  descriptors, which eventfd and epoll share too. So do the per-thread
+  signal-wait pipes (2 each), made on a thread's first blocking eventfd
+  call, `rt_sigsuspend` or masked wait (`ppoll`, `pselect6`,
+  `epoll_pwait`). When the range is full, `rt_sigsuspend` falls back to
+  the host `sigsuspend` (reported once as `sigsuspend-no-wait-channel`);
+  there a signal queued at the very moment the wait starts can be missed
+  until the next one. If a fork child can't build its readiness
   channel (hidden range full), `poll`, `select` or epoll on that signalfd
   can sleep until their timeout; this is reported once in
   `LINUXEMU_DIAGNOSTICS`.

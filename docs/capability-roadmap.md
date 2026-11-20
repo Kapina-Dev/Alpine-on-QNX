@@ -555,13 +555,17 @@ part 3.
 - A signalfd mask change reaches a sleeping process only at its next read
   or poll.
 - A signalfd costs 4 hidden descriptors per process (about 64 in the 256
-  reserve, shared with eventfd, timerfd and epoll); a fork child that
-  can't build its readiness channel can sleep in `poll` until the timeout.
+  reserve, shared with eventfd, timerfd (2 each), epoll and the per-thread
+  signal-wait pipes); a fork child that can't build its readiness channel
+  can sleep in `poll` until the timeout. With the reserve full,
+  `rt_sigsuspend` falls back to the host `sigsuspend`, which can miss a
+  signal queued just as the wait starts.
 - The readiness byte can outlive a signal consumed by a handler or
   `sigwaitinfo` (`POLLIN`, then `EAGAIN`).
 - timerfd: a timer stops firing for others when its arming process exits;
-  relative `CLOCK_REALTIME` timers shift on a clock step; a rare old-arming
-  residue when `settime` races a count update in another process.
+  relative `CLOCK_REALTIME` timers shift on a clock step; when `settime`
+  races a count update in another process, that update can, rarely, add
+  the old arming's uncounted expirations (bounded by what it produced).
 - Real `CLOCK_REALTIME` change detection and `monotonic_in_sleep` are
   unverified on the device (`clock_settime` is `EPERM`; sleep can't be
   forced unattended).
