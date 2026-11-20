@@ -371,8 +371,8 @@ Design and plan:
 `docs/superpowers/specs/2026-11-19-phase3a-eventfd-epoll-design.md` and
 `docs/superpowers/plans/2026-11-19-phase3a-eventfd-epoll.md`. Supported
 calls and limits: `docs/compatibility.md`; device facts: `docs/FINDINGS.md`.
-Part 2 (timerfd, signalfd) is complete and part 3 (inotify) is done
-pending merge (both below); one release after part 3.
+Part 2 (timerfd, signalfd) and part 3 (inotify) are done (both below);
+one release after part 3.
 
 **What landed.**
 
@@ -517,8 +517,8 @@ Design and plan:
 (with a "Corrections after implementation" note) and the matching plan
 under `docs/superpowers/plans/`. Supported calls and limits:
 `docs/compatibility.md` ("Limits of the Phase 3 part 2 calls"); device
-facts: `docs/FINDINGS.md`. Part 3 (inotify) is next; one release after
-part 3.
+facts: `docs/FINDINGS.md`. Part 3 (inotify) followed (below); one
+release after part 3.
 
 **What landed.**
 
@@ -573,7 +573,7 @@ part 3.
   signal-safe).
 - The io-pkt crash isolation from part 1 is still open.
 
-### Phase 3 part 3 status: done, pending merge (2026-11-20)
+### Phase 3 part 3 status: done (2026-11-20)
 
 inotify, on branch `phase3c-inotify` (base `fce297c`). Design and plan:
 `docs/superpowers/specs/2026-11-20-phase3c-inotify-design.md` and
@@ -593,16 +593,19 @@ release follows this part.
   that holds no state. No threads, no hidden descriptors, no polling.
 - The object adds guest paths (working directory, guest symlinks,
   `IN_DONT_FOLLOW`), Linux's errors where QNX differs (`EAGAIN` for an
-  empty nonblocking read, `EINVAL` for a zero mask and `IN_MASK_CREATE`,
+  empty nonblocking read, `EINVAL` for a zero mask and `IN_MASK_CREATE`
+  (with a diagnostic when it comes without `IN_MASK_ADD`),
   `EFAULT` for bad pointers), and `EOPNOTSUPP` with a diagnostic for
-  filesystems QNX can't watch and for device nodes, where the native call
-  can block forever on some ptys.
+  filesystems QNX can't watch and for device nodes, FIFOs and sockets,
+  where the native call can block forever (a FIFO, some ptys).
 - Readiness in `poll`, `select` and epoll and blocking reads come from the
   native fd. `dup`, `fork` and `execve` share the native queue; after
-  `execve`, and for a received fd, the object is re-attached by
-  `/dev/fsnotify`'s identity. `sendmsg`/`sendmmsg` refuse an inotify fd in
-  `SCM_RIGHTS` with `EOPNOTSUPP`, because QNX's receiver would fail
-  `EACCES` and lose the message.
+  `execve` the object is re-attached by `/dev/fsnotify`'s identity.
+  `sendmsg`/`sendmmsg` refuse an inotify fd in `SCM_RIGHTS` with
+  `EOPNOTSUPP`, because QNX's receiver would fail `EACCES` and lose the
+  message. The same identity hook also covers a received fd, for
+  completeness only: it is untested, since QNX can't pass an inotify fd
+  and Linuxemu refuses to send one.
 
 **Gate results.**
 
@@ -630,8 +633,9 @@ release follows this part.
   failure had a different one (a nonzero fault address). That both are
   the same crash is an inference from matching conditions (the first
   python3 run after a fresh install, a SIGSEGV at start-up), not shown, so
-  it isn't established as pre-existing. Nothing ties it to inotify: Python's start-up doesn't use inotify, and the only part 3 code
-  on its path is one `stat` of `/dev/fsnotify` at start-up and a type check
+  it isn't established as pre-existing. Nothing ties it to inotify:
+  Python's start-up doesn't use inotify, and the only part 3 code on its
+  path is one `stat` of `/dev/fsnotify` at start-up and a type check
   in `readv` on typed fds. The cause is still unknown (watch item, below).
 
 **Phase 3 as a whole stays open.** The roadmap's Phase 3 acceptance gate
@@ -1115,7 +1119,7 @@ Compatibility measurement
         |
 [complete] timerfd / signalfd
         |
-[done, pending merge] inotify
+[done] inotify
         |
 Thumb and stripped binaries
         |

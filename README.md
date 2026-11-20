@@ -32,8 +32,8 @@ start-up, a basic workload, a concurrent workload, and clean shutdown:
 | Vim | ✅ works | |
 | GCC and make | ✅ works | Compiles and runs programs on the phone |
 | inotify-tools | ✅ works | `inotify` on QNX's native one; events arrive about 250 ms late (limits in [compatibility.md](docs/compatibility.md)) |
-| nginx | ❌ not yet | Needs `epoll` |
-| Redis | ❌ not yet | Needs `epoll` |
+| Redis | ✅ works | |
+| nginx | ❌ not yet | Starts, but no worker: `ioctl(FIOASYNC)` on its worker channel returns `ENOTTY` (async I/O signals, `FIOASYNC`/`F_SETOWN`, aren't supported yet) |
 | Node.js | ❌ not yet | Stops at start-up |
 
 tmux 3.7 also works, attached and detached, in Term49 and over SSH. All
@@ -91,8 +91,8 @@ Linux's.
 
 - Only 32-bit ARM Linux (armhf). It's tested with Alpine 3.24 (musl) and
   QNX 8.0.0 / BB10 10.3.
-- Not a Linux kernel. There is no `epoll`, graphics, kernel modules
-  or systemd yet, and calls Linuxemu doesn't support return Linux errors.
+- Not a Linux kernel. There are no graphics, kernel modules or systemd,
+  and calls Linuxemu doesn't support return Linux errors.
 - Default-speed `cmatrix` freezes the Term49 display. Use
   `cmatrix -s -u 10`.
 
@@ -101,8 +101,10 @@ The full list is in [compatibility.md](docs/compatibility.md).
 ## Roadmap
 
 [capability-roadmap.md](docs/capability-roadmap.md) sets out the next phases:
-contained modern syscalls such as `pipe2`, `dup3` and full `eventfd` first,
-then `epoll` and `inotify` so servers like nginx and Redis can run.
+contained modern syscalls such as `pipe2`, `dup3` and full `eventfd`, then
+`epoll`, `timerfd`, `signalfd` and `inotify` (all landed; Redis and
+inotify-tools now run), and next the gaps the corpus still shows, such as
+nginx's `FIOASYNC` and Node.js's start-up crash.
 
 ## Development
 

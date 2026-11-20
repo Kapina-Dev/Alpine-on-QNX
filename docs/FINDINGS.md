@@ -1133,6 +1133,12 @@ overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
   `/dev/ttyp1` and `/dev/ttyp5` it blocked (REPLY-blocked on the fsnotify
   server) until the signal arrived. Linuxemu therefore refuses character
   and block devices with `EOPNOTSUPP` before the native call.
+- **FIFOs hang the call too; sockets give `ENOTTY`.** Measured 2026-11-20
+  with `phase3c-probes … special` (3 s interrupting `alarm`), on a qnx6
+  directory: native `inotify_add_watch` on a FIFO blocked until the alarm
+  (-1, `EINTR`, 3,003 ms); on a bound unix socket's path it returned -1,
+  `ENOTTY` in 13 ms. Linuxemu refuses both, like devices, with
+  `EOPNOTSUPP` before the native call.
 - **Identity, exec, dup, `SCM_RIGHTS`.** `fstat` of two inotify fds returns
   the same `st_dev`/`st_ino` as `stat("/dev/fsnotify")` (1/871157257, mode
   `020664`); `/dev/null` differs, so an inotify fd is recognised by that

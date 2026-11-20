@@ -372,10 +372,12 @@ Limits of the Phase 3 part 3 calls (inotify):
   than a watch that never fires. A guest path can't reach these today: the
   guest's `/dev` maps only `/dev/null` and `/dev/pts/*`, which are device
   nodes (next item), so this mapping is untested from a guest.
-- **Device nodes.** A watch on a character or block device returns
-  `EOPNOTSUPP` (reported as above) without calling QNX: the native
-  `inotify_add_watch` on some ptys (`/dev/ttyp1`, `/dev/ttyp5`) blocks
-  until a signal arrives. Linux allows such watches.
+- **Device nodes, FIFOs and sockets.** A watch on a character or block
+  device, a FIFO or a unix socket's path returns `EOPNOTSUPP` (reported as
+  above) without calling QNX: the native `inotify_add_watch` blocks until
+  a signal arrives on a FIFO (the one probed) and on some ptys
+  (`/dev/ttyp1`, `/dev/ttyp5`), and fails `ENOTTY` on a socket. Linux
+  allows such watches.
 - **Late events.** QNX batches inotify events: they arrive about 250 ms
   after the change (median 253 ms, at most 255 ms measured), sometimes
   sooner. A program that waits a fixed short time for an event can miss it.
@@ -387,13 +389,14 @@ Limits of the Phase 3 part 3 calls (inotify):
   directories after changes, so watches with `IN_OPEN`, `IN_ACCESS` or
   `IN_CLOSE_NOWRITE` see extra events. They are real events and are passed
   through.
-- **`IN_MASK_CREATE`** returns `EINVAL` whether or not a watch exists for
-  the path, because QNX can't tell whether one does without Linuxemu
+- **`IN_MASK_CREATE`** returns `EINVAL` (reported in
+  `LINUXEMU_DIAGNOSTICS`) whether or not a watch exists for the path, because QNX can't tell whether one does without Linuxemu
   tracking every watch. Linux returns `EEXIST` only for an existing watch.
 - **`SCM_RIGHTS`.** `sendmsg` and `sendmmsg` with an inotify fd in
   `SCM_RIGHTS` fail `EOPNOTSUPP` and send nothing: QNX can't pass the fd
   (its receiver fails `EACCES` and loses the whole message). A `sendmmsg`
-  returns the count of messages sent before the refused one.
+  returns the count of messages sent before the refused one (by code
+  reading; untested).
 - **`IN_EXCL_UNLINK`** is passed to QNX unchanged and is untested.
 - **No `/proc/sys/fs/inotify`.** `max_queued_events`,
   `max_user_instances` and `max_user_watches` don't exist. At least 300
