@@ -34,7 +34,8 @@
  *   24 after chdir(dir), a watch on "." reports CREATE r
  *   25 through the guest symlink /tmp/inb-link -> /tmp/inb-dir a watch
  *      reports CREATE in the target; with IN_DONT_FOLLOW|IN_ATTRIB (the
- *      link itself) a file created in the target reports nothing in 1 s
+ *      link itself) a chmod of the target reports nothing in 1 s (a watch
+ *      that followed the link would report ATTRIB)
  *   26 add_watch with path (char *)1 fails EFAULT; a read into (void *)1
  *      with an event queued fails EFAULT
  *   27 20 files created: reads with a sizeof(struct inotify_event) +
@@ -527,9 +528,10 @@ static int check_symlink(void)
     reader_init(&reader, fd);
     wd = inotify_add_watch(fd, LINK_PATH, IN_DONT_FOLLOW | IN_ATTRIB);
     if (wd < 0) result = fail(25, "add_watch IN_DONT_FOLLOW");
-    else if (make_file(DIR_PATH "/u") != 0) result = fail(25, "create u");
+    else if (chmod(DIR_PATH, 0700) != 0) result = fail(25, "chmod target");
     else result = expect_quiet(25, &reader, 1000);
-    unlink(DIR_PATH "/u");
+    if (chmod(DIR_PATH, 0755) != 0 && result == 0)
+        result = fail(25, "restore target mode");
     close(fd);
     return result;
 }
@@ -610,7 +612,10 @@ static int check_burst(void)
     vectors[1].iov_len = sizeof(name);
     got = readv(fd, vectors, 2);
     event = (const struct inotify_event *)header;
-    if (got != (ssize_t)(16 + event->len) || event->wd != wd ||
+    if (got < (ssize_t)sizeof(header)) {
+        fprintf(stderr, "check 27: readv %d\n", (int)got);
+        result = fail(27, "readv");
+    } else if (got != (ssize_t)(16 + event->len) || event->wd != wd ||
             (event->mask & IN_CREATE) == 0 || event->len == 0 ||
             strcmp(name, "g") != 0) {
         fprintf(stderr, "check 27: readv %d wd %d mask 0x%x len %u\n",
