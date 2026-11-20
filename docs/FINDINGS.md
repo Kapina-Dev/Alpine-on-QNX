@@ -1116,8 +1116,8 @@ overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
   natively; the queue overflows (`IN_Q_OVERFLOW`) at 2,048 events. Blocking
   read with nothing queued is ended by a signal (`EINTR`) and woken by an
   event; a too-small buffer gives `EINVAL`; `FIONREAD` reports queued bytes;
-  a forked child shares the queue. Limits reached: 300 instances, 2,000
-  watches (no failure up to those counts).
+  a forked child shares the queue. At least 300 instances and 2,000
+  watches (the probe's caps; no limit was hit).
 - **Five differences from Linux.** (1) A nonblocking read of an empty queue
   returns 0, not `EAGAIN`. (2) A zero mask is accepted (wd returned), Linux
   gives `EINVAL`. (3) Watches on `/dev/shmem`, `/pps` and `/proc` fail with
@@ -1126,8 +1126,7 @@ overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
   Delivery is batched: median 253 ms, p90/max 255 ms over 40 trials, with a
   few at 7-39 ms when a batch boundary was near. (5) Background system
   processes open files and directories after changes, so `OPEN`/
-  `CLOSE_NOWRITE`/`ACCESS` watches see extra, genuine events (the `initial`
-  and `unlink` lines above show such records).
+  `CLOSE_NOWRITE`/`ACCESS` watches see extra, genuine events.
 - **Identity, exec, dup, `SCM_RIGHTS`.** `fstat` of two inotify fds returns
   the same `st_dev`/`st_ino` as `stat("/dev/fsnotify")` (1/871157257, mode
   `020664`); `/dev/null` differs, so an inotify fd is recognised by that
