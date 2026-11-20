@@ -1236,3 +1236,49 @@ Consequences for Task 2: pass `FIOASYNC`, `F_SETFL O_ASYNC`, `F_SETOWN` and
 (process-group) owner with a Linux error and a diagnostic; Linux `F_SETOWN`
 owners are guest pids and the QNX owner is the native pid, so the owner given
 to QNX must be the native pid of the target (own pid at minimum).
+
+## 2026-11-20 — QNX io-pkt SIGIO leak after TCP async (Phase 3 part 4, Ruling 4)
+
+Device: BlackBerry Passport, ordinary user, no reboot during the work.
+Probe: `native-probes/phase3d-tcp-sigio-leak.c`
+(`build/native-probes/phase3d-tcp-sigio-leak`). Pure native QNX; Linuxemu
+not involved.
+
+- `arm`: one TCP loopback connection; `FIOASYNC 1` and `F_SETOWN(getpid())`
+  on the accepted socket; one write; close everything; exit.
+- `scan`: a **fresh process that never asks for async I/O**. It makes 400
+  TCP loopback connections (`SO_REUSEADDR` listener, poll, accept, write)
+  with a `SIGIO` handler. Its sockets show no `O_ASYNC` in `F_GETFL` and no
+  `F_GETOWN` owner.
+
+Each step runs as a separate process, one after the other:
+
+| Sequence | scans that got SIGIO |
+| --- | --- |
+| `scan` alone (no async process before it) | 0 of 10 (and 0 of 6 later) |
+| `arm` (TCP) then `scan` | 5 of 17 across three sessions of scratch versions, plus 1 of 6 in the final check of the committed probe |
+| `arm clear` (`FIOASYNC 0` and `F_SETOWN 0` before close) then `scan` | 2 of 5; `FIOASYNC 0` alone: 2 of 6. Clearing doesn't help |
+| all TCP arm variants together | 10 of 34, about 1 in 3 |
+| AF_UNIX socketpair `arm-unix` then `scan` | 0 of 4 |
+
+- A scan that is hit gets 3 `SIGIO`s in a burst partway through (round
+  110-180 of 400). `si_pid` is the scan process itself, `si_code` 0. A
+  watcher process in the same process group gets nothing: the signal goes
+  to the TCP-using process, not to a group.
+- With `SIGIO` at its default action, the hit process dies (host status
+  128+22). That is how it showed up first: `epoll-concurrent`'s TCP checks
+  (31, 33, 34) died with exit 150 on both the new core and the pre-phase core
+  after async-io fixture runs. The pipe checks never died.
+- **Decay:** the state wears off by itself, without a reboot. In one
+  sequence, two TCP runs died within about 3 minutes of the last TCP async
+  use, and the following runs passed. About an hour after the last arm, 6
+  scans got nothing, and the full event smoke then passed.
+- Which socket structure io-pkt keeps or recycles is not visible from user
+  space. UDP was not tested.
+
+Consequence (Ruling 4): Linuxemu allows socket async I/O on **AF_UNIX
+only** (stream and datagram). AF_INET (TCP and UDP) gets `EINVAL` with the
+"only supported on AF_UNIX sockets" diagnostic, like AF_INET6, pipes and
+ptys. Otherwise one guest's TCP async I/O could kill later, unrelated
+processes. nginx asks for `SIGIO` only on its AF_UNIX master/worker
+socketpair, and libuv doesn't use `SIGIO`.

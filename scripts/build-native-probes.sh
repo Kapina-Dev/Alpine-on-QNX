@@ -76,6 +76,8 @@ set -x
     "$project_dir/native-probes/phase3c-facts.c" -lsocket
 "$cc" $common_flags -o "$build_dir/phase3d-sigio" \
     "$project_dir/native-probes/phase3d-sigio.c" -lsocket
+"$cc" $common_flags -o "$build_dir/phase3d-tcp-sigio-leak" \
+    "$project_dir/native-probes/phase3d-tcp-sigio-leak.c" -lsocket
 "$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \
     -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c -lsocket
 "$cc" $common_flags -std=gnu99 -marm -DLINUXEMU_TESTING=1 \
