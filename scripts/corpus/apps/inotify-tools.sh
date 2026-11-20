@@ -1,5 +1,7 @@
-# Corpus app: inotify-tools (file watching). Linuxemu has no inotify yet
-# (roadmap Phase 3), so this app is expected to fail at basic for now.
+# Corpus app: inotify-tools (file watching), on Linuxemu's inotify over
+# QNX's native one (roadmap Phase 3 part 3). QNX delivers events about
+# 250 ms late, well inside the 2 s waits after starting the watcher and
+# after the changes.
 corpus_packages="inotify-tools"
 
 stage_startup()

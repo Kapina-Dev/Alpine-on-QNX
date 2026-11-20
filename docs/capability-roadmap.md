@@ -371,8 +371,8 @@ Design and plan:
 `docs/superpowers/specs/2026-11-19-phase3a-eventfd-epoll-design.md` and
 `docs/superpowers/plans/2026-11-19-phase3a-eventfd-epoll.md`. Supported
 calls and limits: `docs/compatibility.md`; device facts: `docs/FINDINGS.md`.
-Part 2 (timerfd, signalfd) is done pending merge (below); part 3
-(inotify) follows; one release after part 3.
+Part 2 (timerfd, signalfd) is complete and part 3 (inotify) is done
+pending merge (both below); one release after part 3.
 
 **What landed.**
 
@@ -509,7 +509,7 @@ Part 2 (timerfd, signalfd) is done pending merge (below); part 3
   late `EPOLLRDHUP`, pipe hangups with data left, the near-full eventfd
   writer, epoll fds over `SCM_RIGHTS`, and the capacities.
 
-### Phase 3 part 2 status: done, pending merge (2026-11-20)
+### Phase 3 part 2 status: complete (2026-11-20)
 
 timerfd and signalfd, on branch `phase3b-timers-signals` (base `37443ed`).
 Design and plan:
@@ -572,6 +572,103 @@ part 3.
 - `snprintf` in the `execve` dispatch path (an existing pattern, not
   signal-safe).
 - The io-pkt crash isolation from part 1 is still open.
+
+### Phase 3 part 3 status: done, pending merge (2026-11-20)
+
+inotify, on branch `phase3c-inotify` (base `fce297c`). Design and plan:
+`docs/superpowers/specs/2026-11-20-phase3c-inotify-design.md` and
+`docs/superpowers/plans/2026-11-20-phase3c-inotify.md`. Supported calls and
+limits: `docs/compatibility.md` ("Limits of the Phase 3 part 3 calls");
+device facts: `docs/FINDINGS.md` (2026-11-20, "QNX native inotify"). One
+release follows this part.
+
+**What landed.**
+
+- The probes found that QNX's libc has a native inotify whose records,
+  mask bits and watch descriptors are Linux's, and that `ionotify()` and a
+  stat-scanning fallback are no use (`EINVAL` on directories; 4.2 s per
+  1,000-entry scan, whole-second mtimes). So the guest's inotify fd is the
+  native one: `inotify_init`, `inotify_init1`, `inotify_add_watch` and
+  `inotify_rm_watch` (`src/linux_inotify.c`) wrap it with a typed object
+  that holds no state. No threads, no hidden descriptors, no polling.
+- The object adds guest paths (working directory, guest symlinks,
+  `IN_DONT_FOLLOW`), Linux's errors where QNX differs (`EAGAIN` for an
+  empty nonblocking read, `EINVAL` for a zero mask and `IN_MASK_CREATE`,
+  `EFAULT` for bad pointers), and `EOPNOTSUPP` with a diagnostic for
+  filesystems QNX can't watch and for device nodes, where the native call
+  can block forever on some ptys.
+- Readiness in `poll`, `select` and epoll and blocking reads come from the
+  native fd. `dup`, `fork` and `execve` share the native queue; after
+  `execve`, and for a received fd, the object is re-attached by
+  `/dev/fsnotify`'s identity. `sendmsg`/`sendmmsg` refuse an inotify fd in
+  `SCM_RIGHTS` with `EOPNOTSUPP`, because QNX's receiver would fail
+  `EACCES` and lose the message.
+
+**Gate results.**
+
+- `run-event-smoke` fixtures `inotify-basic`, `inotify-modes` and
+  `inotify-share` pass on the Passport; each task ran its new checks
+  first on a core without its code (the pre-phase core or the previous
+  task's) and saw them fail.
+- The Android FileObserver and PackageManager events (`IN_CREATE`,
+  `IN_DELETE`, `IN_MOVED_*`, `IN_CLOSE_WRITE` on directories) are covered
+  by `inotify-basic`.
+- Application corpus: 9 of 11 compatible. inotify-tools is newly
+  compatible (all five stages, no unsupported call), and every app
+  compatible before (the seven baseline apps and Redis) still is; BusyBox
+  passed its shutdown stage. Results: `docs/corpus-results.md`.
+- Full device regression: `linuxemu_full_regression_failures=0` (core
+  `13eac1ec…`), on the second run. The first run failed only
+  `run-python-smoke`: python3 died at start-up with a SIGSEGV (pc
+  `0x11210964`, address `0x79616dcc`) before its first check, after every
+  earlier suite, including `run-event-smoke`, had passed. Run alone, the
+  Python smoke then failed once in five fresh installs on this core (the
+  part 2 signature, pc `0x60067dc4`, address 0) and passed five of five on
+  the pre-phase core; the same workload run 15 times per core, alternating,
+  on one install passed all 30 times. This is the start-up crash first seen
+  in Phase 2 (also on that pre-phase core), and nothing ties it to
+  inotify: Python's start-up doesn't use inotify, and the only part 3 code
+  on its path is one `stat` of `/dev/fsnotify` at start-up and a type check
+  in `readv` on typed fds. The cause is still unknown (watch item, below).
+
+**Phase 3 as a whole stays open.** The roadmap's Phase 3 acceptance gate
+is not met, so Phase 3 is not marked complete:
+
+- libuv event-loop tests: not run in part 3, by the user's choice (the
+  corpus target was inotify-tools only). Open.
+- nginx serve, time out, reload and stop: blocked by `ioctl(FIOASYNC)` on
+  the master/worker socketpair (`ENOTTY`) and, likely next,
+  `fcntl(F_SETOWN)` (`EINVAL`). Not inotify work. Open.
+- Node.js timers, files, subprocesses, sockets and signals: Node still
+  crashes at start-up (SIGSEGV, address 0) after `madvise` (`ENOSYS`) and a
+  refused `mremap`, likely Phase 4/6 V8 memory and JIT work. Open.
+- Watcher tests for create, update, rename, delete and overflow: pass
+  (`inotify-basic`, `inotify-modes`, and the inotify-tools corpus app).
+
+**Follow-ups (not blocking the release).**
+
+- Every limit in `docs/compatibility.md` ("Limits of the Phase 3 part 3
+  calls") stays as documented: about 250 ms late events, the overflow
+  record first, extra events from Passport background processes,
+  `IN_MASK_CREATE` always `EINVAL`, no `SCM_RIGHTS`, device nodes and
+  unwatchable filesystems `EOPNOTSUPP`, `IN_EXCL_UNLINK` untested, no
+  `/proc/sys/fs/inotify`.
+- The `ENOTTY` to `EOPNOTSUPP` mapping for unwatchable filesystems isn't
+  reachable from a guest path today (the guest's `/dev` maps only device
+  nodes), so it is untested.
+- From the reviews: a zero-length read with an event queued returns
+  `EAGAIN` (Linux `EINVAL`); `IN_MASK_CREATE`'s `EINVAL` has no
+  diagnostic; `readv` with a bad `iov_base` isn't probed for `EFAULT`;
+  the pointer check uses `msync`, so a `PROT_NONE` guard page passes it
+  (as epoll's); with a bad fd and an inotify fd in one `SCM_RIGHTS`
+  message, `sendmsg` returns `EOPNOTSUPP` where Linux gives `EBADF`;
+  a partial `sendmmsg` batch is untested.
+- The intermittent python3 start-up SIGSEGV in `run-python-smoke`, seen
+  only on the first run after a fresh install (2 of 7 on this core, 0 of 5
+  on the pre-phase core, 0 of 30 on a kept install). Not yet isolated: capture a
+  core or a guest backtrace at the faulting pc next time it fires.
+- From part 1 and 2, still open: the io-pkt crash isolation, nginx's
+  `FIOASYNC`/`F_SETOWN`, Node's start-up crash, and part 2's follow-ups.
 
 ## Phase 4: Thumb and stripped-binary support
 
@@ -1012,9 +1109,9 @@ Compatibility measurement
         |
 [complete] epoll
         |
-[done, pending merge] timerfd / signalfd
+[complete] timerfd / signalfd
         |
-inotify
+[done, pending merge] inotify
         |
 Thumb and stripped binaries
         |

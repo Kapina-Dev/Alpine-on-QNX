@@ -125,6 +125,31 @@ Phase 3 part 2 adds `timerfd` and `signalfd`, each covered by the
   `ppoll`, `pselect6` and `epoll_pwait` see signals a signalfd's collector
   took.
 
+Phase 3 part 3 adds `inotify` on QNX's native inotify, covered by the
+`run-event-smoke` fixtures `inotify-basic`, `inotify-modes` and
+`inotify-share`:
+
+- `inotify_init`, `inotify_init1` (`IN_NONBLOCK`, `IN_CLOEXEC`),
+  `inotify_add_watch` and `inotify_rm_watch`, with Linux's
+  `struct inotify_event` records. Create, modify, attrib, close-write,
+  delete, rename (`MOVED_FROM`/`MOVED_TO` with a shared cookie),
+  `DELETE_SELF` and `IGNORED`, `IN_ONESHOT`, `IN_MASK_ADD`, `IN_ONLYDIR`,
+  `IN_DONT_FOLLOW`, queue overflow, `FIONREAD`, and Linux's errors where
+  QNX differs (a nonblocking read of an empty queue fails `EAGAIN`, a mask
+  with no event bits fails `EINVAL`).
+- Guest paths: relative watches follow the guest's working directory, and
+  guest symlinks resolve inside the rootfs. Bad path or buffer pointers
+  fail `EFAULT`.
+- Readiness in `poll`, `select`, `ppoll` and epoll (level- and
+  edge-triggered), blocking reads interrupted by signals, a burst of 100
+  creates from four threads with every event delivered once, and the same
+  queue across `dup`, `fork` and `execve`.
+
+The pinned application corpus now scores 9 of 11 apps compatible:
+inotify-tools joins apk, BusyBox, GCC with make, Git, Python, Redis,
+SQLite and Vim (`docs/corpus-results.md`, 2026-11-20). nginx and Node.js
+fail as after part 1.
+
 ## Deliberate limits
 
 Limits of the Phase 2 calls:
@@ -339,6 +364,45 @@ Limits of the Phase 3 part 2 calls (timerfd and signalfd):
   signal unblocked and has no `SA_RESTART`, so a spurious `EINTR` is
   possible, rarely.
 
+Limits of the Phase 3 part 3 calls (inotify):
+
+- **Unsupported filesystems.** A watch on a filesystem QNX can't watch
+  (`/dev/shmem`, `/pps`, `/proc`, where the native call fails `ENOTTY`)
+  returns `EOPNOTSUPP` and is reported in `LINUXEMU_DIAGNOSTICS`, rather
+  than a watch that never fires. A guest path can't reach these today: the
+  guest's `/dev` maps only `/dev/null` and `/dev/pts/*`, which are device
+  nodes (next item), so this mapping is untested from a guest.
+- **Device nodes.** A watch on a character or block device returns
+  `EOPNOTSUPP` (reported as above) without calling QNX: the native
+  `inotify_add_watch` on some ptys (`/dev/ttyp1`, `/dev/ttyp5`) blocks
+  until a signal arrives. Linux allows such watches.
+- **Late events.** QNX batches inotify events: they arrive about 250 ms
+  after the change (median 253 ms, at most 255 ms measured), sometimes
+  sooner. A program that waits a fixed short time for an event can miss it.
+- **Overflow record first.** When the queue overflows (at 2,048 events, not
+  Linux's default 16,384), QNX puts the `IN_Q_OVERFLOW` record (`wd` -1,
+  `len` 0) first in the queue, ahead of the queued events; Linux appends it
+  at the end. It is passed through as QNX queues it.
+- **Extra events.** Passport background processes open files and
+  directories after changes, so watches with `IN_OPEN`, `IN_ACCESS` or
+  `IN_CLOSE_NOWRITE` see extra events. They are real events and are passed
+  through.
+- **`IN_MASK_CREATE`** returns `EINVAL` whether or not a watch exists for
+  the path, because QNX can't tell whether one does without Linuxemu
+  tracking every watch. Linux returns `EEXIST` only for an existing watch.
+- **`SCM_RIGHTS`.** `sendmsg` and `sendmmsg` with an inotify fd in
+  `SCM_RIGHTS` fail `EOPNOTSUPP` and send nothing: QNX can't pass the fd
+  (its receiver fails `EACCES` and loses the whole message). A `sendmmsg`
+  returns the count of messages sent before the refused one.
+- **`IN_EXCL_UNLINK`** is passed to QNX unchanged and is untested.
+- **No `/proc/sys/fs/inotify`.** `max_queued_events`,
+  `max_user_instances` and `max_user_watches` don't exist. At least 300
+  instances and 2,000 watches per process worked on the device (the probe's
+  caps; no limit was hit).
+- `readv` on an inotify fd goes straight to QNX's native `readv`, which
+  returns whole records. A zero-length `read` or `readv` with an event
+  queued returns `EAGAIN` where Linux returns `EINVAL`.
+
 Other limits:
 
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
@@ -347,7 +411,7 @@ Other limits:
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
 - Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary
-  ioctls, `inotify`, graphics, kernel modules, and Linux service management are
+  ioctls, graphics, kernel modules, and Linux service management are
   outside the v0.1 surface.
 - Linux `/dev/ptmx` and `/dev/pts/N` use the finite QNX `/dev/ptypN` and
   `/dev/ttypN` pool; allocation fails when every native pair is busy.

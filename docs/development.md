@@ -111,7 +111,7 @@ thread-directed, and interruption checks:
 sh scripts/run-signal-smoke.sh
 ```
 
-Run the Phase 3 eventfd, epoll, timerfd and signalfd guest fixtures:
+Run the Phase 3 eventfd, epoll, timerfd, signalfd and inotify guest fixtures:
 
 ```sh
 sh scripts/run-event-smoke.sh
@@ -167,9 +167,34 @@ checks.
   and a shared signalfd's per-process wake-up (`SIGNALFD_SHARE_ONLY=N`
   runs check N alone). Check 15 polls 601 fds 2000 times and adds about
   10 s to the event smoke.
+- `inotify-basic`: `inotify_init1` flags, the event kinds (create,
+  modify, close-write, attrib, delete, rename cookies, `DELETE_SELF` and
+  `IGNORED`), the `EINVAL`/`ENOENT`/`ENOTDIR`/`EBADF` cases, a too-small
+  read, `FIONREAD`, a relative watch after `chdir`, a watch through a
+  guest symlink and with `IN_DONT_FOLLOW`, `EFAULT` for bad pointers, and
+  inotify-tools' read buffer size.
+- `inotify-modes`: `IN_ONESHOT`, `IN_MASK_ADD` and mask replacement, queue
+  overflow, readiness in `poll`, `select`, `ppoll` and epoll (level- and
+  edge-triggered), blocking reads and `EINTR`, a 100-file burst from four
+  threads, and fd number reuse under epoll. Check 14 (overflow) takes
+  about a minute.
+- `inotify-share`: inotify across `dup`/`dup3`, `fork` and `execve` (with
+  and without `IN_CLOEXEC`), and `sendmsg`/`sendmmsg` refusing an inotify
+  fd in `SCM_RIGHTS` with `EOPNOTSUPP` (`INOTIFY_SHARE_ONLY=N` runs check N
+  alone).
 - `wake-eventfd-dup` (assembly, built by `build-native-probes.sh`): the
   libcurl wake eventfd through `dup`, `dup2` and closing the original
   number.
+
+The QNX facts behind inotify come from two native probes that
+`build-native-probes.sh` builds into `build/`. They are research tools,
+not part of the regression, and their results are in `docs/FINDINGS.md`
+(2026-11-20, "QNX native inotify"):
+
+```sh
+build/phase3c-probes [qnx6-dir] [shmem-dir]  # events per filesystem, errors, latency, overflow
+build/phase3c-facts qnx6-dir                 # fd identity, exec survival, SCM_RIGHTS, overflow record
+```
 
 To rebuild a fixture, use a rootfs copy with Alpine `build-base` installed
 and commit the new binary:
@@ -296,6 +321,7 @@ sh scripts/run-corpus.sh git nginx  # selected apps
 - `linux_epoll.c`: epoll instances, interest lists, waits, nesting, and fork/exec carry.
 - `linux_timerfd.c`: the timerfd object and the per-process timer manager.
 - `linux_signalfd.c`: the signalfd object, the collector thread and the process-wide signal queue.
+- `linux_inotify.c`: the inotify object over QNX's native inotify (guest paths, Linux errors, exec and receive hooks).
 - `linux_socket.c`: socket addresses, flags, options, message headers, errors, and direct/legacy socket syscall dispatch.
 - `linux_termios.c`: Linux terminal flags, baud rates, control characters, window sizes, and related ioctl conversion.
 - `arm_patch.c`: decoded ARM syscall and TPIDRURO instruction records.
@@ -378,6 +404,8 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current
   process only.
+- inotify limits are listed in [compatibility.md](compatibility.md)
+  ("Limits of the Phase 3 part 3 calls").
 - timerfd and signalfd limits are listed in
   [compatibility.md](compatibility.md) ("Limits of the Phase 3 part 2
   calls").

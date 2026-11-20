@@ -238,3 +238,54 @@ on the device, not committed) to find the `FIOASYNC` call.
 No `epoll_*` or `eventfd*` call is reported any more. Python's
 `epoll_create1` ENOSYS and the `pwritev2` refusals of the Phase 2 run are
 gone.
+
+## Phase 3 part 3: 2026-11-20
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user.
+- **Linuxemu:** branch `phase3c-inotify` at `bd17b41`, core sha256
+  `13eac1ec26d93e62caeccd595028ba4ebc533a1b0d5fa1840641c5744243e43c`.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+- **Leftovers:** no Linuxemu process was left running; the harness killed
+  the nginx server it started (status 137).
+
+```text
+apk install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+busybox install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+gcc-make install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+git install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+inotify-tools install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+nginx install=pass startup=pass basic=fail concurrent=skip shutdown=skip compatible=no unsupported=0
+node install=pass startup=fail basic=skip concurrent=skip shutdown=skip compatible=no unsupported=3
+python install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+redis install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+sqlite install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+vim install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+corpus apps=11 compatible=9
+```
+
+The score is 9 of 11. **inotify-tools is now compatible**: `inotifywait`
+reports a created file (basic), all four files created at once by four
+background `touch` jobs while it monitors (concurrent), and exits on
+`SIGTERM` (shutdown). BusyBox passed its shutdown stage in this run, so all
+seven baseline apps and Redis stay compatible. The timerfd and signalfd
+work of part 2 had no corpus run of its own; this run covers it too.
+
+### Why each failing app fails
+
+| App | Stage | Cause | Roadmap |
+|---|---|---|---|
+| nginx | basic | "server did not answer within 60s", the same result as in part 1 (`ioctl(FIOASYNC)` on the worker channel returns `ENOTTY`, so no worker starts). Not re-diagnosed in this run. | Unscheduled (ioctl coverage) |
+| Node.js | startup | Fatal SIGSEGV at address 0 before printing its version (`pc=0x01a84688`; part 1 saw `0x0116d688`, the same crash at another load address), after `madvise` `ENOSYS` and a refused `mremap`. | Phase 4/6 (V8 memory and JIT) |
+
+### Unsupported calls per app
+
+| App | Calls (occurrences) |
+|---|---|
+| apk, GCC/make, Git, inotify-tools, nginx, SQLite, Vim | none |
+| BusyBox | `sendfile64` 3 (EINVAL, `sendfile-input`) |
+| Node.js | `madvise` 17 (ENOSYS), `mremap` 1 (EINVAL, `mremap-kind`), `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+| Python | `membarrier` 2 (EINVAL, `membarrier-cmd`) |
+| Redis | `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+
+inotify-tools reports no unsupported call: no `inotify_*` call returns
+`ENOSYS` or `EOPNOTSUPP` in its workload.

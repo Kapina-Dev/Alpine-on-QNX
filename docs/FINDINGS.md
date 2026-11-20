@@ -1152,3 +1152,32 @@ overflow_record=wd:-1 mask:0x4000 cookie:0 len:0 position:1
   viable.
 - **`ionotify` returning `EINVAL`.** `ionotify()` on a directory fd returns
   -1 with `EINVAL` (22): there is no other native change-notification path.
+
+## 2026-11-20 — Phase 3 part 3 gate: inotify-tools and the Python start-up crash
+
+Passport (QNX 8.0.0), ordinary user, core `13eac1ec…` (`phase3c-inotify` at
+`bd17b41`).
+
+- **inotify-tools works on the native backend.** In the corpus run,
+  `inotifywait` saw the created file (basic), all four files from four
+  concurrent `touch` jobs (concurrent) and exited on `SIGTERM` (shutdown),
+  with no unsupported call in its diagnostics report. The corpus waits of
+  2 s comfortably cover QNX's ~250 ms batching.
+- **The python3 start-up SIGSEGV is still intermittent.** The first full
+  regression failed only `run-python-smoke`: python3 died before its first
+  check (`fatal signal=0x0000000b pc=0x11210964 address=0x79616dcc`). Then:
+
+  | Runs | Core | Result |
+  | --- | --- | --- |
+  | `run-python-smoke` alone, fresh install each, 5 times | part 3 | 1 failed (`pc=0x60067dc4 address=0x00000000`), 4 passed |
+  | `run-python-smoke` alone, fresh install each, 5 times | pre-phase (`9a0f5844…`) | 5 passed |
+  | the smoke's Python workload on one install, alternating cores, 15 rounds | both | 30 of 30 passed |
+  | second full regression | part 3 | passed (`linuxemu_full_regression_failures=0`) |
+
+  The `0x60067dc4`/address 0 signature is the one Phase 2 recorded on
+  2026-11-18, which also failed on that phase's pre-phase core. Every
+  failure so far was the first Python run after a fresh install; none was
+  seen on a kept install. The sample doesn't separate the two cores (2 of
+  7 against 0 of 5), Python's start-up has no inotify use, and the part 3
+  code on its path is one `stat` of `/dev/fsnotify` at start-up. The
+  cause is not isolated yet.
