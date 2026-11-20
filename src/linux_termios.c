@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -21,10 +22,17 @@
 #define LINUX_TIOCSWINSZ 0x5414u
 #define LINUX_FIONREAD 0x541bu
 #define LINUX_FIONBIO 0x5421u
+#define LINUX_FIOASYNC 0x5452u
 #define LINUX_TIOCGPTN 0x80045430u
 #define LINUX_TIOCSPTLCK 0x40045431u
 #define LINUX_EOPNOTSUPP 95
 #define QNX_DISABLED_CHARACTER 0xffu
+/* Not in the QNX headers; the BSD _IOW('f', 125, int), which the QNX
+   socket stack accepts (docs/FINDINGS.md, "QNX socket async I/O"). */
+#ifndef FIOASYNC
+#define FIOASYNC 0x8004667du
+#endif
+#define GUEST_PAGE 4096u
 
 struct linux_termios {
     uint32_t input, output, control, local;
@@ -123,6 +131,44 @@ static int32_t termios_set(int fd, uint32_t request, const void *argument)
         -(int32_t)linux_errno_number(errno);
 }
 
+/* The guest int at address is mapped: the loader's and the guest's own
+   mappings are known; anything else is probed (msync fails on an unmapped
+   page). */
+static int guest_int_mapped(const void *address)
+{
+    uintptr_t start = (uintptr_t)address;
+    uintptr_t first = start & ~(uintptr_t)(GUEST_PAGE - 1);
+    uintptr_t last = (start + sizeof(int) - 1) & ~(uintptr_t)(GUEST_PAGE - 1);
+    if (address == 0 || start > UINTPTR_MAX - sizeof(int)) return 0;
+    if (guest_memory_range_owned(start, sizeof(int))) return 1;
+    return first != 0 &&
+        msync((void *)first, last - first + GUEST_PAGE, MS_ASYNC) == 0;
+}
+
+/* FIOASYNC: only AF_UNIX sockets (linux_socket_async_capable); anything
+   else would never send SIGIO, or (AF_INET) would leak SIGIO to other
+   processes, so it is refused. */
+static int32_t async_io_set(int fd, void *guest_argument)
+{
+    int value;
+    if (guest_fd_is_hidden(fd)) return -EBADF;
+    if (!guest_int_mapped(guest_argument)) return -EFAULT;
+    memcpy(&value, guest_argument, sizeof(value));
+    if (!linux_socket_async_capable(fd)) {
+        uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
+        if (fcntl(fd, F_GETFL) < 0)
+            return -(int32_t)linux_errno_number(errno);
+        arguments[0] = (uint32_t)fd;
+        arguments[1] = LINUX_FIOASYNC;
+        arguments[2] = (uint32_t)(uintptr_t)guest_argument;
+        return linux_report_unsupported(54, EINVAL,
+            "async I/O (FIOASYNC) is only supported on AF_UNIX sockets", arguments);
+    }
+    value = value != 0;
+    return ioctl(fd, FIOASYNC, &value) == 0 ? 0 :
+        -(int32_t)linux_errno_number(errno);
+}
+
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
 {
     int value;
@@ -172,6 +218,7 @@ int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument)
             return fcntl(fd, F_SETFL, value) == 0 ? 0 :
                 -(int32_t)linux_errno_number(errno);
         }
+    case LINUX_FIOASYNC: return async_io_set(fd, guest_argument);
     case LINUX_TIOCGPTN:
         if (guest_argument == 0) return -EFAULT;
         {

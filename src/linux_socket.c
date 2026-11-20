@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
@@ -987,6 +988,47 @@ static int32_t multi_message_call(int receiving, uint32_t *arguments)
         }
     }
     return (int32_t)done;
+}
+
+/* Socket async I/O (FIOASYNC, O_ASYNC, F_SETOWN): 1 only for a host
+   AF_UNIX socket, stream or datagram, with no typed object (docs/FINDINGS.md,
+   "QNX socket async I/O").  Pipes and ptys accept FIOASYNC on QNX but never
+   send SIGIO.  AF_INET is refused although QNX signals for it: after a TCP
+   socket has had async I/O, io-pkt later sends SIGIO to unrelated processes
+   doing TCP, even when async was cleared before close, which kills them
+   ("QNX io-pkt SIGIO leak after TCP async"); UDP was not cleared of it.
+   Other families were not measured.  errno is left as it was. */
+int linux_socket_async_capable(int fd)
+{
+    int saved_errno = errno;
+    int capable = 0;
+    struct stat64 status;
+    struct guest_fd_object *object;
+    struct sockaddr_storage address;
+    socklen_t address_length = sizeof(address);
+    int type = 0;
+    socklen_t type_length = sizeof(type);
+
+    if (guest_fd_is_hidden(fd) || fstat64(fd, &status) != 0 ||
+            !S_ISSOCK(status.st_mode))
+        goto out;
+    object = guest_fd_acquire(fd);
+    if (object != 0) {
+        guest_fd_put(object);
+        goto out;
+    }
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) != 0 ||
+            (type != SOCK_STREAM && type != SOCK_DGRAM))
+        goto out;
+    memset(&address, 0, sizeof(address));
+    if (getsockname(fd, (struct sockaddr *)&address, &address_length) != 0 ||
+            address_length < offsetof(struct sockaddr, sa_family) +
+                sizeof(address.ss_family))
+        goto out;
+    capable = address.ss_family == AF_UNIX;
+out:
+    errno = saved_errno;
+    return capable;
 }
 
 static uint32_t socketcall_number(uint32_t call)

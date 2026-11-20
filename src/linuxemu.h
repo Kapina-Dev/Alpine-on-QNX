@@ -245,6 +245,9 @@ void linux_resource_note_exec(const uint32_t args[6]);
 void linux_resource_after_fork(void);
 int32_t linux_ioctl(int fd, uint32_t request, void *guest_argument);
 int32_t linux_socket_syscall(uint32_t number, uint32_t arguments[6]);
+/* 1 when fd is a host AF_UNIX socket, the only kind that gets async I/O
+   (FIOASYNC, O_ASYNC, F_SETOWN); else 0.  errno untouched (linux_socket.c). */
+int linux_socket_async_capable(int fd);
 int32_t linux_futex(uint32_t *address, uint32_t operation, uint32_t value,
     const void *guest_timeout, uint32_t *second_address, uint32_t bitset);
 int32_t linux_futex_wake(uint32_t *address, int count, uint32_t bitset);

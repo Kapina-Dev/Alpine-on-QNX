@@ -821,6 +821,14 @@ static int32_t linux_close_fd(int fd)
     return result;
 }
 
+/* Linux O_ASYNC (ARM EABI) and QNX's own value. */
+#define LINUX_O_ASYNC 0x00002000u
+#ifdef O_ASYNC
+#define HOST_O_ASYNC O_ASYNC
+#else
+#define HOST_O_ASYNC 0x10000
+#endif
+
 static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
 {
     int result;
@@ -848,18 +856,37 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     case 3:
         typed_status = guest_fd_dispatch_get_status(fd, &result);
         if (typed_status == 0) result = fcntl(fd, F_GETFL);
-        if (result >= 0) return (int32_t)linux_status_flags(result);
+        if (result >= 0)
+            return (int32_t)(linux_status_flags(result) |
+                ((result & HOST_O_ASYNC) != 0 ? LINUX_O_ASYNC : 0u));
         break;
     case 4: {
         int requested;
         int current;
+        int async_allowed = 0;
         typed_status = guest_fd_dispatch_get_status(fd, &current);
         if (typed_status == 0) current = fcntl(fd, F_GETFL);
         if (current < 0) return linux_host_result(current);
         if (linux_open_flags(argument & (0x00000400u | 0x00000800u),
                 &requested) != 0) return -EINVAL;
-        current &= ~(O_APPEND | O_NONBLOCK);
+        if ((argument & LINUX_O_ASYNC) != 0) {
+            /* Only AF_UNIX sockets (linux_socket_async_capable):
+               elsewhere QNX would never send SIGIO, or (AF_INET) would
+               send it to other processes.  Clearing it is fine. */
+            if (!linux_socket_async_capable(fd)) {
+                uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
+                arguments[0] = (uint32_t)fd;
+                arguments[1] = (uint32_t)command;
+                arguments[2] = argument;
+                return linux_report_unsupported(221, EINVAL,
+                    "async I/O (O_ASYNC) is only supported on AF_UNIX sockets",
+                    arguments);
+            }
+            async_allowed = 1;
+        }
+        current &= ~(O_APPEND | O_NONBLOCK | HOST_O_ASYNC);
         current |= requested & (O_APPEND | O_NONBLOCK);
+        if (async_allowed) current |= HOST_O_ASYNC;
         typed_status = guest_fd_dispatch_set_status(fd, current);
         result = typed_status == 0 ? fcntl(fd, F_SETFL, current) :
             typed_status > 0 ? 0 : -1;
@@ -909,14 +936,32 @@ static int32_t linux_fcntl64(int fd, int command, uint32_t argument)
     }
     case 8:
     case 9: {
-        /* F_SETOWN/F_GETOWN: QNX answers ENOSYS (measured on the device),
-           so there is nothing to forward; Linux EINVAL, reported. */
+        /* F_SETOWN/F_GETOWN: forwarded for AF_UNIX sockets only.
+           Guest pids are QNX pids and QNX's F_GETOWN returns exactly the
+           pid set, so nothing is translated.  QNX refuses a process-group
+           owner (negative: EOPNOTSUPP, and no signal); pipes and ptys
+           answer ENOSYS, and AF_INET is refused (io-pkt SIGIO leak): all
+           are Linux EINVAL, reported. */
         uint32_t arguments[6] = { 0, 0, 0, 0, 0, 0 };
         arguments[0] = (uint32_t)fd;
         arguments[1] = (uint32_t)command;
         arguments[2] = argument;
-        return linux_report_unsupported(221, EINVAL, "fcntl-owner",
-            arguments);
+        if (!linux_socket_async_capable(fd)) {
+            if (fcntl(fd, F_GETFD) < 0) return linux_host_result(-1);
+            return linux_report_unsupported(221, EINVAL,
+                "fcntl-owner: only AF_UNIX sockets support F_SETOWN", arguments);
+        }
+        if (command == 9) {
+            result = fcntl(fd, F_GETOWN);
+            break;
+        }
+        if ((int32_t)argument < 0)
+            return linux_report_unsupported(221, EINVAL,
+                "fcntl-owner: process-group owners are not supported",
+                arguments);
+        result = fcntl(fd, F_SETOWN, (int)argument);
+        if (result > 0) result = 0;
+        break;
     }
     case 1032:
     case 1031: {
