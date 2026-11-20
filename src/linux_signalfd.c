@@ -105,10 +105,10 @@
  * exec.  A signalfd without SFD_CLOEXEC travels in the fd records as
  * "shm:channel:" (eventfd's format); the mask is in the page, so the new
  * image rebuilds the object with its mask and gets a slot and a new
- * readiness channel; its collector starts lazily as after fork.  Signals pending at execve (the process
- * queue included) travel separately (guest_signal_exec_pending) and are
- * raised again process-directed at start-up, so that collector takes
- * them.
+ * readiness channel; its collector starts lazily as after fork.  Signals
+ * pending at execve (the process queue included) travel separately
+ * (guest_signal_exec_pending) and are raised again process-directed at
+ * start-up, so that collector takes them.
  *
  * SCM_RIGHTS.  Linux semantics: a received signalfd reads the receiving
  * process's signals.  The description's pipe write end and the page
@@ -266,7 +266,11 @@ static void *collector_main(void *argument)
 }
 
 /* Starts the collector once per process (signalfd_lock held).  It blocks
-   every signal; sigwaitinfo takes those in its set. */
+   every signal; sigwaitinfo takes those in its set.  The start is lazy,
+   from signalfd, read or poll inside the SIGILL dispatch: like
+   guest_fd_object_new, this pthread_create (which may allocate) is an
+   accepted exception to the no-malloc rule for dispatch paths; it runs
+   once per process, with every signal blocked around it. */
 static int collector_start(void)
 {
     pthread_attr_t attributes;
@@ -394,13 +398,16 @@ static void slot_release(int index)
     pthread_mutex_unlock(&signalfd_lock);
 }
 
-/* Reports a failure of the lazy start-up once per process (reads still
-   take what the kernel holds for the caller). */
-static void report_once(const char *detail, int fd)
+/* Reports a failure of the lazy start-up once per process and kind
+   (reads still take what the kernel holds for the caller).  Each kind
+   has its own flag, so one failure doesn't hide the other. */
+static volatile int reported_channel;
+static volatile int reported_collector;
+
+static void report_once(volatile int *reported, const char *detail, int fd)
 {
-    static volatile int reported;
     uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
-    if (__sync_lock_test_and_set(&reported, 1) != 0) return;
+    if (__sync_lock_test_and_set(reported, 1) != 0) return;
     args[0] = (uint32_t)fd;
     (void)linux_report_unsupported(355, linux_errno_number(errno), detail,
         args);
@@ -420,7 +427,7 @@ static struct signalfd_slot *slot_ready(struct signalfd_data *data, int fd)
         result = channel_make(slot);
         pthread_mutex_unlock(&signalfd_lock);
         if (result != 0) {
-            report_once("signalfd-channel", fd);
+            report_once(&reported_channel, "signalfd-channel", fd);
             return 0;
         }
     }
@@ -429,7 +436,8 @@ static struct signalfd_slot *slot_ready(struct signalfd_data *data, int fd)
         slot->generation = generation;
         linux_signalfd_collector_update();
     }
-    if (ensure_collector() != 0) report_once("signalfd-collector", fd);
+    if (ensure_collector() != 0)
+        report_once(&reported_collector, "signalfd-collector", fd);
     return slot;
 }
 

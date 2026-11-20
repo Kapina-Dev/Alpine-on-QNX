@@ -33,15 +33,18 @@
  * the spec is read under a seqlock (sequence) together with it, so a
  * total computed from a replaced arming never swaps into the new one.
  * Left: a catch_up whose swap won just before another process's settime
- * may still add that old arming's last few expirations after the
- * settime's reset (bounded by what the old arming produced).
+ * may still add the old arming's uncounted expirations (bounded by what
+ * it produced) after the settime's reset.
  *
  * Who fires.  Only the process that armed a timerfd (or an exec image that
  * inherited it armed) has its QNX timer, so poll/epoll readiness in a fork
  * child or an SCM_RIGHTS receiver comes from the arming process's pulses
  * and stops when that process exits (documented limit).  A blocking read
  * does not depend on it: it sleeps at most until the next expiration and
- * counts from the clock itself.
+ * counts from the clock itself.  The slot remembers which arming its QNX
+ * timer was set for; a pulse that finds the page disarmed or re-armed by
+ * another process re-arms (or stops) this process's timer from the page,
+ * so a stale periodic timer doesn't keep waking the manager.
  *
  * TFD_TIMER_CANCEL_ON_SET.  For an absolute CLOCK_REALTIME(_ALARM) arming
  * the page keeps the realtime - monotonic offset.  It is compared again
@@ -176,6 +179,7 @@ struct timer_slot {
     uint16_t generation;
     uint8_t in_use;
     uint8_t has_timer;
+    uint16_t arming;                /* WORD_ARMING the timer was set for */
     timer_t timer;
 };
 
@@ -237,10 +241,18 @@ static void arming_begin(struct timerfd_shared *shared)
     (void)__sync_fetch_and_or(&shared->sequence, 1u);
 }
 
+/* Always leaves the sequence even: (s | 1) + 1, not s + 1.  A writer
+   that stalled (SIGTSTP, a debugger) past SEQUENCE_SPINS was taken over
+   by another one whose end already made the sequence even; a plain +1
+   from the stalled writer would then make it odd for good, and every
+   snapshot and settime would wait out the full spin. */
 static void arming_end(struct timerfd_shared *shared)
 {
+    uint32_t sequence = *(volatile uint32_t *)&shared->sequence, seen;
     __sync_synchronize();
-    (void)__sync_fetch_and_add(&shared->sequence, 1u);
+    while ((seen = __sync_val_compare_and_swap(&shared->sequence, sequence,
+            (sequence | 1u) + 1u)) != sequence)
+        sequence = seen;
 }
 
 /* Expirations of the arming due at now (at most COUNT_MASK). */
@@ -378,11 +390,21 @@ static int host_arm(struct timer_slot *slot, int64_t delay, int64_t interval)
     return TimerSettime(slot->timer, 0, &setting, 0) == -1 ? -1 : 0;
 }
 
+/* Stops the slot's QNX timer whatever the page says. */
+static int host_disarm(struct timer_slot *slot)
+{
+    struct _itimer setting;
+    setting.nsec = 0;
+    setting.interval_nsec = 0;
+    return TimerSettime(slot->timer, 0, &setting, 0) == -1 ? -1 : 0;
+}
+
 static int slot_timer(int index);
 
-/* Arms the slot's QNX timer for the page's next expiration (lock held):
-   an exec image re-arming an inherited timerfd, or a realtime timer after
-   the clock was set (QNX timers are armed relative to now). */
+/* Sets the slot's QNX timer for the page's next expiration (lock held):
+   an exec image re-arming an inherited timerfd, a realtime timer after
+   the clock was set (QNX timers are armed relative to now), or a pulse
+   finding that another process disarmed or re-armed the timerfd. */
 static int rearm_from_page(int index)
 {
     struct timer_slot *slot = &slots[index];
@@ -390,14 +412,16 @@ static int rearm_from_page(int index)
     struct arming arming;
     int64_t now, delay;
     snapshot(shared, &arming);
-    if (!arming.armed) return 0;
+    slot->arming = (uint16_t)WORD_ARMING(arming.word);
+    if (!arming.armed)
+        return slot->has_timer ? host_disarm(slot) : 0;
     if (slot_timer(index) != 0) return -1;
     now = clock_now(shared->host_clock);
     if (now < arming.first_deadline) delay = arming.first_deadline - now;
     else if (arming.interval != 0)
         delay = arming.first_deadline + ((now - arming.first_deadline) /
             arming.interval + 1) * arming.interval - now;
-    else return 0;      /* a fired one-shot: catch_up counts it */
+    else return host_disarm(slot);  /* a fired one-shot: catch_up counts it */
     return host_arm(slot, delay, arming.interval);
 }
 
@@ -414,6 +438,15 @@ static void on_pulse(uint32_t value)
         check_clock_set(shared, slot->write_fd);
         catch_up(shared, slot->write_fd);
         snapshot(shared, &arming);
+        /* Disarmed or re-armed by another process (a fork child, an
+           SCM_RIGHTS receiver): this timer still runs the old spec, and a
+           short period would keep waking the manager for nothing. */
+        if (slot->has_timer && (!arming.armed ||
+                (uint16_t)WORD_ARMING(arming.word) != slot->arming)) {
+            (void)rearm_from_page((int)index);
+            pthread_mutex_unlock(&timer_lock);
+            return;
+        }
         /* A one-shot pulse that came before the deadline (QNX rounds to
            ticks, so it shouldn't) would leave a waiter asleep: re-arm. */
         if (arming.armed && arming.interval == 0 &&
@@ -462,7 +495,12 @@ static void *manager_main(void *argument)
 }
 
 /* Starts the manager once per process (lock held).  The thread blocks
-   every signal, so no guest or emulator signal is ever routed to it. */
+   every signal, so no guest or emulator signal is ever routed to it.
+   It starts lazily, from settime (or an exec restore) inside the SIGILL
+   dispatch: like guest_fd_object_new, this pthread_create (which may
+   allocate) is an accepted exception to the no-malloc rule for dispatch
+   paths; it runs once per process, under timer_lock, with every signal
+   blocked around it. */
 static int manager_start(void)
 {
     pthread_attr_t attributes;
@@ -889,6 +927,7 @@ int32_t linux_timerfd_settime(int fd, uint32_t flags, const void *new_spec,
         word = eventfd_atomic_load64(&shared->counted);
         store64(&shared->counted, ((WORD_ARMING(word) + 1) & 0xffffu) <<
             COUNT_BITS);
+        slot->arming = (uint16_t)((WORD_ARMING(word) + 1) & 0xffffu);
         if (cancel) store64(&shared->cancel_offset, (uint64_t)offset);
         (void)__sync_lock_test_and_set(&shared->cancelled, 0);
         __sync_synchronize();

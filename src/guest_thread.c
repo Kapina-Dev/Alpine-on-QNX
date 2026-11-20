@@ -566,6 +566,8 @@ static void process_queue_reset(void)
     memset(&process_queue, 0, sizeof(process_queue));
 }
 
+/* Spins with sched_yield: assumes the holder runs at an equal priority
+   (yield lets it run) or has a free core; it's held only briefly. */
 static void process_lock(void)
 {
     while (__sync_lock_test_and_set(&process_queue.lock, 1) != 0)

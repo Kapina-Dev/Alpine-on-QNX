@@ -1224,6 +1224,39 @@ void guest_signal_restore_pending(const char *value)
  * sleeps again.  A signal whose default action ends the process ends it
  * in the kernel, as before.
  */
+/* Without a signal-wait channel (the hidden range is full) rt_sigsuspend
+   falls back to the host sigsuspend, as before the channel existed.  A
+   signal raised in the kernel ends it, and so does the collector's poke
+   for one it routes or queues (the trap's return delivers it).  A signal
+   already queued that the temporary mask lets in ends it at once; one
+   queued between that check and the sleep (a poke landing just before
+   sigsuspend) waits for the next signal.  Reported once. */
+static int32_t suspend_without_channel(const sigset_t *host_set,
+    const uint32_t words[2], const uint32_t old_words[2], int wait_errno)
+{
+    static volatile int reported;
+    int saved_errno;
+    if (__sync_lock_test_and_set(&reported, 1) == 0) {
+        uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+        (void)linux_report_unsupported(179, linux_errno_number(wait_errno),
+            "sigsuspend-no-wait-channel", args);
+    }
+    guest_thread_signal_mask_set(words);
+    if (guest_thread_signal_ready()) {
+        guest_thread_signal_suspend_restore(old_words);
+        return -EINTR;
+    }
+    if (sigsuspend(host_set) != 0) {
+        saved_errno = errno;
+        if (saved_errno == EINTR)
+            guest_thread_signal_suspend_restore(old_words);
+        else guest_thread_signal_mask_set(old_words);
+        return -(int32_t)linux_errno_number(saved_errno);
+    }
+    guest_thread_signal_mask_set(old_words);
+    return 0;
+}
+
 int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size)
 {
     sigset_t host_set, host_old;
@@ -1236,7 +1269,8 @@ int32_t guest_signal_suspend(const void *guest_set, size_t signal_set_size)
     linux_set_to_host(words, &host_set);
     guest_thread_signal_mask_get(old_words);
     wait_fd = guest_thread_signal_wait_begin();
-    if (wait_fd < 0) return -(int32_t)linux_errno_number(errno);
+    if (wait_fd < 0)
+        return suspend_without_channel(&host_set, words, old_words, errno);
     if (pthread_sigmask(SIG_SETMASK, &host_set, &host_old) != 0) {
         saved_errno = errno;
         guest_thread_signal_wait_end();
