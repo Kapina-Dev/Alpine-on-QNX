@@ -3,7 +3,7 @@
  * Prints one name=value line per finding; lines starting with '#' are
  * supporting detail. Every wait is bounded; alarm() is a last-resort guard.
  *
- * Usage: phase3c-probes [qnx6-dir] [shmem-dir]
+ * Usage: phase3c-probes [qnx6-dir] [shmem-dir] [more|special]
  *   defaults: ./inotify-probe.d and /dev/shmem/inotify-probe.d
  *
  * Findings:
@@ -20,6 +20,10 @@
  *   ionotify_dir             ionotify() on a directory fd
  *   dir_mtime_resolution     st_mtime granularity on the qnx6 dir
  *   scan_cost_us             readdir+lstat cost for a 1000-entry directory
+ *   special_fifo, special_socket   (third argument "special") add_watch on
+ *                            a FIFO and on a bound unix socket's path: does
+ *                            it return promptly (3 s alarm), and do events
+ *                            arrive (FIFO write: MODIFY; chmod: ATTRIB)?
  */
 #define _QNX_SOURCE 1
 #include <dirent.h>
@@ -35,8 +39,10 @@
 #include <sys/ioctl.h>
 #include <sys/iomsg.h>
 #include <sys/neutrino.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -608,6 +614,71 @@ static void probe_more(const char *dir)
     rm_tree(dir);
 }
 
+/* add_watch on a special file, bounded by a 3 s interrupting alarm; when
+ * it succeeds, poke the file and report the events. */
+static void probe_special_one(const char *tag, const char *path, int is_fifo)
+{
+    struct sigaction sa, old;
+    long long t0;
+    int fd, wd, saved;
+    fd = p_init();
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_alarm_noop;
+    sigaction(SIGALRM, &sa, &old);
+    alarm(3);
+    t0 = now_us();
+    errno = 0;
+    wd = p_add(fd, path, IN_MODIFY | IN_ATTRIB | IN_OPEN | IN_CLOSE_WRITE |
+                             IN_CLOSE_NOWRITE);
+    saved = errno;
+    alarm(0);
+    sigaction(SIGALRM, &old, NULL);
+    alarm(180);
+    printf("special_%s=add:%d errno:%d waited_ms:%lld", tag, wd,
+           wd < 0 ? saved : 0, (now_us() - t0) / 1000);
+    if (wd >= 0) {
+        if (is_fifo) {
+            int f = open(path, O_RDWR | O_NONBLOCK);
+            if (f >= 0) {
+                write(f, "x", 1);
+                close(f);
+            }
+        }
+        chmod(path, 0600);
+        printf(" %s", drain(fd, 1000));
+    }
+    printf("\n");
+    close(fd);
+}
+
+static void probe_special(const char *dir)
+{
+    char a[1100];
+    struct sockaddr_un sun;
+    int s;
+    rm_tree(dir);
+    mkdir(dir, 0755);
+    snprintf(a, sizeof(a), "%s/fifo", dir);
+    if (mkfifo(a, 0644) != 0)
+        printf("special_fifo=mkfifo_fail errno:%d\n", errno);
+    else
+        probe_special_one("fifo", a, 1);
+    snprintf(a, sizeof(a), "%s/sock", dir);
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", a);
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0 || bind(s, (struct sockaddr *)&sun, SUN_LEN(&sun)) != 0) {
+        printf("special_socket=bind_fail errno:%d\n", errno);
+    } else {
+        listen(s, 1);
+        probe_special_one("socket", a, 0);
+    }
+    if (s >= 0)
+        close(s);
+    rm_tree(dir);
+}
+
 static void probe_ionotify(const char *dir)
 {
     int fd = open(dir, O_RDONLY);
@@ -688,6 +759,22 @@ int main(int argc, char **argv)
             return 1;
         snprintf(extra, sizeof(extra), "%s.more", qnx6_dir);
         probe_more(extra);
+        printf("probe_done=1\n");
+        return 0;
+    }
+
+    if (argc > 3 && strcmp(argv[3], "special") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        signal(SIGALRM, alarm_handler);
+        alarm(180);
+        p_init = (int (*)(void))dlsym(RTLD_DEFAULT, "inotify_init");
+        p_add = (int (*)(int, const char *, uint32_t))dlsym(
+            RTLD_DEFAULT, "inotify_add_watch");
+        p_rm = (int (*)(int, int32_t))dlsym(RTLD_DEFAULT, "inotify_rm_watch");
+        if (!p_init || !p_add || !p_rm)
+            return 1;
+        snprintf(extra, sizeof(extra), "%s.special", qnx6_dir);
+        probe_special(extra);
         printf("probe_done=1\n");
         return 0;
     }

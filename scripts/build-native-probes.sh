@@ -71,7 +71,7 @@ set -x
 "$cc" $common_flags -o "$build_dir/phase3b-probes" \
     "$project_dir/native-probes/phase3b-probes.c"
 "$cc" $common_flags -o "$build_dir/phase3c-probes" \
-    "$project_dir/native-probes/phase3c-probes.c"
+    "$project_dir/native-probes/phase3c-probes.c" -lsocket
 "$cc" $common_flags -o "$build_dir/phase3c-facts" \
     "$project_dir/native-probes/phase3c-facts.c" -lsocket
 "$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \

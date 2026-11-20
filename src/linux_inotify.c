@@ -16,10 +16,11 @@
  *     guest's cwd, through guest symlinks, or to the link itself with
  *     IN_DONT_FOLLOW) to a host path before the native call;
  *   - Linux's errors where QNX differs: a mask without event bits and
- *     IN_MASK_CREATE are EINVAL; a device node (never passed to QNX,
- *     where some ptys block the call) and a filesystem without change
- *     notification (native ENOTTY: /dev/shmem, /proc) are EOPNOTSUPP with
- *     a diagnostic; a bad path pointer is EFAULT;
+ *     IN_MASK_ADD|IN_MASK_CREATE are EINVAL, IN_MASK_CREATE alone EINVAL
+ *     with a diagnostic; a device node, FIFO or socket (never passed to
+ *     QNX, where FIFOs and some ptys block the call) and a filesystem
+ *     without change notification (native ENOTTY: /dev/shmem, /proc) are
+ *     EOPNOTSUPP with a diagnostic; a bad path pointer is EFAULT;
  *   - read: a nonblocking read of an empty queue returns 0 natively, which
  *     Linux never does: it becomes EAGAIN;
  *   - dup, fork and exec: the native fd carries the queue; the object is
@@ -80,7 +81,6 @@ static int32_t inotify_read(struct guest_fd_object *object, int fd,
     (void)object;
     /* QNX: 0 for an empty queue on a nonblocking description. */
     if (result == 0) result = -1, errno = EAGAIN;
-    linux_epoll_note_io(fd);
     return result < 0 ? linux_error(errno) : (int32_t)result;
 }
 
@@ -152,7 +152,9 @@ fail:
 }
 
 /* The guest's inotify fd: EBADF for a closed or hidden number, EINVAL for
-   any other kind of fd.  1 when it is one. */
+   any other kind of fd.  1 when it is one.  A number with no object but
+   /dev/fsnotify's identity (its exec record was dropped, or the identity
+   was unknown when it arrived) gets its object here. */
 static int32_t check_inotify_fd(int fd)
 {
     struct guest_fd_object *object;
@@ -162,6 +164,9 @@ static int32_t check_inotify_fd(int fd)
     object = guest_fd_acquire(fd);
     is_inotify = object != 0 &&
         guest_fd_object_type(object) == GUEST_FD_INOTIFY;
+    if (object == 0 && linux_inotify_is_native(fd) &&
+            linux_inotify_attach(fd) == 0)
+        is_inotify = 1;
     guest_fd_put(object);
     return is_inotify ? 1 : linux_error(EINVAL);
 }
@@ -194,16 +199,22 @@ static int32_t check_guest_string(const char *path)
     }
 }
 
-/* EOPNOTSUPP with a diagnostic note. */
-static int32_t unsupported(int fd, const char *guest_path, uint32_t mask,
-    const char *detail)
+/* A Linux error (EOPNOTSUPP unless given) with a diagnostic note. */
+static int32_t unsupported_error(int fd, const char *guest_path,
+    uint32_t mask, int host_errno, const char *detail)
 {
     uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
     args[0] = (uint32_t)fd;
     args[1] = (uint32_t)(uintptr_t)guest_path;
     args[2] = mask;
     return linux_report_unsupported(LINUX_NR_INOTIFY_ADD_WATCH,
-        (int32_t)linux_errno_number(EOPNOTSUPP), detail, args);
+        (int32_t)linux_errno_number(host_errno), detail, args);
+}
+
+static int32_t unsupported(int fd, const char *guest_path, uint32_t mask,
+    const char *detail)
+{
+    return unsupported_error(fd, guest_path, mask, EOPNOTSUPP, detail);
 }
 
 int32_t linux_inotify_add_watch(int fd, const char *guest_path, uint32_t mask)
@@ -214,27 +225,37 @@ int32_t linux_inotify_add_watch(int fd, const char *guest_path, uint32_t mask)
     int wd;
     /* Linux's order: the mask, the fd, then the path. */
     if ((mask & LINUX_IN_ALL_EVENTS) == 0 ||
-            (mask & LINUX_IN_MASK_CREATE) != 0)
+            (mask & (LINUX_IN_MASK_CREATE | LINUX_IN_MASK_ADD)) ==
+            (LINUX_IN_MASK_CREATE | LINUX_IN_MASK_ADD))
         return linux_error(EINVAL);
     checked = check_inotify_fd(fd);
     if (checked < 0) return checked;
     checked = check_guest_string(guest_path);
     if (checked < 0) return checked;
+    /* IN_MASK_CREATE alone (Linux 4.18+: fail if the inode already has a
+       watch) has no QNX counterpart: EINVAL with a diagnostic. */
+    if ((mask & LINUX_IN_MASK_CREATE) != 0)
+        return unsupported_error(fd, guest_path, mask, EINVAL,
+            "inotify: IN_MASK_CREATE unsupported");
     if (((mask & LINUX_IN_DONT_FOLLOW) != 0 ?
             guest_path_resolve_nofollow(guest_path, host_path,
                 sizeof(host_path)) :
             guest_path_resolve(guest_path, 0, host_path,
                 sizeof(host_path))) != 0)
         return linux_error(errno);
-    /* Device nodes never reach the native call: on some ptys
-       (/dev/ttyp1, /dev/ttyp5) it blocks until a signal arrives (FINDINGS
-       2026-11-20), and the others give ENOTTY anyway. */
+    /* Device nodes, FIFOs and sockets never reach the native call: on
+       some ptys (/dev/ttyp1, /dev/ttyp5) and on a FIFO it blocks until
+       a signal arrives (FINDINGS 2026-11-20), and the others (and a bound
+       unix socket's path) give ENOTTY. */
     if (((mask & LINUX_IN_DONT_FOLLOW) != 0 ? lstat64(host_path, &status) :
             stat64(host_path, &status)) != 0)
         return linux_error(errno);
     if (S_ISCHR(status.st_mode) || S_ISBLK(status.st_mode))
         return unsupported(fd, guest_path, mask,
             "inotify: device nodes cannot be watched on QNX");
+    if (S_ISFIFO(status.st_mode) || S_ISSOCK(status.st_mode))
+        return unsupported(fd, guest_path, mask,
+            "inotify: FIFOs and sockets cannot be watched on QNX");
     wd = inotify_add_watch(fd, host_path, mask & INOTIFY_PASSED_BITS);
     if (wd >= 0) return wd;
     if (errno == ENOTTY)

@@ -48,6 +48,9 @@
  *      fresh pty from /dev/ptmx) fails EOPNOTSUPP promptly: device nodes
  *      never reach QNX's call, which blocks on some ptys; "skip 29" when
  *      no pty is reachable
+ *   30 a watch on a FIFO and on a bound unix socket's path (both under
+ *      /tmp/inb-dir) fails EOPNOTSUPP promptly: QNX's call blocks on a
+ *      FIFO until a signal arrives, and gives ENOTTY on a socket
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -62,8 +65,10 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -676,6 +681,37 @@ static int check_pty(void)
     return result;
 }
 
+static int check_fifo_socket(void)
+{
+    struct sockaddr_un address;
+    int fd = inotify_init1(IN_NONBLOCK), sock, result;
+    if (fd < 0) return fail(30, "inotify_init1");
+    if (mkfifo(DIR_PATH "/fifo", 0644) != 0) {
+        close(fd);
+        return fail(30, "mkfifo");
+    }
+    result = expect_error(30, inotify_add_watch(fd, DIR_PATH "/fifo",
+        IN_ATTRIB), EOPNOTSUPP, "watch on a FIFO");
+    if (result != 0) goto done;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), DIR_PATH "/sock");
+    sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0 || bind(sock, (struct sockaddr *)&address,
+            sizeof(address)) != 0) {
+        result = fail(30, "bind unix socket");
+    } else {
+        result = expect_error(30, inotify_add_watch(fd, DIR_PATH "/sock",
+            IN_ATTRIB), EOPNOTSUPP, "watch on a socket");
+    }
+    if (sock >= 0) close(sock);
+    unlink(DIR_PATH "/sock");
+done:
+    unlink(DIR_PATH "/fifo");
+    close(fd);
+    return result;
+}
+
 static int run(void)
 {
     int result, fd;
@@ -720,7 +756,9 @@ static int run(void)
     arm(28);
     if ((result = check_device()) != 0) return result;
     arm(29);
-    return check_pty();
+    if ((result = check_pty()) != 0) return result;
+    arm(30);
+    return check_fifo_socket();
 }
 
 int main(void)
