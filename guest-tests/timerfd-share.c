@@ -75,7 +75,8 @@
 #define MS 1000000LL
 #define SECOND 1000000000LL
 
-struct spec32 { int32_t value_sec, value_nsec, interval_sec, interval_nsec; };
+/* Linux struct itimerspec: it_interval, then it_value. */
+struct spec32 { int32_t interval_sec, interval_nsec, value_sec, value_nsec; };
 
 static volatile int current_check;
 static volatile int watchdog_ticks;     /* 100 ms ticks since arm() */

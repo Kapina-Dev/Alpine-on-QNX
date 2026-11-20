@@ -36,6 +36,9 @@
  *      absolute CLOCK_REALTIME deadline of 2040-01-01 (time64) is armed,
  *      gettime reports > 0, and nothing fires within 50 ms
  *   22 the time64 calls (410/411) behave as 353/354 for checks 12 and 15
+ *   23 musl's timerfd_settime/timerfd_gettime with struct itimerspec
+ *      (it_interval first): a one-shot 50 ms fires once and gettime
+ *      reports the value as it_value and a zero it_interval
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,6 +53,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -64,8 +68,9 @@
 #define TFD_SET_TICKS 0x40085400u
 #define MS 1000000LL
 
-struct spec32 { int32_t value_sec, value_nsec, interval_sec, interval_nsec; };
-struct spec64 { int64_t value_sec, value_nsec, interval_sec, interval_nsec; };
+/* Linux struct itimerspec: it_interval, then it_value. */
+struct spec32 { int32_t interval_sec, interval_nsec, value_sec, value_nsec; };
+struct spec64 { int64_t interval_sec, interval_nsec, value_sec, value_nsec; };
 
 static volatile int current_check;
 static volatile int watchdog_ticks;     /* 100 ms ticks since arm() */
@@ -232,6 +237,38 @@ static int check_oneshot(int check, int time64)
     if (!read_eagain(fd)) return fail(check, "second read not EAGAIN");
     sleep_ms(60);
     if (!read_eagain(fd)) return fail(check, "one-shot fired again");
+    close(fd);
+    return 0;
+}
+
+/* Check 23: libc's own layout, not this file's spec32/spec64. */
+static int check_libc_layout(void)
+{
+    struct itimerspec spec, now;
+    uint64_t count = 0;
+    int fd = tfd_create(1, TFD_NONBLOCK_FLAG);
+    if (fd < 0) return fail(10, "timerfd_create");
+    memset(&spec, 0, sizeof(spec));
+    spec.it_value.tv_nsec = 50 * MS;
+    if (timerfd_settime(fd, 0, &spec, 0) != 0)
+        return fail(23, "timerfd_settime one-shot 50 ms");
+    memset(&now, 0x55, sizeof(now));
+    if (timerfd_gettime(fd, &now) != 0) return fail(23, "timerfd_gettime");
+    if (now.it_value.tv_sec != 0 || now.it_value.tv_nsec <= 0 ||
+            now.it_value.tv_nsec > 50 * MS || now.it_interval.tv_sec != 0 ||
+            now.it_interval.tv_nsec != 0) {
+        fprintf(stderr, "value %lld.%09ld interval %lld.%09ld\n",
+            (long long)now.it_value.tv_sec, now.it_value.tv_nsec,
+            (long long)now.it_interval.tv_sec, now.it_interval.tv_nsec);
+        return fail(23, "gettime not value <= 50 ms, interval 0");
+    }
+    sleep_ms(80);
+    if (!read_count(fd, &count) || count != 1) {
+        fprintf(stderr, "count %llu\n", (unsigned long long)count);
+        return fail(23, "one-shot 50 ms did not fire once by 80 ms");
+    }
+    sleep_ms(60);
+    if (!read_eagain(fd)) return fail(23, "one-shot fired again");
     close(fd);
     return 0;
 }
@@ -550,5 +587,7 @@ int main(void)
     arm(22);
     if ((result = check_oneshot(22, 1)) != 0) return result;
     if ((result = check_gettime(22, 1)) != 0) return result;
+    arm(23);
+    if ((result = check_libc_layout()) != 0) return result;
     return 0;
 }

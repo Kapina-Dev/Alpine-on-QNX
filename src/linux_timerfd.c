@@ -807,9 +807,12 @@ int32_t linux_timerfd_create(int32_t clock, uint32_t flags)
     return fds[0];
 }
 
-/* The guest itimerspec: two {sec, nsec} pairs, 32- or 64-bit fields.  A
+/* The guest itimerspec: two {sec, nsec} pairs, 32- or 64-bit fields,
+   it_interval first and it_value second (Linux uapi order); ns[0] is the
+   value and ns[1] the interval, so pair i sits at position 1 - i.  A
    time64 tv_nsec keeps only its low 32 bits, as Linux's get_timespec64
    does for 32-bit tasks (the upper half is padding). */
+#define SPEC_PAIR(i) (1 - (i))
 static int load_spec(const void *address, int time64, int64_t ns[2])
 {
     int i;
@@ -818,12 +821,14 @@ static int load_spec(const void *address, int time64, int64_t ns[2])
         int64_t seconds, nanoseconds;
         if (time64) {
             int64_t fields[2];
-            memcpy(fields, (const char *)address + 16 * i, sizeof(fields));
+            memcpy(fields, (const char *)address + 16 * SPEC_PAIR(i),
+                sizeof(fields));
             seconds = fields[0];
             nanoseconds = (int32_t)(uint32_t)(uint64_t)fields[1];
         } else {
             int32_t fields[2];
-            memcpy(fields, (const char *)address + 8 * i, sizeof(fields));
+            memcpy(fields, (const char *)address + 8 * SPEC_PAIR(i),
+                sizeof(fields));
             seconds = fields[0];
             nanoseconds = fields[1];
         }
@@ -845,12 +850,14 @@ static void store_spec(void *address, int time64, const int64_t ns[2])
             int64_t fields[2];
             fields[0] = seconds;
             fields[1] = nanoseconds;
-            memcpy((char *)address + 16 * i, fields, sizeof(fields));
+            memcpy((char *)address + 16 * SPEC_PAIR(i), fields,
+                sizeof(fields));
         } else {
             int32_t fields[2];
             fields[0] = seconds > INT32_MAX ? INT32_MAX : (int32_t)seconds;
             fields[1] = (int32_t)nanoseconds;
-            memcpy((char *)address + 8 * i, fields, sizeof(fields));
+            memcpy((char *)address + 8 * SPEC_PAIR(i), fields,
+                sizeof(fields));
         }
     }
 }
