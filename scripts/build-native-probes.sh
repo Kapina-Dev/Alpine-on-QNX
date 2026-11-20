@@ -74,6 +74,8 @@ set -x
     "$project_dir/native-probes/phase3c-probes.c" -lsocket
 "$cc" $common_flags -o "$build_dir/phase3c-facts" \
     "$project_dir/native-probes/phase3c-facts.c" -lsocket
+"$cc" $common_flags -o "$build_dir/phase3d-sigio" \
+    "$project_dir/native-probes/phase3d-sigio.c" -lsocket
 "$cc" $common_flags -std=gnu99 -marm -I"$project_dir/src" \
     -o "$project_dir/build/linuxemu" "$project_dir"/src/*.c -lsocket
 "$cc" $common_flags -std=gnu99 -marm -DLINUXEMU_TESTING=1 \
@@ -126,6 +128,7 @@ set +x
 "$sdk_root/bin/readelf" -h "$build_dir/phase3b-probes"
 "$sdk_root/bin/readelf" -h "$build_dir/phase3c-probes"
 "$sdk_root/bin/readelf" -h "$build_dir/phase3c-facts"
+"$sdk_root/bin/readelf" -h "$build_dir/phase3d-sigio"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu"
 "$sdk_root/bin/readelf" -h "$project_dir/build/linuxemu-loader-test"
 "$sdk_root/bin/readelf" -h "$project_dir/build/elf-fixture-tool"

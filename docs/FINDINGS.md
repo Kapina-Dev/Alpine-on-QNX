@@ -1190,3 +1190,49 @@ Passport (QNX 8.0.0), ordinary user, core `13eac1ec…` (`phase3c-inotify` at
   7 against 0 of 5), Python's start-up has no inotify use, and the part 3
   code on its path is one `stat` of `/dev/fsnotify` at start-up. The
   cause is not isolated yet.
+
+## 2026-11-20 — QNX socket async I/O (Phase 3 part 4 probe)
+
+Device: BlackBerry Passport (QNX 8.0.0 kernel string, 10.3.1 SDK), ordinary
+user. Probe: `native-probes/phase3d-sigio.c` (`build/native-probes/phase3d-sigio`).
+Each case runs in its own forked child with a 3 s alarm; `si_fd` does not exist
+in QNX `siginfo_t`, so the signal's `si_signo`/`si_code`/`si_value` are
+recorded. QNX headers do not define `FIOASYNC`; the probe uses the BSD value
+`0x8004667d` (`_IOW('f', 125, int)`), which the QNX socket stack accepted.
+QNX `O_ASYNC` is `0x10000`. Native pids are large (about 7.7e8).
+
+| Case | FIOASYNC | F_SETOWN(getpid) | F_GETOWN | F_GETFL O_ASYNC | peer event delivers SIGIO |
+| --- | --- | --- | --- | --- | --- |
+| AF_UNIX SOCK_STREAM | 0 | 0 | pid | 1 | yes (22, code 0, value 0) |
+| AF_UNIX SOCK_DGRAM | 0 | 0 | pid | 1 | yes |
+| TCP loopback (accepted end) | 0 | 0 | pid | 1 | yes |
+| TCP listening (pending connect) | 0 | 0 | pid | 1 | yes |
+| UDP loopback | 0 | 0 | pid | 1 | yes |
+| pty master | 0 | -1 ENOSYS | -1 ENOSYS | 0 | no |
+| pipe | 0 | -1 ENOSYS | -1 ENOSYS | 0 | no |
+
+Allow-list (QNX really delivers SIGIO): AF_UNIX stream and dgram, AF_INET
+stream (connected and listening) and dgram. Not on the list: pty masters and
+pipes (FIOASYNC returns 0 but no signal, and F_SETOWN fails), which is
+the "accepting async I/O that will not signal" case Linuxemu must refuse.
+All socket families tested are in; no AF_INET6 or other families were probed.
+
+Further answers, all on AF_UNIX SOCK_STREAM:
+
+| Question | Result |
+| --- | --- |
+| `F_SETFL` with `O_ASYNC` alone (no FIOASYNC) | returns 0, `F_GETFL` shows 0x10000, a peer write then signals (with `F_SETOWN`) |
+| Turning it off (`FIOASYNC` 0) | returns 0, flag clears, the next peer write does not signal |
+| Owner form | `F_GETOWN` returns exactly the pid given to `F_SETOWN` |
+| `F_SETOWN(-getpgrp())` | fails, `EOPNOTSUPP` (103); `F_GETOWN` then reads 0; a peer write does not signal. No process-group owner |
+| Peer close | delivers SIGIO (22) |
+| fork | the child sees the same owner (the parent's pid) and the flag set; a peer write by the child signals the parent |
+| exec after fork | the exec'd child still sees owner = parent pid and the flag set |
+| exec in place (pid kept) | owner = own pid and the flag survive `execv`; a peer write after exec delivers SIGIO to the new image once it installs its handler |
+| Which thread | with another thread blocked in `read`, the handler ran on that blocked thread, not the main thread (the process is signalled and QNX picks a thread without the signal blocked) |
+
+Consequences for Task 2: pass `FIOASYNC`, `F_SETFL O_ASYNC`, `F_SETOWN` and
+`F_GETOWN` straight to QNX for sockets only; refuse non-sockets and a negative
+(process-group) owner with a Linux error and a diagnostic; Linux `F_SETOWN`
+owners are guest pids and the QNX owner is the native pid, so the owner given
+to QNX must be the native pid of the target (own pid at minimum).
