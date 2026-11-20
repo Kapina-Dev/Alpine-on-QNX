@@ -190,7 +190,9 @@ void guest_signal_acting_mask(uint32_t words[2]);
    ignores them. */
 void guest_signal_drop_ignored(const uint32_t unblocked[2]);
 /* execve: writes LINUXEMU_GUEST_PENDING=... for the signals pending now
-   (1), or nothing (0); the new image raises them again at start-up. */
+   (1), or nothing (0); the new image raises them again at start-up
+   (process-directed for the process's, thread-directed for the calling
+   thread's queue). */
 int guest_signal_exec_pending(char *buffer, size_t size);
 void guest_signal_restore_pending(const char *value);
 /* Installs the handler of the host signal the collector pokes a guest
@@ -414,6 +416,8 @@ int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
    exists).  Async-signal-safe. */
 void linux_signalfd_collector_update(void);
 void linux_signalfd_after_fork(void);
+/* Registers the signalfd exec-record restore and SCM_RIGHTS receive. */
+void linux_signalfd_register(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);

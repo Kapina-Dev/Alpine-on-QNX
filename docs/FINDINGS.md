@@ -1040,3 +1040,8 @@ programs).
   probe, which no longer unblocks anything Linuxemu started with. One
   instance each: sender details, `sigqueue` values and real-time counts
   are lost.
+- **Task 6:** the carry keeps two sets. Signals pending for the process
+  (host `sigpending`, which on QNX doesn't separate thread from process,
+  and the process queue) are raised again with `kill(getpid())`, so the
+  new image's signalfd collector can take them; signals only in the
+  calling thread's queue are raised at the main thread.

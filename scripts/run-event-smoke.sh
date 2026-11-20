@@ -53,6 +53,7 @@ run_rootfs_fixture timerfd-basic
 run_rootfs_fixture timerfd-share
 run_rootfs_fixture signalfd-basic
 run_rootfs_fixture signalfd-semantics
+run_rootfs_fixture signalfd-share
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"

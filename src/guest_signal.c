@@ -1126,18 +1126,33 @@ void guest_signal_apply_frame_mask(siginfo_t *trap_information)
  * native probe: a blocked SIGUSR1, pending before execve, was gone in the
  * new image whether sent with kill or pthread_kill; FINDINGS 2026-11-20).
  * So the exec carries the Linux numbers of every signal pending for the
- * calling thread (the host's own pending set, its queue, the process
- * queue) in LINUXEMU_GUEST_PENDING, and the new image raises each one
- * again at start-up, after the frame probe, while the inherited blocked
- * set still holds it.  One instance each: sender details, sigqueue
- * values and real-time counts are lost (documented).
+ * calling thread in LINUXEMU_GUEST_PENDING as two sets, and the new image
+ * raises each one again at start-up, before the frame probe (which never
+ * unblocks a signal blocked at start-up), while the inherited blocked set
+ * still holds it:
+ *   - process-directed (kill(getpid())): the host's own pending set and
+ *     the process queue (the collector's).  Process-directed so the new
+ *     image's collector, and so its signalfds, can take them.  QNX's
+ *     sigpending doesn't tell a signal pending for the thread from one
+ *     pending for the process, so a host thread-directed one also comes
+ *     back process-directed; the new image has one thread then, which
+ *     still gets it (a thread made later could get it instead: a
+ *     documented difference).
+ *   - thread-directed (pthread_kill to the main thread): the calling
+ *     thread's own queue, minus the above; on Linux they stay pending for
+ *     that thread, which is the new image's main thread.
+ * One instance each: sender details, sigqueue values and real-time counts
+ * are lost (documented).  Format "P0,P1,T0,T1" (hex Linux set words).
  */
 #define PENDING_VARIABLE "LINUXEMU_GUEST_PENDING="
+
+/* Never SIGILL, SIGKILL, SIGSEGV or SIGSTOP. */
+#define NOT_CARRIED_WORD0 ((1u << 3) | (1u << 8) | (1u << 10) | (1u << 18))
 
 int guest_signal_exec_pending(char *buffer, size_t size)
 {
     sigset_t host;
-    uint32_t words[2] = { 0, 0 }, queued[2];
+    uint32_t process[2] = { 0, 0 }, thread[2], queued[2];
     int host_signal;
     if (sigpending(&host) == 0)
         for (host_signal = 1; host_signal <= SIGRTMAX; ++host_signal) {
@@ -1145,41 +1160,55 @@ int guest_signal_exec_pending(char *buffer, size_t size)
             if (sigismember(&host, host_signal) != 1) continue;
             linux_signal = guest_signal_from_host(host_signal);
             if (linux_signal > 0 && linux_signal <= LINUX_SIGNAL_COUNT)
-                words[(linux_signal - 1) / 32] |=
+                process[(linux_signal - 1) / 32] |=
                     1u << ((linux_signal - 1) % 32);
         }
-    guest_thread_pending_mask(queued);
-    words[0] |= queued[0];
-    words[1] |= queued[1];
     guest_process_pending_mask(queued, 1);
-    words[0] |= queued[0];
-    words[1] |= queued[1];
-    /* Never SIGILL, SIGKILL, SIGSEGV or SIGSTOP. */
-    words[0] &= ~((1u << 3) | (1u << 8) | (1u << 10) | (1u << 18));
-    if ((words[0] | words[1]) == 0) return 0;
-    snprintf(buffer, size, PENDING_VARIABLE "%08x,%08x", (unsigned)words[0],
-        (unsigned)words[1]);
+    process[0] |= queued[0];
+    process[1] |= queued[1];
+    guest_thread_pending_mask(thread);
+    thread[0] &= ~process[0];
+    thread[1] &= ~process[1];
+    process[0] &= ~NOT_CARRIED_WORD0;
+    thread[0] &= ~NOT_CARRIED_WORD0;
+    if ((process[0] | process[1] | thread[0] | thread[1]) == 0) return 0;
+    snprintf(buffer, size, PENDING_VARIABLE "%08x,%08x,%08x,%08x",
+        (unsigned)process[0], (unsigned)process[1], (unsigned)thread[0],
+        (unsigned)thread[1]);
     return 1;
 }
 
-void guest_signal_restore_pending(const char *value)
+static void raise_set(const uint32_t words[2], int process_directed)
 {
-    uint32_t words[2];
-    char *end;
+    pid_t self = getpid();
     int linux_signal;
-    if (value == 0 || value[0] == '\0') return;
-    words[0] = (uint32_t)strtoul(value, &end, 16);
-    if (*end != ',') return;
-    words[1] = (uint32_t)strtoul(end + 1, &end, 16);
-    if (*end != '\0') return;
-    words[0] &= ~((1u << 3) | (1u << 8) | (1u << 10) | (1u << 18));
     for (linux_signal = 1; linux_signal <= LINUX_SIGNAL_COUNT; ++linux_signal) {
         int host_signal;
         if ((words[(linux_signal - 1) / 32] &
                 (1u << ((linux_signal - 1) % 32))) == 0) continue;
         host_signal = linux_signal_to_host(linux_signal);
-        if (host_signal != 0) (void)pthread_kill(pthread_self(), host_signal);
+        if (host_signal == 0) continue;
+        if (process_directed) (void)kill(self, host_signal);
+        else (void)pthread_kill(pthread_self(), host_signal);
     }
+}
+
+void guest_signal_restore_pending(const char *value)
+{
+    uint32_t words[4];
+    const char *cursor = value;
+    char *end;
+    int index;
+    if (value == 0 || value[0] == '\0') return;
+    for (index = 0; index < 4; ++index) {
+        words[index] = (uint32_t)strtoul(cursor, &end, 16);
+        if (end == cursor || *end != (index == 3 ? '\0' : ',')) return;
+        cursor = end + 1;
+    }
+    words[0] &= ~NOT_CARRIED_WORD0;
+    words[2] &= ~NOT_CARRIED_WORD0;
+    raise_set(words, 1);
+    raise_set(words + 2, 0);
 }
 
 /*

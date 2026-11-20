@@ -20,7 +20,7 @@ static char fd_records_variable[32768];
 static char personality_variable[48];
 static char comm_variable[48];
 static char nice_variable[48];
-static char pending_variable[64];
+static char pending_variable[80];
 static char diagnostics_variable[PATH_MAX + 32];
 static char executable_variable[PATH_MAX + 32];
 static char guest_executable_path[PATH_MAX];

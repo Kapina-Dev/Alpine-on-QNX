@@ -991,6 +991,7 @@ void linux_syscall_register_fd_types(void)
 {
     linux_eventfd_register();
     linux_timerfd_register();
+    linux_signalfd_register();
     linux_epoll_register();
 }
 

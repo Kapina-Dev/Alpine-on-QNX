@@ -82,8 +82,29 @@
  * every thread that has it unblocked, so none sleeps through a signal
  * Linux would deliver.
  *
- * Not yet (Task 6): fork restart, exec records and SCM_RIGHTS (until then
- * a signalfd crosses exec and SCM_RIGHTS as a plain pipe).
+ * fork.  The child keeps its signalfds (slots, pages, channels) but has
+ * no collector and an empty process queue (guest_thread_after_fork), as
+ * Linux passes no pending signal to a child.  Its collector starts lazily
+ * on the first signalfd call, read or readiness check (poll, select,
+ * epoll) of a signalfd.  The channel and page stay shared with the
+ * parent, as the open-file description is on Linux: one process's
+ * collector can raise the shared channel for a signal only it can read,
+ * which the other sees as a spurious wake-up (its read finds nothing:
+ * EAGAIN, or a blocking read sleeps again).
+ *
+ * exec.  A signalfd without SFD_CLOEXEC travels in the fd records as
+ * "shm:channel:" (eventfd's format); the mask is in the page, so the new
+ * image rebuilds the object with its mask and gets a slot; its collector
+ * starts lazily as after fork.  Signals pending at execve (the process
+ * queue included) travel separately (guest_signal_exec_pending) and are
+ * raised again process-directed at start-up, so that collector takes
+ * them.
+ *
+ * SCM_RIGHTS.  Linux semantics: a received signalfd reads the receiving
+ * process's signals.  The channel write end and the page travel as
+ * companions (as eventfd's); the receiver maps the page (mask shared with
+ * the sender, as one open-file description) and takes a slot, so its own
+ * collector serves it.
  */
 #include "linuxemu.h"
 #include "guest_fd.h"
@@ -94,8 +115,10 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -263,8 +286,8 @@ void linux_signalfd_collector_update(void)
 
 /* The parent's collector doesn't exist in a fork child, and the lock may
    have been held by a parent thread.  The child's signalfds keep their
-   slots; the next signalfd call or read starts the child's collector
-   (Task 6 completes fork). */
+   slots; the next signalfd call, read or readiness check starts the
+   child's collector. */
 void linux_signalfd_after_fork(void)
 {
     pthread_mutex_init(&signalfd_lock, 0);
@@ -452,19 +475,46 @@ static void signalfd_release(struct guest_fd_object *object)
 
 /* POLLRDNORM (Linux POLLIN) while a signal in the mask waits in the
    calling thread's queue or the process queue, so a lost channel byte
-   can't hide one; never writable, as on Linux. */
+   can't hide one; never writable, as on Linux.  Every guest wait checks
+   here before sleeping, so this is where a fork child's or a new image's
+   collector starts when the program only polls. */
 static short signalfd_ready_now(struct guest_fd_object *object, int fd)
 {
     struct signalfd_data *data = guest_fd_object_data(object);
     uint32_t mask[2];
     (void)fd;
+    (void)ensure_collector();
     load_mask(data->shared, mask);
     return has_pending(mask) ? POLLRDNORM : 0;
 }
 
+/* Exec record body "shm:channel:" (two hidden fds), as eventfd's. */
+static int signalfd_serialize(struct guest_fd_object *object, int fd,
+    char *buffer, size_t size)
+{
+    struct signalfd_data *data = guest_fd_object_data(object);
+    int length = snprintf(buffer, size, "%d:%d:", data->shm_fd,
+        data->write_fd);
+    (void)fd;
+    return length < 0 || (size_t)length >= size ? -1 : length;
+}
+
+/* SCM_RIGHTS companions: the channel write end, then the shm page. */
+static int signalfd_companions(struct guest_fd_object *object, int fd,
+    int *out, int max)
+{
+    struct signalfd_data *data = guest_fd_object_data(object);
+    (void)fd;
+    if (max < 2 || data->write_fd < 0 || data->shm_fd < 0) return -1;
+    out[0] = data->write_fd;
+    out[1] = data->shm_fd;
+    return 2;
+}
+
 static const struct guest_fd_ops signalfd_ops = {
     signalfd_read, signalfd_write, signalfd_poll_fd, signalfd_get_status,
-    signalfd_set_status, signalfd_release, 0, signalfd_ready_now, 0
+    signalfd_set_status, signalfd_release, signalfd_serialize,
+    signalfd_ready_now, signalfd_companions
 };
 
 /* Wraps a channel read end, write end, shm fd and its mapping (all the
@@ -577,4 +627,53 @@ int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
     linux_signalfd_collector_update();
     if (has_pending(words)) raise_ready(shared, fds[1]);
     return fds[0];
+}
+
+/* Exec: the record "shm:channel:" names the page (with the mask) and the
+   channel write end; fd is the channel read end, which survived exec.
+   Runs at start-up, before the carried signals are raised again; the
+   collector starts lazily. */
+static int signalfd_restore(int fd, int hidden_fd, int second_hidden_fd,
+    const char *host_path)
+{
+    void *page;
+    (void)host_path;
+    if (hidden_fd < 0 || second_hidden_fd < 0) return -1;
+    page = eventfd_map_page(hidden_fd);
+    if (page == 0) return -1;
+    return attach_object(fd, second_hidden_fd, hidden_fd, page);
+}
+
+/* A signalfd received from another process: fd is the channel read end,
+   the companions the channel write end and the shm page.  It reads this
+   process's signals (Linux semantics): the slot puts its mask into this
+   process's collector union. */
+static int signalfd_receive(int fd, const int *companions, int count)
+{
+    struct stat64 status;
+    int write_fd, shm_fd;
+    void *page;
+    if (count != 2 || fstat64(companions[1], &status) != 0 ||
+            status.st_size < EVENTFD_PAGE) return -1;
+    write_fd = eventfd_hidden_copy(companions[0]);
+    if (write_fd < 0) return -1;
+    shm_fd = eventfd_hidden_copy(companions[1]);
+    if (shm_fd < 0) {
+        close(write_fd);
+        return -1;
+    }
+    page = eventfd_map_page(shm_fd);
+    if (page == 0 || attach_object(fd, write_fd, shm_fd, page) != 0) {
+        close(write_fd);
+        close(shm_fd);
+        return -1;
+    }
+    linux_signalfd_collector_update();
+    return 0;
+}
+
+void linux_signalfd_register(void)
+{
+    guest_fd_register_restore(GUEST_FD_SIGNALFD, signalfd_restore);
+    guest_fd_register_receive(GUEST_FD_SIGNALFD, signalfd_receive);
 }
