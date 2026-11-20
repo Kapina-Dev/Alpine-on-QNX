@@ -418,6 +418,25 @@ void linux_signalfd_collector_update(void);
 void linux_signalfd_after_fork(void);
 /* Registers the signalfd exec-record restore and SCM_RIGHTS receive. */
 void linux_signalfd_register(void);
+/* inotify (linux_inotify.c) on QNX's native inotify: inotify_init (316,
+   flags 0) and inotify_init1 (360), inotify_add_watch (317),
+   inotify_rm_watch (318).  The guest fd, a watch descriptor or 0, or a
+   negative Linux errno. */
+int32_t linux_inotify_init(uint32_t linux_flags);
+int32_t linux_inotify_add_watch(int fd, const char *guest_path,
+    uint32_t mask);
+int32_t linux_inotify_rm_watch(int fd, int32_t wd);
+/* 1 when fd is a native inotify fd (fstat64 matches /dev/fsnotify's
+   st_dev/st_ino, recorded at registration), else 0. */
+int linux_inotify_is_native(int fd);
+/* Attaches a fresh inotify object to fd: 0, or -1 with errno. */
+int linux_inotify_attach(int fd);
+/* readv on an inotify fd (native readv; an empty nonblocking queue is
+   -EAGAIN): 1 with *result set, or 0 when fd is no inotify fd. */
+int linux_inotify_readv(int fd, const struct iovec *vectors, int count,
+    int32_t *result);
+/* Records /dev/fsnotify's identity. */
+void linux_inotify_register(void);
 /* epoll_create (250) passes 0 after checking size > 0; epoll_create1
    (357) passes its flags.  The guest fd or a negative Linux errno. */
 int32_t linux_epoll_create(uint32_t linux_flags);

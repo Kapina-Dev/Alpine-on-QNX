@@ -152,6 +152,10 @@
 #define LINUX_NR_TIMERFD_GETTIME 354
 #define LINUX_NR_TIMERFD_GETTIME64 410
 #define LINUX_NR_TIMERFD_SETTIME64 411
+#define LINUX_NR_INOTIFY_INIT 316
+#define LINUX_NR_INOTIFY_ADD_WATCH 317
+#define LINUX_NR_INOTIFY_RM_WATCH 318
+#define LINUX_NR_INOTIFY_INIT1 360
 #define LINUX_NR_EVENTFD2 356
 #define LINUX_NR_PSELECT6 335
 #define LINUX_NR_PPOLL 336
@@ -385,6 +389,8 @@ static int typed_vector_io(int fd, const struct iovec *vectors, int count,
     int index, handled;
 
     if (!guest_fd_is_typed(fd)) return 0;
+    if (!writing && linux_inotify_readv(fd, vectors, count, result))
+        return 1;
     if (count < 0 || count > 1024) { *result = -EINVAL; return 1; }
     for (index = 0; index != count && length != sizeof(buffer); ++index) {
         part = vectors[index].iov_len;
@@ -992,6 +998,7 @@ void linux_syscall_register_fd_types(void)
     linux_eventfd_register();
     linux_timerfd_register();
     linux_signalfd_register();
+    linux_inotify_register();
     linux_epoll_register();
 }
 
@@ -2167,6 +2174,21 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_EVENTFD2:
         result = linux_eventfd_create(context->uc_mcontext.cpu.gpr[0],
             context->uc_mcontext.cpu.gpr[1]);
+        break;
+    case LINUX_NR_INOTIFY_INIT:
+        result = linux_inotify_init(0);
+        break;
+    case LINUX_NR_INOTIFY_INIT1:
+        result = linux_inotify_init(context->uc_mcontext.cpu.gpr[0]);
+        break;
+    case LINUX_NR_INOTIFY_ADD_WATCH:
+        result = linux_inotify_add_watch((int)context->uc_mcontext.cpu.gpr[0],
+            (const char *)context->uc_mcontext.cpu.gpr[1],
+            context->uc_mcontext.cpu.gpr[2]);
+        break;
+    case LINUX_NR_INOTIFY_RM_WATCH:
+        result = linux_inotify_rm_watch((int)context->uc_mcontext.cpu.gpr[0],
+            (int32_t)context->uc_mcontext.cpu.gpr[1]);
         break;
     case LINUX_NR_TIMERFD_CREATE:
         result = linux_timerfd_create((int32_t)context->uc_mcontext.cpu.gpr[0],

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Phase 3 event objects: eventfd, epoll, timerfd and signalfd guest fixtures.
+# Phase 3 event objects: eventfd, epoll, timerfd, signalfd and inotify guest
+# fixtures.
 set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -54,6 +55,7 @@ run_rootfs_fixture timerfd-share
 run_rootfs_fixture signalfd-basic
 run_rootfs_fixture signalfd-semantics
 run_rootfs_fixture signalfd-share
+run_rootfs_fixture inotify-basic
 run_guest wake-eventfd-dup
 
 echo "linuxemu_event_smoke_failures=$failures"
