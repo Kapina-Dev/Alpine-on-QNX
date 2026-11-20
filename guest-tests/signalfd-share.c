@@ -16,8 +16,9 @@
  *      itself makes the idle signalfd poll readable in the child (its
  *      collector starts on that first poll) and is read there with the
  *      child's pid; then the child's read of the first signalfd fails
- *      EAGAIN (a child's process queue starts empty); afterwards the
- *      parent still reads its own SIGUSR1 once
+ *      EAGAIN (a child's process queue starts empty); afterwards select
+ *      shows the parent's signalfd readable and the parent still reads
+ *      its own SIGUSR1 once
  *   12 exec: a fork child makes a signalfd for SIGUSR1 without
  *      SFD_CLOEXEC and execs this fixture; in the new image the fd is
  *      still a signalfd with the SIGUSR1 mask: after SIGUSR2 and SIGUSR1
@@ -36,6 +37,14 @@
  *      with SIGUSR1, the child polls the received fd readable and reads
  *      SIGUSR1 with the parent's pid, and the parent's own signalfd
  *      reads nothing
+ *   15 a shared signalfd keeps each process's wake-up: a fork child
+ *      spins non-blocking reads of the inherited signalfd (each empty
+ *      read settles the readiness) while the parent, 2000 times, enters
+ *      poll(s + 600 idle pipe fds, 1000 ms) and a helper thread sends the
+ *      parent SIGUSR1 at a varying point of that entry or sleep (the idle
+ *      fds widen the entry); every poll must return
+ *      readable and the read return SIGUSR1 (a wake-up drained by the
+ *      child times out)
  *
  * Exit codes of a fork child or exec'd image (printed by the parent):
  * 2 mask wrong, 3 exec failed, 4-9 the step that failed (see the code).
@@ -52,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -156,6 +166,16 @@ static int wait_collected(int fd)
     return poll(&entry, 1, 2000) == 1 && (entry.revents & POLLIN) != 0;
 }
 
+/* select (not poll) shows the signalfd readable within 2 s. */
+static int select_readable(int fd)
+{
+    struct timeval timeout = { 2, 0 };
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    return select(fd + 1, &set, 0, 0, &timeout) == 1 && FD_ISSET(fd, &set);
+}
+
 static int both_blocked(void)
 {
     sigset_t set;
@@ -208,6 +228,8 @@ static int fork_child(void)
         return child_failed(11, status, "child read the parent's signal "
             "or not its own (4: read the parent's, 6: no readiness, 7: "
             "wrong record, 8: read twice)");
+    if (!select_readable(s))
+        return fail(11, "select doesn't show the parent's SIGUSR1");
     if (!read_one(s, &record) || record.ssi_signo != SIGUSR1 ||
             record.ssi_pid != (uint32_t)parent)
         return fail(11, "parent's collected SIGUSR1 lost after fork");
@@ -369,13 +391,99 @@ static int check_rights(void)
     return 0;
 }
 
+#define SHARED_ROUNDS 2000
+#define SHARED_FILLERS 600
+
+static volatile int kick_request, kick_stop, kick_spin;
+
+/* Sends the parent SIGUSR1 after each request, after a spin that grows
+   each round, so the signal lands at every point of the main thread's
+   way into poll and while it sleeps there. */
+static void *kicker(void *argument)
+{
+    (void)argument;
+    while (!kick_stop) {
+        volatile int spin;
+        if (!kick_request) continue;
+        for (spin = 0; spin < kick_spin; ++spin) {}
+        kill(getpid(), SIGUSR1);
+        kick_request = 0;
+        __sync_synchronize();
+    }
+    return 0;
+}
+
+static int check_shared_wakeup(void)
+{
+    static struct pollfd entries[1 + SHARED_FILLERS];
+    struct record record;
+    pthread_t thread;
+    int s = sfd(-1, bit(SIGUSR1), SFD_NONBLOCK_FLAG), round, result = 0;
+    int idle[2], i;
+    pid_t child;
+    if (s < 0 || pipe(idle) != 0) return fail(10, "signalfd or pipe");
+    /* s first, then idle fds: Linuxemu checks s's readiness first and
+       the rest before the host poll sleeps, which widens the window in
+       which a wake-up can be taken away. */
+    entries[0].fd = s;
+    for (i = 1; i <= SHARED_FILLERS; ++i) {
+        entries[i].fd = i == 1 ? idle[0] : dup(idle[0]);
+        if (entries[i].fd < 0) return fail(10, "dup");
+    }
+    child = fork();
+    if (child < 0) return fail(10, "fork");
+    if (child == 0) {
+        alarm(20);
+        for (;;) (void)read_eagain(s);
+    }
+    kick_request = 0;
+    kick_stop = 0;
+    if (pthread_create(&thread, 0, kicker, 0) != 0) {
+        kill(child, SIGKILL);
+        waitpid(child, 0, 0);
+        return fail(10, "pthread_create");
+    }
+    sleep_ms(50);
+    for (round = 0; round < SHARED_ROUNDS && result == 0; ++round) {
+        int polled;
+        kick_spin = (round % 250) * 80;
+        kick_request = 1;
+        __sync_synchronize();
+        for (i = 0; i <= SHARED_FILLERS; ++i) {
+            entries[i].events = POLLIN;
+            entries[i].revents = 0;
+        }
+        polled = poll(entries, 1 + SHARED_FILLERS, 1000);
+        while (kick_request) sleep_ms(1);
+        if (polled != 1 || (entries[0].revents & POLLIN) == 0) {
+            fprintf(stderr, "signalfd-share: round %d poll returned %d\n",
+                round, polled);
+            result = fail(15, "parent's wake-up lost to the child's read");
+        } else if (!read_one(s, &record) || record.ssi_signo != SIGUSR1) {
+            sleep_ms(50);
+            if (!read_one(s, &record) || record.ssi_signo != SIGUSR1)
+                result = fail(15, "readable but SIGUSR1 not read");
+        }
+        watchdog_ticks = 0;
+    }
+    kick_stop = 1;
+    pthread_join(thread, 0);
+    kill(child, SIGKILL);
+    waitpid(child, 0, 0);
+    for (i = 1; i <= SHARED_FILLERS; ++i) close(entries[i].fd);
+    close(idle[1]);
+    close(s);
+    return result;
+}
+
 static int run_check(int check, const char *self)
 {
     switch (check) {
     case 11: return fork_child();
     case 12: return exec_check(12, self);
     case 13: return exec_check(13, self);
-    default: return check_rights();
+    case 14: return check_rights();
+    default: return check_shared_wakeup();
     }
 }
 
@@ -399,7 +507,7 @@ int main(int argc, char **argv)
     action.sa_handler = on_usr1;
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGUSR1, &action, 0) != 0) return fail(10, "sigaction");
-    for (check = 11; check <= 14; ++check) {
+    for (check = 11; check <= 15; ++check) {
         if (only != 0 && check != only) continue;
         arm(check);
         if ((result = run_check(check, argv[0])) != 0) return result;

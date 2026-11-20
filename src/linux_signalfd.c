@@ -38,13 +38,20 @@
  * a slot wakes the collector when it finishes.  Nothing is dropped; the
  * kernel's own queue limit makes sigqueue fail EAGAIN, as on Linux.
  *
- * Object.  The guest's fd is the read end of a pipe (the readiness
- * channel); the state lives in one page of unnamed shm whose start is a
- * struct eventfd_shared, so the readiness byte follows part 1's protocol
- * through the exported helpers (the counter is a "maybe pending" hint
- * here).  After it: the signalfd's Linux mask (shared by every fd of the
- * open-file description, as on Linux).  SIGKILL and SIGSTOP are dropped
- * from it silently, as on Linux.
+ * Object.  The open-file description is a page of unnamed shm (the
+ * Linux mask, a mask generation and O_NONBLOCK; shared by every fd and
+ * every process holding it, as on Linux) and a pipe whose read end is the
+ * guest's fd; that pipe never carries data, it gives the description its
+ * identity and travels through exec records and SCM_RIGHTS.  SIGKILL and
+ * SIGSTOP are dropped from the mask silently, as on Linux.
+ *
+ * Readiness is per process, because what a signalfd reads (the reader's
+ * own queues) is: each process holding the signalfd has its own hidden
+ * pipe and a private struct eventfd_shared in its slot, kept by part 1's
+ * protocol through the exported helpers (the counter is a "maybe
+ * pending" hint).  poll, select and epoll wait on that pipe (poll_fd).
+ * One shared channel would let one process's empty read drain the byte
+ * another process's collector wrote for it, losing that wake-up.
  *
  * read.  Fills as many 128-byte struct signalfd_siginfo records as fit
  * (EINVAL below 128 bytes), taking signals in the mask from the calling
@@ -67,8 +74,9 @@
  * once the collector has run.
  *
  * Locking.  signalfd_lock guards the slot table and the collector start.
- * It is a leaf: under it only lock-free counter helpers, pipe writes and
- * pthread_create run.  The collector takes it to compute the union and to
+ * It is a leaf: under it only lock-free counter helpers, pipe writes, the
+ * making of a readiness pipe (pipe, fcntl, close) and pthread_create
+ * run.  The collector takes it to compute the union and to
  * raise readiness, never together with thread_registry_lock or the
  * process queue's lock.
  *
@@ -82,29 +90,31 @@
  * every thread that has it unblocked, so none sleeps through a signal
  * Linux would deliver.
  *
- * fork.  The child keeps its signalfds (slots, pages, channels) but has
- * no collector and an empty process queue (guest_thread_after_fork), as
- * Linux passes no pending signal to a child.  Its collector starts lazily
- * on the first signalfd call, read or readiness check (poll, select,
- * epoll) of a signalfd.  The channel and page stay shared with the
- * parent, as the open-file description is on Linux: one process's
- * collector can raise the shared channel for a signal only it can read,
- * which the other sees as a spurious wake-up (its read finds nothing:
- * EAGAIN, or a blocking read sleeps again).
+ * fork.  The child keeps its signalfds (slots, pages) but has no
+ * collector, no readiness channels (its copies of the parent's are
+ * closed) and an empty process queue (guest_thread_after_fork), as Linux
+ * passes no pending signal to a child.  Its channel is made and its
+ * collector started lazily, on the first signalfd call, read or readiness
+ * check (poll, select, epoll) of a signalfd.
+ *
+ * A mask change wakes the changing process's collector at once; another
+ * process holding the description reloads at its next read or readiness
+ * check (the generation moved).  One asleep in a wait meanwhile keeps
+ * collecting the old set until then (documented limit).
  *
  * exec.  A signalfd without SFD_CLOEXEC travels in the fd records as
  * "shm:channel:" (eventfd's format); the mask is in the page, so the new
- * image rebuilds the object with its mask and gets a slot; its collector
- * starts lazily as after fork.  Signals pending at execve (the process
+ * image rebuilds the object with its mask and gets a slot and a new
+ * readiness channel; its collector starts lazily as after fork.  Signals pending at execve (the process
  * queue included) travel separately (guest_signal_exec_pending) and are
  * raised again process-directed at start-up, so that collector takes
  * them.
  *
  * SCM_RIGHTS.  Linux semantics: a received signalfd reads the receiving
- * process's signals.  The channel write end and the page travel as
- * companions (as eventfd's); the receiver maps the page (mask shared with
- * the sender, as one open-file description) and takes a slot, so its own
- * collector serves it.
+ * process's signals.  The description's pipe write end and the page
+ * travel as companions (as eventfd's); the receiver maps the page (mask
+ * shared with the sender, as one open-file description) and takes a slot
+ * with its own readiness channel, so its own collector serves it.
  */
 #include "linuxemu.h"
 #include "guest_fd.h"
@@ -136,23 +146,33 @@
 /* QNX's last signal: one of the top eight, always masked. */
 #define COLLECTOR_WAKE (SIGRTMAX + 8)
 
+/* The open-file description, shared by every process holding it.  Only
+   event.nonblock is used of the event part (readiness is per process,
+   in the slot). */
 struct signalfd_shared {
     struct eventfd_shared event;    /* first: the 8-byte aligned counter */
     uint32_t mask[2];               /* Linux signal set */
+    uint32_t generation;            /* bumped by every mask change */
 };
 
-/* Per process.  The guest's fd (the channel read end) is passed to every
-   op. */
+/* Per process.  The guest's fd (the read end of the description's pipe,
+   which never carries data) is passed to every op. */
 struct signalfd_data {
     struct signalfd_shared *shared;
-    int write_fd;
+    int write_fd;                   /* that pipe's write end (records) */
     int shm_fd;
     int slot;
 };
 
+/* Per process and signalfd: this process's readiness channel.  A fork
+   child's inherited copies are closed (linux_signalfd_after_fork) and it
+   makes its own on first use; an exec'd image makes one at restore. */
 struct signalfd_slot {
+    struct eventfd_shared ready;    /* first: the 8-byte aligned hint */
     struct signalfd_shared *shared;
-    int write_fd;
+    int channel[2];                 /* hidden pipe: read end, write end */
+    int has_channel;
+    uint32_t generation;            /* the mask generation last seen */
     int in_use;
 };
 
@@ -170,11 +190,13 @@ static void load_mask(struct signalfd_shared *shared, uint32_t mask[2])
     mask[1] = words[1];
 }
 
-/* Raises the channel (the counter is only a hint: 1 = maybe pending). */
-static void raise_ready(struct signalfd_shared *shared, int write_fd)
+/* Raises this process's channel for the slot (the counter is only a
+   hint: 1 = maybe pending). */
+static void raise_ready(struct signalfd_slot *slot)
 {
-    if (eventfd_counter_load(&shared->event) == 0)
-        (void)eventfd_counter_add(&shared->event, write_fd, 1);
+    if (!slot->has_channel) return;
+    if (eventfd_counter_load(&slot->ready) == 0)
+        (void)eventfd_counter_add(&slot->ready, slot->channel[1], 1);
 }
 
 /* A signal in mask waits in the calling thread's queue or (unrouted) in
@@ -213,8 +235,7 @@ static void raise_matching(int linux_signal)
         uint32_t mask[2];
         if (!slots[index].in_use) continue;
         load_mask(slots[index].shared, mask);
-        if ((mask[word] & bit) != 0)
-            raise_ready(slots[index].shared, slots[index].write_fd);
+        if ((mask[word] & bit) != 0) raise_ready(&slots[index]);
     }
     pthread_mutex_unlock(&signalfd_lock);
 }
@@ -284,26 +305,77 @@ void linux_signalfd_collector_update(void)
     if (collector_started) (void)pthread_kill(collector_thread, COLLECTOR_WAKE);
 }
 
+static void channel_close(struct signalfd_slot *slot)
+{
+    if (!slot->has_channel) return;
+    close(slot->channel[0]);
+    close(slot->channel[1]);
+    slot->has_channel = 0;
+}
+
 /* The parent's collector doesn't exist in a fork child, and the lock may
    have been held by a parent thread.  The child's signalfds keep their
-   slots; the next signalfd call, read or readiness check starts the
-   child's collector. */
+   slots but not the parent's readiness channels (those copies are
+   closed: a read here must never drain the parent's wake-up); the next
+   signalfd call, read or readiness check makes the child's channel and
+   starts its collector. */
 void linux_signalfd_after_fork(void)
 {
+    int index;
     pthread_mutex_init(&signalfd_lock, 0);
     collector_started = 0;
     collector_armed[0] = collector_armed[1] = 0;
+    for (index = 0; index < SIGNALFD_SLOTS; ++index)
+        channel_close(&slots[index]);
 }
 
-static int slot_take(struct signalfd_shared *shared, int write_fd)
+/* Makes this process's readiness channel for the slot (signalfd_lock
+   held; only pipe, fcntl and close run).  0, or -1 with errno. */
+static int channel_make(struct signalfd_slot *slot)
+{
+    int fds[2], index, saved_errno;
+    if (slot->has_channel) return 0;
+    if (pipe(fds) != 0) return -1;
+    for (index = 0; index < 2; ++index) {
+        int flags = fcntl(fds[index], F_GETFL), hidden;
+        if (flags < 0 ||
+                fcntl(fds[index], F_SETFL, flags | O_NONBLOCK) != 0)
+            goto fail;
+        hidden = guest_fd_hide(fds[index]);
+        if (hidden < 0) {
+            if (errno == EINVAL) errno = EMFILE;
+            goto fail;
+        }
+        fds[index] = hidden;
+    }
+    memset(&slot->ready, 0, sizeof(slot->ready));
+    slot->channel[0] = fds[0];
+    slot->channel[1] = fds[1];
+    __sync_synchronize();
+    slot->has_channel = 1;
+    return 0;
+fail:
+    saved_errno = errno;
+    close(fds[0]);
+    close(fds[1]);
+    errno = saved_errno;
+    return -1;
+}
+
+static int slot_take(struct signalfd_shared *shared)
 {
     int index;
     pthread_mutex_lock(&signalfd_lock);
     for (index = 0; index < SIGNALFD_SLOTS; ++index) {
         if (slots[index].in_use) continue;
+        slots[index].has_channel = 0;
+        if (channel_make(&slots[index]) != 0) {
+            pthread_mutex_unlock(&signalfd_lock);
+            return -1;
+        }
         slots[index].in_use = 1;
         slots[index].shared = shared;
-        slots[index].write_fd = write_fd;
+        slots[index].generation = shared->generation;
         pthread_mutex_unlock(&signalfd_lock);
         return index;
     }
@@ -316,10 +388,49 @@ static void slot_release(int index)
 {
     if (index < 0) return;
     pthread_mutex_lock(&signalfd_lock);
+    channel_close(&slots[index]);
     slots[index].in_use = 0;
     slots[index].shared = 0;
-    slots[index].write_fd = -1;
     pthread_mutex_unlock(&signalfd_lock);
+}
+
+/* Reports a failure of the lazy start-up once per process (reads still
+   take what the kernel holds for the caller). */
+static void report_once(const char *detail, int fd)
+{
+    static volatile int reported;
+    uint32_t args[6] = { 0, 0, 0, 0, 0, 0 };
+    if (__sync_lock_test_and_set(&reported, 1) != 0) return;
+    args[0] = (uint32_t)fd;
+    (void)linux_report_unsupported(355, linux_errno_number(errno), detail,
+        args);
+}
+
+/* Before any use in this process: the readiness channel (a fork child
+   makes its own), a collector wake-up when another process changed the
+   mask since this one last looked, and the collector itself.  The slot,
+   or 0 when the channel can't be made (errno). */
+static struct signalfd_slot *slot_ready(struct signalfd_data *data, int fd)
+{
+    struct signalfd_slot *slot = &slots[data->slot];
+    uint32_t generation;
+    if (!slot->has_channel) {
+        int result;
+        pthread_mutex_lock(&signalfd_lock);
+        result = channel_make(slot);
+        pthread_mutex_unlock(&signalfd_lock);
+        if (result != 0) {
+            report_once("signalfd-channel", fd);
+            return 0;
+        }
+    }
+    generation = *(volatile uint32_t *)&data->shared->generation;
+    if (slot->generation != generation) {
+        slot->generation = generation;
+        linux_signalfd_collector_update();
+    }
+    if (ensure_collector() != 0) report_once("signalfd-collector", fd);
+    return slot;
 }
 
 /* A signal in words still pending in the QNX kernel for the calling
@@ -394,23 +505,28 @@ static int collect_records(const uint32_t mask[2], unsigned char *buffer,
     return (int)count;
 }
 
-/* After a read: drop the readiness byte, then raise it again when a
-   signal in the mask is still queued.  The take comes before the check,
-   so a signal the collector queues meanwhile is either seen by the check
-   or raises the channel after the take. */
-static void settle(struct signalfd_data *data, int fd, const uint32_t mask[2])
+/* After a read: drop this process's readiness byte, then raise it again
+   when a signal in the mask is still queued.  The take comes before the
+   check, so a signal the collector queues meanwhile is either seen by
+   the check or raises the channel after the take.  The channel is this
+   process's alone, so nothing here can take another process's
+   wake-up. */
+static void settle(struct signalfd_slot *slot, const uint32_t mask[2])
 {
-    (void)eventfd_counter_take(&data->shared->event, data->write_fd, fd);
-    if (has_pending(mask)) raise_ready(data->shared, data->write_fd);
+    (void)eventfd_counter_take(&slot->ready, slot->channel[1],
+        slot->channel[0]);
+    if (has_pending(mask)) raise_ready(slot);
 }
 
 static int32_t signalfd_read(struct guest_fd_object *object, int fd,
     void *buffer, size_t length)
 {
     struct signalfd_data *data = guest_fd_object_data(object);
+    struct signalfd_slot *slot;
     size_t capacity = length / SIGNALFD_RECORD;
     if (capacity == 0) return -(int32_t)linux_errno_number(EINVAL);
-    if (ensure_collector() != 0) return -(int32_t)linux_errno_number(errno);
+    slot = slot_ready(data, fd);
+    if (slot == 0) return -(int32_t)linux_errno_number(errno);
     for (;;) {
         uint32_t mask[2];
         int32_t waited;
@@ -418,12 +534,12 @@ static int32_t signalfd_read(struct guest_fd_object *object, int fd,
         load_mask(data->shared, mask);
         count = collect_records(mask, buffer, capacity, &freed);
         if (freed) linux_signalfd_collector_update();
-        settle(data, fd, mask);
+        settle(slot, mask);
         if (count > 0) return (int32_t)(count * SIGNALFD_RECORD);
         if (has_pending(mask)) continue;
         if (data->shared->event.nonblock)
             return -(int32_t)linux_errno_number(EAGAIN);
-        waited = eventfd_wait_readable(&data->shared->event, fd,
+        waited = eventfd_wait_readable(&slot->ready, slot->channel[0],
             SIGNALFD_READ_SLICE_MS);
         if (waited == 0 && !eventfd_still_attached(object, fd))
             waited = -(int32_t)linux_errno_number(EBADF);
@@ -438,10 +554,12 @@ static int32_t signalfd_write(struct guest_fd_object *object, int fd,
     return -(int32_t)linux_errno_number(EINVAL);
 }
 
+/* poll, select and epoll wait on this process's channel, not on the
+   guest's fd (whose pipe never carries data). */
 static int signalfd_poll_fd(struct guest_fd_object *object, int fd)
 {
-    (void)object;
-    return fd;
+    struct signalfd_slot *slot = slot_ready(guest_fd_object_data(object), fd);
+    return slot == 0 ? fd : slot->channel[0];
 }
 
 static int signalfd_get_status(struct guest_fd_object *object, int fd)
@@ -482,8 +600,7 @@ static short signalfd_ready_now(struct guest_fd_object *object, int fd)
 {
     struct signalfd_data *data = guest_fd_object_data(object);
     uint32_t mask[2];
-    (void)fd;
-    (void)ensure_collector();
+    (void)slot_ready(data, fd);
     load_mask(data->shared, mask);
     return has_pending(mask) ? POLLRDNORM : 0;
 }
@@ -519,13 +636,14 @@ static const struct guest_fd_ops signalfd_ops = {
 
 /* Wraps a channel read end, write end, shm fd and its mapping (all the
    caller's until success) into an object attached to read_fd, with a
-   slot.  On failure the mapping is gone and the fds are still the
-   caller's.  0, or -1 with errno. */
+   slot (and this process's readiness channel).  On failure the mapping
+   is gone and the fds are still the caller's.  The slot index, or -1
+   with errno. */
 static int attach_object(int read_fd, int write_fd, int shm_fd, void *page)
 {
     struct guest_fd_object *object;
     struct signalfd_data *data;
-    int slot = slot_take(page, write_fd), saved_errno;
+    int slot = slot_take(page), saved_errno;
     if (slot < 0) {
         saved_errno = errno;
         munmap(page, EVENTFD_PAGE);
@@ -557,11 +675,17 @@ static int attach_object(int read_fd, int write_fd, int shm_fd, void *page)
         return -1;
     }
     guest_fd_put(object);
-    return 0;
+    return slot;
 }
 
 /* signalfd(fd, mask, size) with fd an existing signalfd: replace its
-   mask (every fd of that open-file description sees it). */
+   mask (every fd of that open-file description sees it).  This process's
+   collector is woken now; another process holding the same description
+   reloads the union at its next read or readiness check of it
+   (slot_ready sees the generation move).  Until then (it is asleep in a
+   wait) its collector keeps the old set: a newly added signal reaches
+   its read (from the kernel) but no wake-up; a removed one is still
+   collected there (documented limit). */
 static int32_t update_mask(int fd, const uint32_t words[2])
 {
     struct guest_fd_object *object;
@@ -577,11 +701,15 @@ static int32_t update_mask(int fd, const uint32_t words[2])
     pthread_mutex_lock(&signalfd_lock);
     data->shared->mask[0] = words[0];
     data->shared->mask[1] = words[1];
-    __sync_synchronize();
+    slots[data->slot].generation =
+        __sync_add_and_fetch(&data->shared->generation, 1u);
     (void)collector_start();
     pthread_mutex_unlock(&signalfd_lock);
     linux_signalfd_collector_update();
-    if (has_pending(words)) raise_ready(data->shared, data->write_fd);
+    {
+        struct signalfd_slot *slot = slot_ready(data, fd);
+        if (slot != 0 && has_pending(words)) raise_ready(slot);
+    }
     guest_fd_put(object);
     return fd;
 }
@@ -592,7 +720,7 @@ int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
     struct signalfd_shared *shared;
     uint32_t words[2];
     void *page;
-    int fds[3], saved_errno;
+    int fds[3], saved_errno, slot;
 
     if ((flags & ~(LINUX_SFD_NONBLOCK | LINUX_SFD_CLOEXEC)) != 0 ||
             size != sizeof(words))
@@ -610,7 +738,8 @@ int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
     shared->mask[0] = words[0];
     shared->mask[1] = words[1];
     __sync_synchronize();
-    if (attach_object(fds[0], fds[1], fds[2], page) != 0) {
+    slot = attach_object(fds[0], fds[1], fds[2], page);
+    if (slot < 0) {
         saved_errno = errno;
         close(fds[0]);
         close(fds[1]);
@@ -625,7 +754,7 @@ int32_t linux_signalfd(int fd, const void *mask, uint32_t size,
             "signalfd-collector", args);
     }
     linux_signalfd_collector_update();
-    if (has_pending(words)) raise_ready(shared, fds[1]);
+    if (has_pending(words)) raise_ready(&slots[slot]);
     return fds[0];
 }
 
@@ -641,7 +770,7 @@ static int signalfd_restore(int fd, int hidden_fd, int second_hidden_fd,
     if (hidden_fd < 0 || second_hidden_fd < 0) return -1;
     page = eventfd_map_page(hidden_fd);
     if (page == 0) return -1;
-    return attach_object(fd, second_hidden_fd, hidden_fd, page);
+    return attach_object(fd, second_hidden_fd, hidden_fd, page) < 0 ? -1 : 0;
 }
 
 /* A signalfd received from another process: fd is the channel read end,
@@ -663,7 +792,7 @@ static int signalfd_receive(int fd, const int *companions, int count)
         return -1;
     }
     page = eventfd_map_page(shm_fd);
-    if (page == 0 || attach_object(fd, write_fd, shm_fd, page) != 0) {
+    if (page == 0 || attach_object(fd, write_fd, shm_fd, page) < 0) {
         close(write_fd);
         close(shm_fd);
         return -1;

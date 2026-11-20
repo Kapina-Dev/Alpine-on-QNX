@@ -397,8 +397,10 @@ static int in_set(const uint32_t *set, int fd)
 
 /* An epoll fd in one of the sets: select then goes through do_poll, which
    expands it (QNX select() can't take the expanded fds' per-entry results:
-   one closed item would fail the whole call with EBADF). */
-static int sets_hold_epoll(int count, const uint32_t *read_set,
+   one closed item would fail the whole call with EBADF).  The same for a
+   typed fd that waits on another host fd (a signalfd waits on its
+   process's own channel): native select would watch the wrong fd. */
+static int sets_need_poll(int count, const uint32_t *read_set,
     const uint32_t *write_set, const uint32_t *except_set)
 {
     int fd;
@@ -410,7 +412,7 @@ static int sets_hold_epoll(int count, const uint32_t *read_set,
         if (!guest_fd_is_typed(fd)) continue;
         epoll = linux_epoll_acquire(fd);
         guest_fd_put(epoll);
-        if (epoll != 0) return 1;
+        if (epoll != 0 || guest_fd_poll_target(fd) != fd) return 1;
     }
     return 0;
 }
@@ -551,7 +553,7 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
         timeout.tv_usec = (long)(pselect_call ? fraction / 1000 : fraction);
         timeout_pointer = &timeout;
     }
-    if (sets_hold_epoll(count, guest_read, guest_write, guest_except)) {
+    if (sets_need_poll(count, guest_read, guest_write, guest_except)) {
         struct linux_poll_mask mask;
         int timeout_ms = -1, interrupted = 0;
         if (timeout_pointer != 0) {
