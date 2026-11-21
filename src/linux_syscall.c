@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1115,6 +1116,26 @@ static int linux_wait_status(int host_status)
     return host_status;
 }
 
+/* QNX's waitpid can return a reaped child while procnto is still tearing
+   it down (more often for a large, multi-threaded process, which every
+   Linuxemu guest is), and kill(pid, 0) then still succeeds for a moment.
+   On Linux the pid is gone once wait returns, and callers check that
+   (libuv's spawn tests do), so wait for ESRCH: yield a little, then sleep
+   in 1 ms steps, for at most about 200 ms. */
+static void wait_until_reaped(pid_t child)
+{
+    const struct timespec step = { 0, 1000000 };
+    int saved_errno = errno;
+    unsigned attempt;
+
+    for (attempt = 0; attempt != 300; ++attempt) {
+        if (kill(child, 0) != 0) break;
+        if (attempt < 100) sched_yield();
+        else nanosleep(&step, 0);
+    }
+    errno = saved_errno;
+}
+
 static int32_t linux_wait4(int pid, int *guest_status, uint32_t linux_options,
     void *guest_usage)
 {
@@ -1135,6 +1156,8 @@ static int32_t linux_wait4(int pid, int *guest_status, uint32_t linux_options,
 #endif
     result = waitpid((pid_t)pid, &host_status, host_options);
     if (result < 0) return -(int32_t)linux_errno_number(errno);
+    if (result != 0 && (WIFEXITED(host_status) || WIFSIGNALED(host_status)))
+        wait_until_reaped(result);
     if (result != 0 && guest_status != 0)
         *guest_status = linux_wait_status(host_status);
     if (result != 0 && guest_usage != 0) {

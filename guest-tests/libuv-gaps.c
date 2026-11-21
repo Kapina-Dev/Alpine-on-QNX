@@ -22,11 +22,16 @@
  *      change only the socket inode's mode; QNX refuses it with EPERM and
  *      Linuxemu reports the refusal), and chmod() of the bound path sets
  *      the mode stat() shows (libuv pipe_set_chmod)
+ *   16 once waitpid() has reaped a child killed by SIGTERM, kill(pid, 0)
+ *      fails ESRCH, in each of REAP_ROUNDS rounds; the child has two
+ *      extra threads and 32 MiB of touched memory, which makes QNX's
+ *      teardown outlast waitpid (libuv spawn_and_kill_with_std)
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <signal.h>
 #include <stdio.h>
@@ -43,6 +48,8 @@
 #define SOCKET_NAME "linuxemu-libuv-gaps-sock"
 #define DOTTED_NAME "/tmp/./linuxemu-libuv-gaps-sock2"
 #define CHMOD_NAME "/tmp/linuxemu-libuv-gaps-sock3"
+#define REAP_ROUNDS 300
+#define REAP_MEMORY (32 << 20)
 
 static volatile sig_atomic_t current_check;
 
@@ -255,6 +262,56 @@ static int check_socket_chmod(void)
     return 0;
 }
 
+static void *idle_thread(void *argument)
+{
+    (void)argument;
+    for (;;) pause();
+    return 0;
+}
+
+static int check_reaped_pid(void)
+{
+    int round;
+
+    arm(16, 300);
+    for (round = 0; round != REAP_ROUNDS; ++round) {
+        int ready[2];
+        char byte;
+        pid_t child;
+        int status;
+
+        if (pipe(ready) != 0) return fail(16, "pipe");
+        child = fork();
+        if (child < 0) return fail(16, "fork");
+        if (child == 0) {
+            pthread_t thread;
+            char *memory = malloc(REAP_MEMORY);
+            if (memory == 0) _exit(1);
+            memset(memory, 1, REAP_MEMORY);
+            if (pthread_create(&thread, 0, idle_thread, 0) != 0 ||
+                pthread_create(&thread, 0, idle_thread, 0) != 0) _exit(1);
+            if (write(ready[1], "r", 1) != 1) _exit(1);
+            for (;;) pause();
+        }
+        close(ready[1]);
+        if (read(ready[0], &byte, 1) != 1) return fail(16, "child ready");
+        close(ready[0]);
+        if (kill(child, SIGTERM) != 0) return fail(16, "kill SIGTERM");
+        if (waitpid(child, &status, 0) != child) return fail(16, "waitpid");
+        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+            errno = 0;
+            return fail(16, "child status");
+        }
+        errno = 0;
+        if (kill(child, 0) == 0 || errno != ESRCH) {
+            fprintf(stderr, "libuv-gaps: round %d\n", round);
+            return fail(16, "kill(pid, 0) after the reap");
+        }
+    }
+    alarm(0);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -271,5 +328,6 @@ int main(int argc, char **argv)
     if ((result = check_connect_file()) != 0) return result;
     if ((result = check_bound_names()) != 0) return result;
     if ((result = check_socket_chmod()) != 0) return result;
+    if ((result = check_reaped_pid()) != 0) return result;
     return 0;
 }
