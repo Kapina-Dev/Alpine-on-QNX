@@ -48,7 +48,7 @@ Passport. See
 You need a BlackBerry 10 phone with BerryCore by sw7ft installed. Run these as the ordinary Term49 or SSH user:
 
 ```sh
-wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.6/install-linuxemu.sh
+wget -O /tmp/install-linuxemu.sh https://github.com/Kapina-Dev/Alpine-on-QNX/releases/download/v0.1.7/install-linuxemu.sh
 sh /tmp/install-linuxemu.sh
 . ~/.profile
 alpinx

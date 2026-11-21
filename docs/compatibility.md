@@ -1,4 +1,4 @@
-# Linuxemu v0.1.6 compatibility
+# Linuxemu v0.1.7 compatibility
 
 Linuxemu runs 32-bit ARM Linux applications directly on the ARM CPU of a
 BlackBerry 10 phone and translates their Linux system calls to QNX.
@@ -32,6 +32,10 @@ UNIX sockets, `SCM_RIGHTS` descriptor passing (including large nonblocking
 frames), peer credentials, and Linux PTY/forkpty workflows backed by QNX
 pseudoterminals. An attached tmux 3.7c client with `TERM=xterm-256color`
 attaches and exits cleanly, in an SSH pseudo-terminal and in Term49.
+Since 0.1.7 it also covers eventfd, epoll, timerfd, signalfd, inotify, socket
+async I/O on AF_UNIX sockets and a 158-test subset of libuv 1.52.1's
+event-loop tests, and the application corpus adds nginx, Redis and
+inotify-tools to the compatible apps.
 
 The 0.1.6 core adds a Linux-style descriptor table: `RLIMIT_NOFILE` is
 virtual (744 on the Passport since Phase 3 part 1, which reserves 256
