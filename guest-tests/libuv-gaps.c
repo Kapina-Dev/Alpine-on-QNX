@@ -39,6 +39,12 @@
  *      KILL_ROUNDS rounds, and the new image never sees that pipe open
  *      (libuv kill, process_ref, spawn_detached: the helper survived and
  *      was left running)
+ *   19 a MAP_PRIVATE, PROT_READ|PROT_WRITE mapping of a file at a page
+ *      offset, plain and MAP_FIXED over an anonymous region, holds the
+ *      file's bytes, zeros after the end of the file, and a write to it
+ *      leaves the file unchanged (Linuxemu reads such mappings in with
+ *      pread, since QNX's own mapping returned wrong pages; found by the
+ *      Python smoke, not by libuv)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -51,6 +57,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -66,6 +73,8 @@
 #define REAP_MEMORY (32 << 20)
 #define WAKE_ROUNDS 3000
 #define KILL_ROUNDS 20
+#define MAP_TEST_PATH "/tmp/linuxemu-libuv-gaps-map"
+#define MAP_PAGE 4096
 
 static volatile sig_atomic_t current_check;
 
@@ -465,6 +474,69 @@ static int check_kill_after_exec(const char *self)
     return 0;
 }
 
+/* One mapping of the check-19 file: page 1 on, 2 pages, the file ends
+   100 bytes into the second one. */
+static int check_private_mapping(int fd, const unsigned char *file,
+    unsigned char *where)
+{
+    unsigned char *map, byte;
+    size_t i;
+
+    map = mmap(where, 2 * MAP_PAGE, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | (where != 0 ? MAP_FIXED : 0), fd, MAP_PAGE);
+    if (map == MAP_FAILED) return fail(19, "mmap");
+    if (where != 0 && map != where) {
+        errno = 0;
+        return fail(19, "MAP_FIXED mapping elsewhere");
+    }
+    for (i = 0; i != MAP_PAGE + 100; ++i)
+        if (map[i] != file[MAP_PAGE + i]) {
+            errno = 0;
+            return fail(19, "mapping differs from the file");
+        }
+    for (; i != 2 * MAP_PAGE; ++i)
+        if (map[i] != 0) {
+            errno = 0;
+            return fail(19, "nonzero after the end of the file");
+        }
+    map[0] ^= 0xff;
+    if (pread(fd, &byte, 1, MAP_PAGE) != 1) return fail(19, "pread");
+    if (byte != file[MAP_PAGE]) {
+        errno = 0;
+        return fail(19, "a private write reached the file");
+    }
+    munmap(map, 2 * MAP_PAGE);
+    return 0;
+}
+
+static int check_private_file_mapping(void)
+{
+    static unsigned char file[2 * MAP_PAGE + 100];
+    unsigned char *region;
+    size_t i;
+    int fd, result;
+
+    for (i = 0; i != sizeof(file); ++i)
+        file[i] = (unsigned char)(i * 7 + (i >> 8) + 1);
+    fd = open(MAP_TEST_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return fail(19, "open");
+    if (write(fd, file, sizeof(file)) != (ssize_t)sizeof(file))
+        return fail(19, "write");
+    result = check_private_mapping(fd, file, 0);
+    if (result == 0) {
+        region = mmap(0, 4 * MAP_PAGE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) result = fail(19, "anonymous mmap");
+        else {
+            result = check_private_mapping(fd, file, region + MAP_PAGE);
+            munmap(region, 4 * MAP_PAGE);
+        }
+    }
+    close(fd);
+    unlink(MAP_TEST_PATH);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -483,6 +555,8 @@ int main(int argc, char **argv)
         if (realpath(argv[0], self) == 0) return fail(18, "realpath argv[0]");
         return check_kill_after_exec(self);
     }
+    if (argc == 2 && strcmp(argv[1], "check-19") == 0)
+        return check_private_file_mapping();
     if (realpath(argv[0], self) == 0) return fail(10, "realpath argv[0]");
     if ((result = check_exe(self)) != 0) return result;
     if ((result = check_exec(self)) != 0) return result;
@@ -492,5 +566,6 @@ int main(int argc, char **argv)
     if ((result = check_reaped_pid()) != 0) return result;
     if ((result = check_signal_wakes_wait()) != 0) return result;
     if ((result = check_kill_after_exec(self)) != 0) return result;
+    if ((result = check_private_file_mapping()) != 0) return result;
     return 0;
 }

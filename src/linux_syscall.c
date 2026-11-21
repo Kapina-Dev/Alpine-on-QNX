@@ -1210,7 +1210,7 @@ static int32_t linux_mmap2(ucontext_t *context)
     int host_descriptor;
     int host_protection;
     int mapping_protection;
-    int copy_executable_file;
+    int copy_file;
     void *result;
     off64_t offset;
     size_t mapped_length;
@@ -1247,11 +1247,18 @@ static int32_t linux_mmap2(ucontext_t *context)
             "mmap-shared-exec", (const uint32_t *)context->uc_mcontext.cpu.gpr);
     offset = (off64_t)context->uc_mcontext.cpu.gpr[5] * 4096;
     host_descriptor = (int)context->uc_mcontext.cpu.gpr[4];
-    copy_executable_file =
+    /* Private file mappings that are executable or writable are read in
+       with pread instead of mapped from the file: executable ones because
+       of the code patching, writable ones because QNX's MAP_PRIVATE file
+       mapping can return wrong pages (FINDINGS 2026-11-21: a library's
+       data segment, its dynamic section included, differed from pread of
+       the same bytes for a few minutes, and musl crashed in symbol lookup).
+       Read-only private mappings stay mapped from the file. */
+    copy_file =
         (linux_flags & LINUX_MAP_PRIVATE) != 0 &&
         (linux_flags & LINUX_MAP_ANONYMOUS) == 0 &&
-        (host_protection & PROT_EXEC) != 0;
-    if (copy_executable_file) {
+        (host_protection & (PROT_EXEC | PROT_WRITE)) != 0;
+    if (copy_file) {
         host_flags |= MAP_ANON;
         host_descriptor = -1;
     }
@@ -1262,7 +1269,7 @@ static int32_t linux_mmap2(ucontext_t *context)
             (host_protection | PROT_READ | PROT_WRITE) & ~PROT_EXEC;
     result = mmap64((void *)requested_address, requested_length,
         mapping_protection, host_flags,
-        host_descriptor, copy_executable_file ? 0 : offset);
+        host_descriptor, copy_file ? 0 : offset);
     if (result == MAP_FAILED) {
         trace_internal_failure("linuxemu: host mmap failed\n");
         return -(int32_t)linux_errno_number(errno);
@@ -1275,7 +1282,7 @@ static int32_t linux_mmap2(ucontext_t *context)
         munmap(result, mapped_length);
         return -ENOMEM;
     }
-    if (copy_executable_file) {
+    if (copy_file) {
         struct stat64 status;
         size_t file_bytes;
         int descriptor = (int)context->uc_mcontext.cpu.gpr[4];
@@ -1284,17 +1291,23 @@ static int32_t linux_mmap2(ucontext_t *context)
             munmap(result, mapped_length);
             return -(int32_t)linux_errno_number(saved_errno);
         }
-        if (status.st_size < 0 || offset < 0 || offset > status.st_size) {
+        if (status.st_size < 0 || offset < 0 ||
+            (offset > status.st_size && (host_protection & PROT_EXEC) != 0)) {
             munmap(result, mapped_length);
             return -EINVAL;
         }
+        /* Writable: a mapping that starts past the end of the file is
+           zeros (Linux maps it; a touch would raise SIGBUS there). */
         file_bytes = requested_length;
-        if ((off64_t)file_bytes > status.st_size - offset)
+        if (offset >= status.st_size) file_bytes = 0;
+        else if ((off64_t)file_bytes > status.st_size - offset)
             file_bytes = (size_t)(status.st_size - offset);
         if (file_bytes != 0 && read_exact_at(descriptor, result,
                 file_bytes, offset) != 0) {
             int saved_errno = errno;
             munmap(result, mapped_length);
+            /* A write-only fd: Linux's mmap refuses it with EACCES. */
+            if (saved_errno == EBADF) return -EACCES;
             return -(int32_t)linux_errno_number(saved_errno);
         }
     }
