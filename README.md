@@ -36,8 +36,10 @@ start-up, a basic workload, a concurrent workload, and clean shutdown:
 | nginx | ✅ works | Serves, times out an idle client, reloads twice and stops. Its worker channel uses `FIOASYNC`, which works on unix sockets |
 | Node.js | ❌ not yet | Stops at start-up |
 
-tmux 3.7 also works, attached and detached, in Term49 and over SSH. All
-results come from runs on a real Passport. See
+tmux 3.7 also works, attached and detached, in Term49 and over SSH, and
+libuv 1.52.1's own event-loop tests pass (the 158-test subset Linuxemu gates
+on; 445 of its 507 tests pass in all). All results come from runs on a real
+Passport. See
 [corpus-results.md](docs/corpus-results.md) for the per-stage results and
 [compatibility.md](docs/compatibility.md) for the supported surface.
 
@@ -109,7 +111,7 @@ pass), and next Node.js's start-up crash.
 
 ## Development
 
-Building on the device, the 14 regression suites, the
+Building on the device, the 16 regression suites, the
 `LINUXEMU_DIAGNOSTICS` log, the application corpus and the source layout are
 described in [development.md](docs/development.md). The release process is
 in [release.md](docs/release.md), and [FINDINGS.md](docs/FINDINGS.md) records
