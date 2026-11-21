@@ -17,7 +17,9 @@
 # by UV_TEST_TIMEOUT_MULTIPLIER (default 10). Each test is ended after
 # LIBUV_TEST_TIMEOUT seconds (default 60) and then scores exit=124. Exit
 # 7 is libuv's skip. Per-test output and LINUXEMU_DIAGNOSTICS reports go
-# to build/libuv-smoke/.
+# to build/libuv-smoke/. At the end, guests of this run still alive (a
+# helper process its test left behind) are killed and counted in
+# libuv_leftover_processes=N; any leftover fails the run.
 set -u
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -159,10 +161,25 @@ while read -r name; do
     fi
 done <"$output_dir/tests.txt"
 
+# The watchdog kills only the test process, not the helpers it spawned,
+# which then live on under pid 1 (a helper that missed its SIGTERM sleeps
+# forever and uses CPU). Every guest of this run carries its
+# LINUXEMU_DIAGNOSTICS path under $output_dir, so end those that are left.
+leftovers=0
+for pid in $(pidin -f an 2>/dev/null | awk -v e="$linuxemu" '$2 == e ||
+        "/" $2 == e { print $1 }'); do
+    if pidin -p "$pid" env 2>/dev/null |
+            grep -q "LINUXEMU_DIAGNOSTICS=$output_dir/"; then
+        kill -KILL "$pid" 2>/dev/null && leftovers=$((leftovers + 1))
+    fi
+done
+echo "libuv_leftover_processes=$leftovers"
+
 if [ "$mode" = all ]; then
     echo "libuv_all pass=$pass fail=$((failures - skip)) skip=$skip"
-    test "$failures" -eq "$skip"
+    test "$failures" -eq "$skip" && test "$leftovers" -eq 0
 else
+    failures=$((failures + leftovers))
     echo "linuxemu_libuv_failures=$failures"
     test "$failures" -eq 0
 fi
