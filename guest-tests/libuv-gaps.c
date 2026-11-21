@@ -10,6 +10,9 @@
  *      readlink("/proc/<getpid()>/exe") give the same path
  *   12 after execve through a relative symlink from another directory,
  *      the new image's /proc/self/exe is the real file's absolute path
+ *   13 connect() of an AF_UNIX stream socket, blocking and nonblocking, to
+ *      a regular file fails ECONNREFUSED, and to a missing path ENOENT
+ *      (libuv pipe_connect_to_file)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,10 +22,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define EXEC_LINK "/tmp/linuxemu-libuv-gaps-link"
+#define PLAIN_FILE "/tmp/linuxemu-libuv-gaps-file"
 
 static volatile sig_atomic_t current_check;
 
@@ -105,6 +111,46 @@ static int check_exec(const char *self)
     return 0;
 }
 
+/* connect(path) on a fresh AF_UNIX stream socket: 0 or the errno. */
+static int connect_error(const char *path, int flags)
+{
+    struct sockaddr_un address;
+    int fd = socket(AF_UNIX, SOCK_STREAM | flags, 0);
+    int result;
+
+    if (fd < 0) return errno;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, path);
+    result = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0 ?
+        0 : errno;
+    close(fd);
+    return result;
+}
+
+static int check_connect_file(void)
+{
+    int fd;
+    int result;
+
+    unlink(PLAIN_FILE);
+    fd = open(PLAIN_FILE, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) return fail(13, "create file");
+    close(fd);
+    result = connect_error(PLAIN_FILE, 0);
+    errno = result;
+    if (result != ECONNREFUSED) return fail(13, "connect to a file");
+    result = connect_error(PLAIN_FILE, SOCK_NONBLOCK);
+    errno = result;
+    if (result != ECONNREFUSED)
+        return fail(13, "nonblocking connect to a file");
+    unlink(PLAIN_FILE);
+    result = connect_error(PLAIN_FILE, 0);
+    errno = result;
+    if (result != ENOENT) return fail(13, "connect to a missing path");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -118,5 +164,6 @@ int main(int argc, char **argv)
     if (realpath(argv[0], self) == 0) return fail(10, "realpath argv[0]");
     if ((result = check_exe(self)) != 0) return result;
     if ((result = check_exec(self)) != 0) return result;
+    if ((result = check_connect_file()) != 0) return result;
     return 0;
 }

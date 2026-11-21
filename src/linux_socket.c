@@ -52,6 +52,7 @@
 #define LINUX_ENOPROTOOPT 92
 #define LINUX_EOPNOTSUPP 95
 #define LINUX_EAFNOSUPPORT 97
+#define LINUX_ECONNREFUSED 111
 #define LINUX_UNIX_PATH_MAX 108
 
 struct linux_msghdr {
@@ -621,6 +622,17 @@ static int32_t make_socket(uint32_t *arguments)
     return fd;
 }
 
+/* The host file a converted AF_UNIX name refers to exists. */
+static int unix_path_exists(const struct sockaddr_un *address)
+{
+    struct stat status;
+    int saved_errno = errno;
+    int exists = address->sun_path[0] != '\0' &&
+        stat(address->sun_path, &status) == 0;
+    errno = saved_errno;
+    return exists;
+}
+
 static int32_t address_call(uint32_t number, uint32_t *arguments)
 {
     struct sockaddr_storage address;
@@ -630,9 +642,18 @@ static int32_t address_call(uint32_t number, uint32_t *arguments)
         converted = guest_address((void *)arguments[1], arguments[2],
             number == LINUX_NR_BIND, &address, &length);
         if (converted != 0) return converted;
-        return socket_result(number == LINUX_NR_BIND ?
-            bind((int)arguments[0], (struct sockaddr *)&address, length) :
-            connect((int)arguments[0], (struct sockaddr *)&address, length));
+        if (number == LINUX_NR_BIND)
+            return socket_result(bind((int)arguments[0],
+                (struct sockaddr *)&address, length));
+        if (connect((int)arguments[0], (struct sockaddr *)&address,
+                length) == 0) return 0;
+        /* QNX finds AF_UNIX names in io-pkt's namespace and reports any
+           other file as missing; Linux refuses a path that exists but
+           has no listening socket with ECONNREFUSED. */
+        if (errno == ENOENT && address.ss_family == AF_UNIX &&
+                unix_path_exists((const struct sockaddr_un *)&address))
+            return -LINUX_ECONNREFUSED;
+        return socket_result(-1);
     }
     length = sizeof(address);
     converted = number == LINUX_NR_GETSOCKNAME ?
