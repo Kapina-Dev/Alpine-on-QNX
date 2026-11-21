@@ -315,6 +315,50 @@ int guest_path_resolve_at(const char *host_directory, const char *path,
         host_path, host_path_size);
 }
 
+int guest_path_from_host(const char *host_path, char *output, size_t size)
+{
+    char resolved[PATH_MAX];
+    const char *guest;
+    size_t root_length = strlen(root_path);
+
+    if (root_path[0] == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+    if (realpath(host_path, resolved) == 0) return -1;
+    if (strncmp(resolved, root_path, root_length) != 0 ||
+        (resolved[root_length] != '\0' && resolved[root_length] != '/')) {
+        errno = ENOENT;
+        return -1;
+    }
+    guest = resolved[root_length] == '\0' ? "/" : resolved + root_length;
+    if (strlen(guest) + 1 > size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    strcpy(output, guest);
+    return 0;
+}
+
+/* /proc/self/exe and /proc/<own pid>/exe: 1 when normalized names it. */
+static int names_own_exe(const char *normalized)
+{
+    const char *cursor;
+    char *end;
+    long process;
+
+    if (strncmp(normalized, "/proc/", 6) != 0) return 0;
+    cursor = normalized + 6;
+    if (strncmp(cursor, "self/", 5) == 0)
+        return strcmp(cursor + 5, "exe") == 0;
+    /* Linux's procfs has no names with a leading zero. */
+    if (*cursor < '1' || *cursor > '9') return 0;
+    errno = 0;
+    process = strtol(cursor, &end, 10);
+    return errno == 0 && process == (long)getpid() &&
+        strcmp(end, "/exe") == 0;
+}
+
 int guest_path_getcwd(char *buffer, size_t size)
 {
     size_t length = strlen(guest_cwd) + 1;
@@ -339,6 +383,18 @@ int guest_path_readlink(const char *path, char *buffer, size_t size)
 
     if (normalize_guest_path(path, normalized, sizeof(normalized)) != 0)
         return -1;
+
+    if (names_own_exe(normalized)) {
+        target = guest_process_image();
+        if (target[0] == '\0') {
+            errno = ENOENT;
+            return -1;
+        }
+        count = (ssize_t)strlen(target);
+        if ((size_t)count > size) count = (ssize_t)size;
+        memcpy(buffer, target, (size_t)count);
+        return (int)count;
+    }
 
     descriptor_text = 0;
     if (strncmp(normalized, "/proc/self/fd/", 14) == 0)

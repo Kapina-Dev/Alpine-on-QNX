@@ -101,6 +101,9 @@ int guest_path_getcwd(char *buffer, size_t size);
 int guest_path_readlink(const char *path, char *buffer, size_t size);
 int guest_path_chdir(const char *path);
 int guest_path_fchdir(const char *host_path);
+/* The guest path of a host file under the root (symlinks resolved), or -1
+   with ENOENT when it lies outside the root. */
+int guest_path_from_host(const char *host_path, char *output, size_t size);
 const char *guest_path_root(void);
 const char *guest_path_cwd(void);
 
@@ -113,6 +116,8 @@ void guest_process_set_nice(int nice);
 const char *guest_process_initial_name(const char *loaded_path);
 void guest_process_record_executable(const char *loaded_path);
 const char *guest_process_executable(void);
+/* /proc/self/exe: the guest path of the loaded image, "" when unknown. */
+const char *guest_process_image(void);
 void linux_diag_flush(void);
 void linux_diag_flush_final(void);
 void linux_diag_runtime_initialize(void);

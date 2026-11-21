@@ -24,6 +24,7 @@ static char pending_variable[80];
 static char diagnostics_variable[PATH_MAX + 32];
 static char executable_variable[PATH_MAX + 32];
 static char guest_executable_path[PATH_MAX];
+static char guest_image_path[PATH_MAX];
 static uint32_t guest_personality;
 static int guest_no_new_privs;
 static int guest_nice;
@@ -101,11 +102,23 @@ void guest_process_record_executable(const char *loaded_path)
     const char *value = getenv("LINUXEMU_GUEST_EXE");
     snprintf(guest_executable_path, sizeof(guest_executable_path), "%s",
         value != 0 ? value : loaded_path);
+    /* Linux's /proc/self/exe names the file actually loaded (the
+       interpreter of a #! script), absolute and with symlinks resolved.
+       loaded_path is a host path under the root (execve passes the
+       resolved one). */
+    if (guest_path_from_host(loaded_path, guest_image_path,
+            sizeof(guest_image_path)) != 0)
+        guest_image_path[0] = '\0';
 }
 
 const char *guest_process_executable(void)
 {
     return guest_executable_path;
+}
+
+const char *guest_process_image(void)
+{
+    return guest_image_path;
 }
 
 /* Linux names a process after the basename of the file passed to execve,

@@ -2049,7 +2049,17 @@ void linux_syscall_dispatch(ucontext_t *context)
     case LINUX_NR_READLINKAT:
         {
             char host_path[PATH_MAX];
-            if (resolve_at((int32_t)context->uc_mcontext.cpu.gpr[0],
+            const char *link_path =
+                (const char *)context->uc_mcontext.cpu.gpr[1];
+            /* Paths from the guest's root or cwd take readlink's route,
+               which knows the emulated /proc links. */
+            if ((int32_t)context->uc_mcontext.cpu.gpr[0] == LINUX_AT_FDCWD ||
+                    (link_path != 0 && link_path[0] == '/')) {
+                result = guest_path_readlink(link_path,
+                    (char *)context->uc_mcontext.cpu.gpr[2],
+                    (size_t)context->uc_mcontext.cpu.gpr[3]);
+                if (result < 0) result = -linux_errno_number(errno);
+            } else if (resolve_at((int32_t)context->uc_mcontext.cpu.gpr[0],
                     (const char *)context->uc_mcontext.cpu.gpr[1], 0, 1,
                     host_path, sizeof(host_path)) != 0)
                 result = -linux_errno_number(errno);
