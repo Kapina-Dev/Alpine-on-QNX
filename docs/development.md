@@ -489,10 +489,12 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
   - `membarrier` supports no commands.
   - `mremap` works only on plain anonymous memory that was never executable
     and never patched.
-  - The JIT patch hazard (blind `svc`/TPIDRURO rewriting of data words when
-    memory becomes executable) is measured by `jit-patch-hazard` and open
-    until Phase 4. Repeated flips no longer fill the patch table: a site
-    seen again is updated in place.
+  - Anonymous memory made executable is not patched (Phase 4 part 1), so a
+    JIT's data words are never rewritten: `jit-patch-hazard` gates it in
+    `run-linuxemu-smoke`. `LINUXEMU_PATCH_ANONYMOUS=1` restores the
+    patching for generated code that makes system calls
+    (`runtime-exec-syscalls` runs with it). Repeated flips don't fill the
+    patch table: a site seen again is updated in place.
   - `cacheflush` returns `EINVAL` for start equal to end and for a range
     across two adjacent mappings.
   - `statx` timestamps are whole seconds, `stx_btime` is not filled, and

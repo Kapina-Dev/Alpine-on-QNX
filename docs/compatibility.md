@@ -176,10 +176,18 @@ Limits of the Phase 2 calls:
 - `mremap` handles plain anonymous guest memory that was never executable.
   File mappings, executable memory, `MREMAP_FIXED` and
   `MREMAP_DONTUNMAP` return `EINVAL`. Memory that was ever patched is
-  refused too.
-- Memory that a JIT flips to executable is scanned blindly for `svc #0` and
-  TPIDRURO words. Data words that match are rewritten; the fix belongs with
-  Phase 4. Repeated flips of the same page no longer fill the patch table.
+  refused too (with `LINUXEMU_PATCH_ANONYMOUS=1`, that includes anonymous
+  memory that was executable).
+- Anonymous memory that `mprotect` makes executable (a JIT's code and
+  data) is not patched, so its data is never rewritten (Phase 4 part 1).
+  Generated code that makes Linux system calls itself needs
+  `LINUXEMU_PATCH_ANONYMOUS=1`: without it, the `svc` runs as a QNX kernel
+  call (QNX ignores the `svc` immediate) and the program fails.
+  With `LINUXEMU_DIAGNOSTICS`, such memory is reported as `mprotect`
+  `detail=anon-exec-svc` (a JIT data word that only looks like an `svc`
+  is reported too). File mappings are patched as before. A JIT page
+  flipped back to read-write is plain anonymous memory again, so `mremap`
+  may move it.
 - `statx` returns whole-second timestamps and no birth time. Device numbers
   are a synthetic major/minor split of the QNX device number.
 - `cacheflush` returns `EINVAL` when start equals end, and for a range

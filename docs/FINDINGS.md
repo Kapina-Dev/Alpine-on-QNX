@@ -577,6 +577,12 @@ with Phase 4's "Thumb and stripped-binary support" patcher work. Until then,
 measure Node with `--jitless` if it reaches its JIT and fails because of
 this.
 
+**Closed by Phase 4 part 1 (2026-11-22):** anonymous memory made executable
+is no longer patched at all (JIT code makes no system calls), so the data
+corruption is gone; `jit-patch-hazard` now exits 0 and gates in
+`run-linuxemu-smoke`. See "Phase 4 part 1: what anonymous executable
+patching was used for".
+
 ## 2026-11-18 — Phase 2: QNX facts found while adding syscalls
 
 Found on the Passport as the ordinary user. Each has a guest test or a note

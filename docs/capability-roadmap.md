@@ -786,6 +786,52 @@ work in ARM, Thumb, and mixed modes without modifying embedded data.
   bionic** whose syscall stubs call the translator directly, or the track relies
   on patching alone.
 
+### Phase 4 part 1 status: done (2026-11-22)
+
+JIT safety, on branch `phase4a-jit-safety`. Design and plan:
+`docs/superpowers/specs/2026-11-21-phase4a-jit-safety-design.md` and
+`docs/superpowers/plans/2026-11-21-phase4a-jit-safety.md`. The user chose
+JIT safety as Phase 4's first part; Thumb runtime patching, stripped
+binaries and the Android items are later parts.
+
+**What landed.**
+
+- A probe found that QNX ignores the `svc` immediate: an unpatched Linux
+  `svc #0` runs whatever QNX kernel call `ip` names, so system calls can't
+  be caught when they run and must still be patched ahead of time.
+- Anonymous memory that `mprotect` makes executable is no longer patched
+  (the user's call: JIT code makes no system calls). File mappings are
+  patched as before, run by run within one `mprotect`. This ends the data
+  corruption Phase 2 measured, makes a flip about 40% cheaper, and lets
+  `mremap` move a JIT page once it is read-write again.
+- Before the default changed, a read-only check (`mprotect`
+  `detail=anon-exec-svc` with `LINUXEMU_DIAGNOSTICS`) ran over the full
+  regression and the corpus: only two Linuxemu tests generated system calls
+  into anonymous memory, no program did.
+- `LINUXEMU_PATCH_ANONYMOUS=1` restores the old patching, across `execve`.
+- A LuaJIT smoke (`run-jit-smoke`) joins the full regression as its 17th
+  suite.
+
+**Gate results** (core `aa9fe375…`, branch at `89c2ba7`).
+
+- Full device regression: `linuxemu_full_regression_failures=0`,
+  `jit-patch-hazard` and the new tests included.
+- LuaJIT: JIT on, traces compiled, output equal to the interpreter's,
+  alone and four at a time.
+- Corpus: 10 of 11, the same apps as before.
+- Node.js: the same start-up crash on both cores, with and without
+  `--jitless`; it is not the JIT hazard but V8's memory set-up (`madvise`,
+  `mremap`), Phase 6 work.
+
+**Follow-ups.**
+
+- Literal pools inside ELF `.text` are still scanned as code in binaries
+  without `$d` mapping symbols (stripped-binary part).
+- Execute-only anonymous memory isn't read by the diagnostic check.
+- Thumb runtime patching, Thumb signal handlers and entry points,
+  stripped-binary decoding, the Android gate items and the modified-bionic
+  decision: the next parts of Phase 4.
+
 ## Phase 5: synthetic Linux procfs
 
 Do not expose a mounted QNX procfs as Linux `/proc`; its semantics and layouts

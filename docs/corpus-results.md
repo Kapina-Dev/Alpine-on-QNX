@@ -382,3 +382,27 @@ no external IPv6 interface (1). The failures, by cause:
 None of them is in the event-loop work of this part; they point at
 filesystem, procfs, socket-option and scheduling gaps (Phases 5–7). Only
 the subset gates.
+
+## Phase 4 part 1: 2026-11-22
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user, on battery (82%
+  to 75% over the gate).
+- **Linuxemu:** branch `phase4a-jit-safety` at `89c2ba7`, core sha256
+  `aa9fe3754932b70017ac101094f73c15bf03c59f3a72a5767642360875dae8aa`.
+  Anonymous memory made executable is no longer patched.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+
+```text
+corpus apps=11 compatible=10
+```
+
+Every stage line is the same as in Phase 3 part 4: the same ten apps are
+compatible, with the same unsupported calls, and Node.js still fails at
+start-up (SIGSEGV at address 0, with and without `--jitless`; FINDINGS,
+"Phase 4 part 1: flip cost and Node"). No app's report has an
+`anon-exec-svc` record, so no corpus app makes generated code with system
+calls in anonymous memory.
+
+LuaJIT runs as the JIT check outside the corpus (`run-jit-smoke`, in the
+full regression): compatible, JIT on with traces compiled, output equal to
+the interpreter's.
