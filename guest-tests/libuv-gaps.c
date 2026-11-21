@@ -26,6 +26,13 @@
  *      fails ESRCH, in each of REAP_ROUNDS rounds; the child has two
  *      extra threads and 32 MiB of touched memory, which makes QNX's
  *      teardown outlast waitpid (libuv spawn_and_kill_with_std)
+ *   17 a signal that another process sends while epoll_wait() (no
+ *      sigmask, as libuv calls it) is starting up still ends the wait: the
+ *      handler writes to a self-pipe in the epoll set, the libuv SIGCHLD
+ *      pattern, and in each of WAKE_ROUNDS rounds, with the signal sent
+ *      after a varying delay, epoll_wait() must report the pipe (or EINTR)
+ *      well before its 2 s timeout (libuv spawn_and_ping,
+ *      spawn_same_stdout_stderr: exit_cb never called)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -37,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -50,6 +58,7 @@
 #define CHMOD_NAME "/tmp/linuxemu-libuv-gaps-sock3"
 #define REAP_ROUNDS 300
 #define REAP_MEMORY (32 << 20)
+#define WAKE_ROUNDS 3000
 
 static volatile sig_atomic_t current_check;
 
@@ -312,6 +321,92 @@ static int check_reaped_pid(void)
     return 0;
 }
 
+static int wake_pipe[2];
+
+static void wake_handler(int signal_number)
+{
+    int saved_errno = errno;
+    (void)signal_number;
+    if (write(wake_pipe[1], "w", 1) < 0) {}
+    errno = saved_errno;
+}
+
+/* The signaller: one SIGUSR1 to the parent per byte read from go, after a
+   delay that sweeps the parent's way from write(go) into epoll_wait. */
+static void wake_signaller(int go, pid_t parent)
+{
+    unsigned seed = 12345u;
+    char byte;
+    while (read(go, &byte, 1) == 1) {
+        volatile unsigned spin;
+        unsigned delay;
+        seed = seed * 1103515245u + 12345u;
+        delay = (seed >> 8) % 60000u;
+        for (spin = 0; spin != delay; ++spin) {}
+        if (kill(parent, SIGUSR1) != 0) _exit(1);
+    }
+    _exit(0);
+}
+
+static int check_signal_wakes_wait(void)
+{
+    struct sigaction action, old_action;
+    struct epoll_event event;
+    int go[2], epfd, round, status;
+    pid_t child;
+    char sink[64];
+
+    arm(17, 120);
+    if (pipe2(wake_pipe, O_NONBLOCK | O_CLOEXEC) != 0 || pipe(go) != 0)
+        return fail(17, "pipe");
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = wake_handler;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, &old_action) != 0)
+        return fail(17, "sigaction");
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) return fail(17, "epoll_create1");
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = wake_pipe[0];
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, wake_pipe[0], &event) != 0)
+        return fail(17, "epoll_ctl");
+    child = fork();
+    if (child < 0) return fail(17, "fork");
+    if (child == 0) {
+        close(go[1]);
+        wake_signaller(go[0], getppid());
+    }
+    close(go[0]);
+    for (round = 0; round != WAKE_ROUNDS; ++round) {
+        if (write(go[1], "g", 1) != 1) return fail(17, "write go");
+        for (;;) {
+            int ready = epoll_wait(epfd, &event, 1, 2000);
+            if (ready == 1) break;
+            if (ready == 0) {
+                errno = 0;
+                fprintf(stderr, "libuv-gaps: round %d\n", round);
+                return fail(17, "the signal did not end epoll_wait (2 s)");
+            }
+            if (errno != EINTR) return fail(17, "epoll_wait");
+        }
+        while (read(wake_pipe[0], sink, sizeof(sink)) > 0) {}
+    }
+    close(go[1]);
+    if (waitpid(child, &status, 0) != child) return fail(17, "waitpid");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        errno = 0;
+        return fail(17, "signaller status");
+    }
+    sigaction(SIGUSR1, &old_action, 0);
+    close(epfd);
+    close(wake_pipe[0]);
+    close(wake_pipe[1]);
+    alarm(0);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -322,6 +417,8 @@ int main(int argc, char **argv)
         result = check_exe(argv[2]);
         return result == 0 ? 0 : 12;
     }
+    if (argc == 2 && strcmp(argv[1], "check-17") == 0)
+        return check_signal_wakes_wait();
     if (realpath(argv[0], self) == 0) return fail(10, "realpath argv[0]");
     if ((result = check_exe(self)) != 0) return result;
     if ((result = check_exec(self)) != 0) return result;
@@ -329,5 +426,6 @@ int main(int argc, char **argv)
     if ((result = check_bound_names()) != 0) return result;
     if ((result = check_socket_chmod()) != 0) return result;
     if ((result = check_reaped_pid()) != 0) return result;
+    if ((result = check_signal_wakes_wait()) != 0) return result;
     return 0;
 }

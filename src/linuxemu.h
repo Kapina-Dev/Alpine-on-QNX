@@ -232,15 +232,20 @@ short linux_poll_target_entry(int fd, short events, struct pollfd *entry);
    is the fd's fstat64, or 0 to take it when needed. */
 short linux_poll_pipe_hangup(int fd, short revents,
     const struct stat64 *status);
-/* The ppoll/epoll_pwait signal-mask protocol: begin swaps in the guest's
-   mask and opens the thread's signal-wait fd (signal_wait_fd, to poll
-   beside the guest's fds); end restores the mask, as after an interrupted
-   wait when interrupted is set.  begin returns 0 or a negative Linux
+/* The signal protocol of every poll, select and epoll wait: begin opens
+   the thread's signal-wait fd (signal_wait_fd, to poll beside the guest's
+   fds) and, for ppoll/pselect6/epoll_pwait with a mask (guest_set not 0),
+   swaps in the guest's mask; end restores the mask, as after an
+   interrupted wait when interrupted is set.  Without a mask the fd is
+   still needed: a signal that arrives after the syscall started but
+   before the host wait blocks interrupts nothing, and only the byte its
+   handler posts ends the wait.  begin returns 0 or a negative Linux
    errno; end does nothing when begin was not called or failed. */
 struct linux_poll_mask {
     sigset_t old;
     uint32_t old_words[2];
     int signal_wait_fd;
+    int masked;
 };
 int32_t linux_poll_mask_begin(const void *guest_set, uint32_t size,
     struct linux_poll_mask *mask);

@@ -1387,13 +1387,12 @@ int32_t linux_epoll_wait(int epfd, void *events, int maxevents,
        thread on it; never the guest's epfd (it may close under us). */
     wake_fd = instance->wake_read;
     memset(&arrays, 0, sizeof(arrays));
-    mask.signal_wait_fd = -1;
-    if (sigmask != 0) {
-        result = linux_poll_mask_begin(sigmask, sigsetsize, &mask);
-        if (result != 0) {
-            guest_fd_put(object);
-            return result;
-        }
+    /* Also without a sigmask: the signal-wait fd is what ends a wait
+       that a signal reached before poll blocked. */
+    result = linux_poll_mask_begin(sigmask, sigsetsize, &mask);
+    if (result != 0) {
+        guest_fd_put(object);
+        return result;
     }
     if (timeout_ms > 0) deadline = monotonic_ms() + timeout_ms;
     for (;;) {

@@ -123,8 +123,19 @@ int32_t linux_poll_mask_begin(const void *guest_set, uint32_t size,
 {
     sigset_t requested;
     uint32_t requested_words[2];
-    int result = guest_signal_host_mask(guest_set, size, &requested);
+    int result;
     mask->signal_wait_fd = -1;
+    mask->masked = 0;
+    if (guest_set == 0) {
+        /* Without a channel (no hidden fd left) the wait still runs, as
+           before, with only the host's EINTR. */
+        int saved_errno = errno;
+        mask->signal_wait_fd = guest_thread_signal_wait_begin();
+        if (mask->signal_wait_fd >= 0) guest_thread_signal_wait_arm();
+        errno = saved_errno;
+        return 0;
+    }
+    result = guest_signal_host_mask(guest_set, size, &requested);
     if (result != 0) return result;
     memcpy(requested_words, guest_set, sizeof(requested_words));
     /* SIGKILL and SIGSTOP can't be blocked. */
@@ -140,6 +151,7 @@ int32_t linux_poll_mask_begin(const void *guest_set, uint32_t size,
         return -(int32_t)linux_errno_number(saved_errno);
     }
     guest_thread_signal_mask_set(requested_words);
+    mask->masked = 1;
     guest_thread_signal_wait_arm();
     return 0;
 }
@@ -148,6 +160,12 @@ void linux_poll_mask_end(struct linux_poll_mask *mask, int interrupted)
 {
     int saved_errno = errno;
     if (mask->signal_wait_fd < 0) return;
+    if (!mask->masked) {
+        guest_thread_signal_wait_end();
+        mask->signal_wait_fd = -1;
+        errno = saved_errno;
+        return;
+    }
     if (interrupted) guest_thread_signal_wait_interrupted(mask->old_words);
     else guest_thread_signal_wait_complete(mask->old_words);
     sigprocmask(SIG_SETMASK, &mask->old, 0);
@@ -561,16 +579,11 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
                 (timeout.tv_usec + 999) / 1000;
             timeout_ms = milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
         }
-        mask.signal_wait_fd = -1;
-        if (pselect_call && arguments[5] != 0) {
-            uint32_t pair[2];
+        uint32_t pair[2] = { 0, 0 };
+        if (pselect_call && arguments[5] != 0)
             memcpy(pair, (void *)arguments[5], sizeof(pair));
-            if (pair[0] != 0) {
-                result = linux_poll_mask_begin((void *)pair[0], pair[1],
-                    &mask);
-                if (result != 0) return result;
-            }
-        }
+        result = linux_poll_mask_begin((void *)pair[0], pair[1], &mask);
+        if (result != 0) return result;
         result = select_by_poll(count, guest_read, guest_write, guest_except,
             timeout_ms, mask.signal_wait_fd, &interrupted);
         linux_poll_mask_end(&mask, interrupted);
@@ -607,6 +620,20 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
         guest_thread_signal_mask_set(requested_words);
         guest_thread_signal_wait_arm();
         replace_mask = 1;
+    } else {
+        /* No mask: the signal-wait fd still ends a wait that a signal
+           reached before select blocked (linux_poll_mask_begin).  Without
+           one, or with one past FD_SETSIZE, the wait keeps only the
+           host's EINTR. */
+        signal_wait_fd = guest_thread_signal_wait_begin();
+        if (signal_wait_fd >= FD_SETSIZE) {
+            guest_thread_signal_wait_end();
+            signal_wait_fd = -1;
+        } else if (signal_wait_fd >= 0) {
+            FD_SET(signal_wait_fd, &read_set);
+            if (signal_wait_fd >= host_count) host_count = signal_wait_fd + 1;
+            guest_thread_signal_wait_arm();
+        }
     }
     result = select(host_count, (guest_read || signal_wait_fd >= 0) ?
         &read_set : 0,
@@ -627,7 +654,7 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
         sigprocmask(SIG_SETMASK, &old, 0);
         guest_thread_signal_wait_end();
         errno = saved_errno;
-    }
+    } else if (signal_wait_fd >= 0) guest_thread_signal_wait_end();
     if (result < 0) return -(int32_t)linux_errno_number(errno);
     if (ready_any) {
         int fd;
@@ -653,9 +680,16 @@ static int32_t do_select(uint32_t *arguments, int pselect_call, int time64)
 
 int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6])
 {
-    if (number == LINUX_NR_POLL)
-        return do_poll((struct linux_pollfd *)arguments[0], arguments[1],
-            (int)arguments[2], -1, 0);
+    if (number == LINUX_NR_POLL) {
+        struct linux_poll_mask mask;
+        int signal_interrupted = 0;
+        int32_t result = linux_poll_mask_begin(0, 0, &mask);
+        if (result != 0) return result;
+        result = do_poll((struct linux_pollfd *)arguments[0], arguments[1],
+            (int)arguments[2], mask.signal_wait_fd, &signal_interrupted);
+        linux_poll_mask_end(&mask, signal_interrupted);
+        return result;
+    }
     if (number == LINUX_NR_PPOLL || number == LINUX_NR_PPOLL_TIME64) {
         int timeout;
         int result = linux_poll_timespec_timeout((void *)arguments[2],
@@ -663,12 +697,9 @@ int32_t linux_poll_syscall(uint32_t number, uint32_t arguments[6])
         struct linux_poll_mask mask;
         int signal_interrupted = 0;
         if (result != 0) return result;
-        mask.signal_wait_fd = -1;
-        if (arguments[3] != 0) {
-            result = linux_poll_mask_begin((void *)arguments[3], arguments[4],
-                &mask);
-            if (result != 0) return result;
-        }
+        result = linux_poll_mask_begin((void *)arguments[3], arguments[4],
+            &mask);
+        if (result != 0) return result;
         result = do_poll((struct linux_pollfd *)arguments[0], arguments[1],
             timeout, mask.signal_wait_fd, &signal_interrupted);
         linux_poll_mask_end(&mask, signal_interrupted);
