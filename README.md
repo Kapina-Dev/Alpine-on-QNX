@@ -111,7 +111,7 @@ pass), and next Node.js's start-up crash.
 
 ## Development
 
-Building on the device, the 16 regression suites, the
+Building on the device, the 17 regression suites, the
 `LINUXEMU_DIAGNOSTICS` log, the application corpus and the source layout are
 described in [development.md](docs/development.md). The release process is
 in [release.md](docs/release.md), and [FINDINGS.md](docs/FINDINGS.md) records

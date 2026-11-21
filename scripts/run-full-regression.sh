@@ -58,6 +58,7 @@ run_suite run-thread-smoke
 run_suite run-signal-smoke
 run_suite run-event-smoke
 run_suite run-libuv-smoke
+run_suite run-jit-smoke
 run_suite run-loader-process-stress
 run_suite run-python-smoke
 run_suite run-git-smoke

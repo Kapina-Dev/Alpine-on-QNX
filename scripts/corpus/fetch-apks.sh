@@ -37,7 +37,7 @@ trap restore EXIT HUP INT TERM
 echo "nameserver ${DNS_SERVER:-192.168.0.1}" > "$resolver"
 
 for app in "$@"; do
-    packages=$(corpus_packages=; . "$script_dir/apps/$app.sh"; \
+    packages=$(corpus_packages=; . "${CORPUS_APPS_DIR:-$script_dir/apps}/$app.sh"; \
         echo "$corpus_packages")
     archive="$project_dir/artifacts/corpus/$app"
     echo "=== fetch: $app ($packages) ==="

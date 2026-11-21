@@ -247,6 +247,19 @@ should print `sigio=0`; its `arm` modes recreate the leak and are for
 research (`docs/FINDINGS.md`, "QNX io-pkt SIGIO leak after TCP async"). If a
 TCP test dies with `SIGIO` (exit 150), run `scan` and wait for it to read 0.
 
+Run a real JIT (LuaJIT, from its pinned closure in
+`docs/corpus/luajit-apks.sha256`):
+
+```sh
+sh scripts/run-jit-smoke.sh
+```
+
+It scores LuaJIT like a corpus app, from `scripts/jit-apps/` so the corpus
+itself keeps its pinned apps: the JIT must be on, compile traces, and print
+the same results as the interpreter (`-joff`), alone and four at a time. It
+ends with `linuxemu_jit_failures=N` and runs after `run-libuv-smoke` in the
+full regression.
+
 Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
 
 ```sh
