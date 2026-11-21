@@ -141,6 +141,16 @@ hint, not an error; the per-process report already caps entries
 (`LINUX_DIAG_MAX_ENTRIES`). Thumb patterns are not checked (`0xdf00` is too
 common in data to be a useful hint).
 
+### Measure before changing the default
+
+The diagnostic check is built first, while anonymous memory is still
+patched. Then the full regression and the corpus run once with
+`LINUXEMU_DIAGNOSTICS` on, and every `anon-exec-svc` record is listed.
+Expected hits: only `runtime-exec-syscalls` and `jit-patch-hazard`. Any other
+program with a hit is one this change would affect: stop and bring it to the
+user before the default changes. The result goes in FINDINGS. (Asked for by
+the user, 2026-11-21: "what does this break from Phase 3?")
+
 ### The switch
 
 `LINUXEMU_PATCH_ANONYMOUS=1` restores the old behaviour (patch anonymous
@@ -199,6 +209,8 @@ a generated `svc` needs `LINUXEMU_PATCH_ANONYMOUS=1`"), `docs/FINDINGS.md`
 - Phase 4 order: JIT safety first.
 - Approach: JIT memory isn't patched (2026-11-17: "JIT code contains no
   syscalls, so nothing needs patching; the flips just have to be cheap").
+- Measure what the change would affect (regression and corpus with the
+  diagnostic check) before the default changes.
 
 ## My calls (correct me)
 
