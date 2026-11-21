@@ -116,6 +116,10 @@ int main(int argc, char **argv)
     /* Kept until the load succeeded: a load retry re-execs, which drops
        the re-raised signals again. */
     unsetenv("LINUXEMU_GUEST_PENDING");
+    /* The old image's close-on-exec fds, kept open until now so that its
+       peers see them close only once a signal reaches this image. */
+    guest_fd_exec_close_deferred(getenv("LINUXEMU_GUEST_EXEC_CLOSE"));
+    unsetenv("LINUXEMU_GUEST_EXEC_CLOSE");
     stack_pointer = create_guest_stack(guest_argc, guest_argv, &image);
     if (stack_pointer == 0) {
         perror("linuxemu stack");

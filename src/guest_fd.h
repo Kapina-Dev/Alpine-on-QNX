@@ -188,6 +188,16 @@ void guest_fd_register_restore(enum guest_fd_type type,
 int guest_fd_exec_records(char *buffer, size_t size);
 /* Clears FD_CLOEXEC on the hidden fds of the objects just recorded. */
 int guest_fd_exec_prepare(void);
+/* At most this many close-on-exec fds are carried for a deferred close. */
+#define GUEST_EXEC_CLOSE_MAX 64
+/* Clears FD_CLOEXEC on the plain (untyped, not hidden) close-on-exec fds
+   and writes "LINUXEMU_GUEST_EXEC_CLOSE=fd,fd,..." into buffer; returns
+   how many fds it lists (0: leave the variable out). */
+int guest_fd_exec_defer_cloexec(char *buffer, size_t size);
+/* After a failed execve: sets FD_CLOEXEC on those fds again. */
+void guest_fd_exec_defer_undo(void);
+/* In the new image, just before the guest starts: closes the listed fds. */
+void guest_fd_exec_close_deferred(const char *value);
 /* Parses LINUXEMU_FD_RECORDS in the new image; malformed records are
    skipped.  Restored hidden fds get FD_CLOEXEC again.  Returns how many
    records were restored. */

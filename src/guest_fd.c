@@ -537,6 +537,75 @@ int guest_fd_exec_records(char *buffer, size_t size)
     return (int)used;
 }
 
+/*
+ * Close-on-exec fds closed only once the new image runs.  QNX drops a
+ * signal that arrives while a process is still being exec'd (native probe:
+ * a SIGTERM sent on the EOF of a close-on-exec status pipe, as libuv's
+ * uv_spawn does, was lost in 4 of 20 rounds), and a Linuxemu image takes
+ * longer to start, so the guest's "exec happened" signal came too early
+ * and a kill right after it was lost.  So plain guest fds marked
+ * close-on-exec stay open across the host execve and the new image closes
+ * them just before it enters the guest: the old image's peers see the
+ * close when a signal can no longer be lost, as on Linux.  Typed fds and
+ * hidden fds keep the host's close-on-exec.
+ */
+#define EXEC_CLOSE_PREFIX "LINUXEMU_GUEST_EXEC_CLOSE="
+static int exec_close_fds[GUEST_EXEC_CLOSE_MAX];
+static int exec_close_count;
+
+int guest_fd_exec_defer_cloexec(char *buffer, size_t size)
+{
+    size_t used = sizeof(EXEC_CLOSE_PREFIX) - 1;
+    int fd;
+    exec_close_count = 0;
+    if (size <= used) return 0;
+    memcpy(buffer, EXEC_CLOSE_PREFIX, used);
+    for (fd = 0; fd != hidden_base &&
+            exec_close_count != GUEST_EXEC_CLOSE_MAX; ++fd) {
+        struct guest_fd_object *object;
+        int flags = fcntl(fd, F_GETFD), written;
+        if (flags < 0 || (flags & FD_CLOEXEC) == 0) continue;
+        object = guest_fd_acquire(fd);
+        if (object != 0) {
+            guest_fd_put(object);
+            continue;
+        }
+        written = snprintf(buffer + used, size - used, "%s%d",
+            exec_close_count != 0 ? "," : "", fd);
+        if (written < 0 || (size_t)written >= size - used) break;
+        if (fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC) < 0) continue;
+        used += (size_t)written;
+        exec_close_fds[exec_close_count++] = fd;
+    }
+    buffer[used] = '\0';
+    return exec_close_count;
+}
+
+void guest_fd_exec_defer_undo(void)
+{
+    int i;
+    for (i = 0; i != exec_close_count; ++i) {
+        int flags = fcntl(exec_close_fds[i], F_GETFD);
+        if (flags >= 0)
+            (void)fcntl(exec_close_fds[i], F_SETFD, flags | FD_CLOEXEC);
+    }
+    exec_close_count = 0;
+}
+
+void guest_fd_exec_close_deferred(const char *value)
+{
+    const char *cursor = value;
+    if (value == 0) return;
+    while (*cursor != '\0') {
+        char *end;
+        long fd = strtol(cursor, &end, 10);
+        if (end == cursor || fd < 0 || fd >= hidden_base ||
+                (*end != ',' && *end != '\0')) return;
+        close((int)fd);
+        cursor = *end == ',' ? end + 1 : end;
+    }
+}
+
 int guest_fd_exec_prepare(void)
 {
     int i, result = 0;

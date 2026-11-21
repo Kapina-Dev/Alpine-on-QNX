@@ -14,13 +14,15 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 10];
+static char *host_environment[MAX_EXEC_VECTOR + 11];
 /* Fd records carried into the new image (guest_fd_exec_records). */
 static char fd_records_variable[32768];
 static char personality_variable[48];
 static char comm_variable[48];
 static char nice_variable[48];
 static char pending_variable[80];
+/* Close-on-exec fds the new image closes (guest_fd_exec_defer_cloexec). */
+static char exec_close_variable[32 + GUEST_EXEC_CLOSE_MAX * 5];
 static char diagnostics_variable[PATH_MAX + 32];
 static char executable_variable[PATH_MAX + 32];
 static char guest_executable_path[PATH_MAX];
@@ -303,9 +305,16 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
     if (sigprocmask(SIG_UNBLOCK, &trap_signals, &old_mask) != 0) return -1;
     linux_diag_flush();
     (void)guest_fd_exec_prepare();
+    /* Last, so no failure above leaves the fds without FD_CLOEXEC. */
+    if (guest_fd_exec_defer_cloexec(exec_close_variable,
+            sizeof(exec_close_variable)) > 0) {
+        host_environment[environment_count++] = exec_close_variable;
+        host_environment[environment_count] = 0;
+    }
     execve(emulator_path, host_arguments, host_environment);
     {
         int saved_errno = errno;
+        guest_fd_exec_defer_undo();
         sigprocmask(SIG_SETMASK, &old_mask, 0);
         errno = saved_errno;
     }

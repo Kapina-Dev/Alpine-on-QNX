@@ -33,6 +33,12 @@
  *      after a varying delay, epoll_wait() must report the pipe (or EINTR)
  *      well before its 2 s timeout (libuv spawn_and_ping,
  *      spawn_same_stdout_stderr: exit_cb never called)
+ *   18 a SIGTERM sent as soon as a child's execve has closed its
+ *      close-on-exec status pipe (EOF on the pipe, how libuv's uv_spawn
+ *      knows the exec happened) kills the new image, in each of
+ *      KILL_ROUNDS rounds, and the new image never sees that pipe open
+ *      (libuv kill, process_ref, spawn_detached: the helper survived and
+ *      was left running)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -59,6 +65,7 @@
 #define REAP_ROUNDS 300
 #define REAP_MEMORY (32 << 20)
 #define WAKE_ROUNDS 3000
+#define KILL_ROUNDS 20
 
 static volatile sig_atomic_t current_check;
 
@@ -407,6 +414,57 @@ static int check_signal_wakes_wait(void)
     return 0;
 }
 
+/*
+ * The image check 18 execs: the status pipe's write end, close-on-exec in
+ * the old image, must already be closed; then wait for the parent's
+ * SIGTERM (an exit after 10 s means it never came).
+ */
+static int exec_target_18(const char *descriptor)
+{
+    int fd = atoi(descriptor);
+    if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) {
+        errno = 0;
+        return fail(18, "close-on-exec status pipe open in the new image");
+    }
+    sleep(10);
+    return 0;
+}
+
+static int check_kill_after_exec(const char *self)
+{
+    int round;
+
+    arm(18, 60);
+    for (round = 0; round != KILL_ROUNDS; ++round) {
+        int status_pipe[2], status;
+        char byte, text[16];
+        pid_t child;
+
+        if (pipe2(status_pipe, O_CLOEXEC) != 0) return fail(18, "pipe2");
+        child = fork();
+        if (child < 0) return fail(18, "fork");
+        if (child == 0) {
+            snprintf(text, sizeof(text), "%d", status_pipe[1]);
+            execl(self, self, "exec-18", text, (char *)0);
+            _exit(fail(18, "execl"));
+        }
+        close(status_pipe[1]);
+        while (read(status_pipe[0], &byte, 1) > 0) {}
+        close(status_pipe[0]);
+        if (kill(child, SIGTERM) != 0) return fail(18, "kill");
+        if (waitpid(child, &status, 0) != child) return fail(18, "waitpid");
+        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+            fprintf(stderr, "libuv-gaps: check 18 round %d: status 0x%x\n",
+                round, (unsigned)status);
+            errno = 0;
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 18) return 18;
+            return fail(18, "SIGTERM after the exec did not end the child");
+        }
+    }
+    alarm(0);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -419,6 +477,12 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "check-17") == 0)
         return check_signal_wakes_wait();
+    if (argc == 3 && strcmp(argv[1], "exec-18") == 0)
+        return exec_target_18(argv[2]);
+    if (argc == 2 && strcmp(argv[1], "check-18") == 0) {
+        if (realpath(argv[0], self) == 0) return fail(18, "realpath argv[0]");
+        return check_kill_after_exec(self);
+    }
     if (realpath(argv[0], self) == 0) return fail(10, "realpath argv[0]");
     if ((result = check_exe(self)) != 0) return result;
     if ((result = check_exec(self)) != 0) return result;
@@ -427,5 +491,6 @@ int main(int argc, char **argv)
     if ((result = check_socket_chmod()) != 0) return result;
     if ((result = check_reaped_pid()) != 0) return result;
     if ((result = check_signal_wakes_wait()) != 0) return result;
+    if ((result = check_kill_after_exec(self)) != 0) return result;
     return 0;
 }
