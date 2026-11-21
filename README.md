@@ -33,7 +33,7 @@ start-up, a basic workload, a concurrent workload, and clean shutdown:
 | GCC and make | ✅ works | Compiles and runs programs on the phone |
 | inotify-tools | ✅ works | `inotify` on QNX's native one; events arrive about 250 ms late (limits in [compatibility.md](docs/compatibility.md)) |
 | Redis | ✅ works | |
-| nginx | ❌ not yet | Starts, but no worker: `ioctl(FIOASYNC)` on its worker channel returns `ENOTTY` (async I/O signals, `FIOASYNC`/`F_SETOWN`, aren't supported yet) |
+| nginx | ✅ works | Serves, times out an idle client, reloads twice and stops. Its worker channel uses `FIOASYNC`, which works on unix sockets |
 | Node.js | ❌ not yet | Stops at start-up |
 
 tmux 3.7 also works, attached and detached, in Term49 and over SSH. All
@@ -103,8 +103,9 @@ The full list is in [compatibility.md](docs/compatibility.md).
 [capability-roadmap.md](docs/capability-roadmap.md) sets out the next phases:
 contained modern syscalls such as `pipe2`, `dup3` and full `eventfd`, then
 `epoll`, `timerfd`, `signalfd` and `inotify` (all landed; Redis and
-inotify-tools now run), and next the gaps the corpus still shows, such as
-nginx's `FIOASYNC` and Node.js's start-up crash.
+inotify-tools now run), then socket async I/O (`FIOASYNC`, `F_SETOWN`,
+`SIGIO`, on unix sockets only; nginx now runs, and libuv's event-loop tests
+pass), and next Node.js's start-up crash.
 
 ## Development
 

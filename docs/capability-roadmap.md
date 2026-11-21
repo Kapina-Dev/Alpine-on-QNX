@@ -678,6 +678,72 @@ is not met, so Phase 3 is not marked complete:
 - From part 1 and 2, still open: the io-pkt crash isolation, nginx's
   `FIOASYNC`/`F_SETOWN`, Node's start-up crash, and part 2's follow-ups.
 
+### Phase 3 part 4 status: done (2026-11-21)
+
+Socket async I/O, nginx and libuv, on branch `phase3d-async-libuv`. Design
+and plan: `docs/superpowers/specs/2026-11-20-phase3d-async-io-libuv-design.md`
+and `docs/superpowers/plans/2026-11-20-phase3d-async-io-libuv.md`. Limits:
+`docs/compatibility.md` ("Limits of the Phase 3 part 4 calls (socket async
+I/O) and the libuv fixes"); device facts: `docs/FINDINGS.md` (2026-11-21).
+
+**What landed.**
+
+- `ioctl(FIOASYNC)`, `O_ASYNC`, `F_SETOWN` and `F_GETOWN` pass through to
+  QNX on AF_UNIX sockets, which deliver `SIGIO` to the owner. Every other
+  descriptor gets `EINVAL` with a diagnostic: the probes found that after a
+  process used async I/O on a TCP socket, QNX's io-pkt can send `SIGIO` to
+  unrelated processes for minutes to an hour, and the default action kills
+  them (FINDINGS, "QNX io-pkt SIGIO leak after TCP async").
+- nginx serves, times out an idle client, reloads twice and stops (the
+  corpus app, `scripts/corpus/apps/nginx.sh`).
+- libuv 1.52.1's own test suite builds in the guest (`run-libuv-smoke`). A
+  158-test event-loop subset gates and runs in the full regression; `--all`
+  runs the whole suite. Fixing what it found took seven changes, each with a
+  `libuv-gaps` fixture check that failed first: `/proc/self/exe`, AF_UNIX
+  `connect` to a non-socket, AF_UNIX bound names, `fchmod` of a socket, a
+  reaped child pid still alive (`wait4` now waits for QNX's teardown), a
+  signal wake-up lost just before `poll`/`epoll_wait` blocks, and a
+  `SIGTERM` lost right after `execve` (QNX drops signals sent while a process
+  is being exec'd; guest close-on-exec descriptors now stay open across the
+  host `execve` and the new image closes them). The runner also kills and
+  counts helpers a test leaves behind.
+- The python3 start-up SIGSEGV seen since Phase 0 (pc `0x60067dc4`) was
+  caught while it reproduced: QNX's `MAP_PRIVATE` file mapping returned
+  wrong pages for a library's data segment, and musl crashed in symbol
+  lookup. Private writable file mappings are now read in with `pread`. The
+  bad state cleared on its own and could not be brought back, so the fix is
+  not proven against it (watch item, below).
+
+**Gate results** (core `672d97cd…`, branch at `c2f9a93`).
+
+- Full device regression: `linuxemu_full_regression_failures=0`, the
+  libuv subset and the Python smoke included.
+- libuv `--all`: `pass=445 fail=38 skip=24`, no leftover processes. None of
+  the 38 is in the subset; they point at filesystem, procfs, socket-option
+  and scheduling gaps (Phases 5–7), listed in `docs/corpus-results.md`.
+- Application corpus: 10 of 11 compatible. nginx is newly compatible, and
+  every app compatible in part 3 still is. Only Node.js fails.
+
+**Phase 3 as a whole stays open.** Of the roadmap's acceptance gate, the
+libuv event-loop tests (the subset), nginx and the watcher tests pass. Node.js
+still crashes at start-up (SIGSEGV, address 0, after `madvise` `ENOSYS` and a
+refused `mremap`), which is V8 memory and JIT work for Phases 4 and 6, so
+Phase 3 is not marked complete.
+
+**Follow-ups (not blocking the release).**
+
+- Every limit in `docs/compatibility.md` for part 4 stays as documented:
+  async I/O on AF_UNIX only, no `F_SETSIG` or `si_fd`, `/proc` limited to the
+  `exe` link, `fchmod` of a socket `EOPNOTSUPP`, the per-process bound-name
+  table, the `wait4` teardown wait, `EINTR` in a narrow window of event waits,
+  and private writable file mappings as copies.
+- Watch item: if the python3 SIGSEGV at `0x60067dc4` comes back, the `pread`
+  copy didn't cover its cause; compare the mapping with `pread` while it
+  reproduces (FINDINGS, "The python3 start-up SIGSEGV is a QNX mmap returning
+  wrong file pages").
+- The 38 libuv failures outside the subset, and the io-pkt crash isolation
+  and part 2's follow-ups, still open.
+
 ## Phase 4: Thumb and stripped-binary support
 
 Implement safe Thumb guest decoding and interception:

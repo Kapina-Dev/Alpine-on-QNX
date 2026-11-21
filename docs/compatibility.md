@@ -406,6 +406,82 @@ Limits of the Phase 3 part 3 calls (inotify):
   returns whole records. A zero-length `read` or `readv` with an event
   queued returns `EAGAIN` where Linux returns `EINVAL`.
 
+Limits of the Phase 3 part 4 calls (socket async I/O) and the libuv fixes:
+
+- **Async I/O on AF_UNIX sockets only.** `ioctl(FIOASYNC)`, `fcntl(F_SETFL)`
+  with `O_ASYNC`, `F_SETOWN` and `F_GETOWN` work on AF_UNIX `SOCK_STREAM` and
+  `SOCK_DGRAM` sockets (a socketpair included), and QNX delivers `SIGIO`
+  (guest signal 29) to the owner. Every other descriptor gets `EINVAL` and a
+  `LINUXEMU_DIAGNOSTICS` report, and nothing changes: AF_INET and AF_INET6
+  sockets (TCP, UDP and listeners), pipes, ptys, regular files and typed
+  objects. `F_SETOWN` on such a descriptor reports `fcntl-owner` and
+  fails `EINVAL`; on a closed one it is `EBADF`.
+- **Why not TCP.** After a process has used async I/O on a TCP socket, QNX's
+  io-pkt can send `SIGIO` to later, unrelated processes that never asked for
+  it, even after `FIOASYNC 0` and a close (about 1 in 3 `arm`/`scan` pairs;
+  `docs/FINDINGS.md`, "QNX io-pkt SIGIO leak after TCP async"). The default
+  action kills them. The state wears off within minutes to an hour. A TCP
+  refusal is the price of not letting one guest kill other processes. nginx
+  asks for `SIGIO` only on its AF_UNIX master/worker socketpair, and libuv
+  doesn't use it.
+- **Not supported:** `F_SETSIG`/`F_GETSIG`, `F_SETOWN_EX`/`F_GETOWN_EX`,
+  `SIGURG`, and a `SIGIO` that Linuxemu generates itself. A negative
+  (process-group) owner fails `EINVAL` (QNX refuses it too). A positive owner
+  is passed to QNX unchanged, so in practice it is the caller's own pid.
+- **`siginfo` for `SIGIO`.** QNX's `siginfo_t` has no `si_fd`, so a handler
+  sees `si_code` 0 and a zero `si_value`, not `POLL_IN` and the
+  descriptor. A handler must poll to find the descriptor.
+  The handler runs on any thread that has the signal unblocked (on a thread
+  blocked in `read`, in the probe).
+- **`F_SETFL` with only `O_ASYNC`** drops `O_NONBLOCK`, as the other
+  `F_SETFL` flags that are not set do (Linux semantics: `F_SETFL` replaces the
+  flags).
+- **`/proc` is limited to one link.** `readlink("/proc/self/exe")` and
+  `/proc/<own pid>/exe` return the absolute guest path of the running image
+  (after `execve`, the new image; for a `#!` script, the interpreter). Other
+  `/proc` entries stay unemulated, except `/proc/self/fd/N`. A binary started
+  directly on a host path outside the guest root (the `run_guest` mode) gets
+  `ENOENT`.
+- **`fchmod` of a socket** returns `EOPNOTSUPP` with a diagnostic
+  (`fchmod-socket`). Linux succeeds (it changes the socket inode's mode,
+  which no path shows); QNX fails `EPERM` and can't do it, so Linuxemu refuses
+  instead of pretending. `chmod` of a bound socket's path works. libuv's
+  `uv_pipe_chmod` falls back to the path on `EOPNOTSUPP`.
+- **AF_UNIX `connect` to a non-socket** (an existing regular file) fails
+  `ECONNREFUSED` as on Linux; a missing path is `ENOENT`.
+- **AF_UNIX bound names.** `getsockname`, `getpeername`, `accept`, `recvfrom`
+  and `recvmsg` return the name as the guest gave it to `bind` (a relative
+  name stays relative), from a per-process table of the last 16 binds. The
+  table is lost at `execve` (the absolute guest path comes back), is not
+  shared with other processes (a fork child inherits a copy), and a name
+  bound by another process is reported as the absolute guest path. A name
+  bound by socket A, unlinked, and bound again by another socket with a
+  different spelling can make A report the new spelling.
+- **`wait4` waits for QNX's teardown.** After reaping an exited or killed
+  child, `wait4` waits until `kill(pid, 0)` fails, because QNX's `waitpid`
+  can return while the process still exists (a Linux guest then sees a pid
+  that should be gone). The wait is about 200 ms at most (up to about 400 ms
+  with QNX's clock tick) and then gives up silently. It delays a `WNOHANG`
+  poll that finds an exited child by that much.
+- **Event waits and signals.** `poll`, `ppoll`, `select`, `pselect6`,
+  `epoll_wait` and `epoll_pwait` always wait on the thread's signal-wait
+  channel, so a signal that lands just before QNX blocks still ends the wait
+  (the lost wake-up in `docs/FINDINGS.md`). In a narrow window an unmasked
+  `poll` or `select` can return `EINTR` although descriptors are already
+  ready, and a zero-timeout wait can return `EINTR`; Linux would return the
+  count. `epoll` lets ready events win over the signal. Each polling thread
+  holds 2 hidden descriptors from the reserve for the channel; if the reserve
+  is exhausted the wait still works but has the old window.
+- **Private writable file mappings are copies.** `mmap` with `MAP_PRIVATE`
+  and `PROT_WRITE` on a file reads the bytes in with `pread` at map time, as
+  executable private mappings already did, because QNX's own mapping
+  returned wrong pages (`docs/FINDINGS.md`, "The python3 start-up SIGSEGV is
+  a QNX mmap returning wrong file pages"). Later writes to the file don't
+  show in pages the guest hasn't touched (Linux shows them), the whole range
+  is read up front, and a mapping that starts past the end of the file is
+  zeros instead of `SIGBUS` on access. Read-only private mappings and
+  `MAP_SHARED` are still QNX file mappings.
+
 Other limits:
 
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched

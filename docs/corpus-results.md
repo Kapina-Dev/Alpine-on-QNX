@@ -289,3 +289,96 @@ work of part 2 had no corpus run of its own; this run covers it too.
 
 inotify-tools reports no unsupported call: no `inotify_*` call returns
 `ENOSYS` or `EOPNOTSUPP` in its workload.
+
+## Phase 3 part 4: 2026-11-21
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user.
+- **Linuxemu:** branch `phase3d-async-libuv` at `c2f9a93`, core sha256
+  `672d97cd6606a9c823ec5fcec9d54e90a206c81b4454f88fd3810bd757360ce4`.
+  The first run, on `011c860` (core `4027976d…`), scored the same.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+- **Battery:** charging. A run the same day at 4% battery, without a
+  charger, timed out Vim's install on every core: small-file writes on the
+  device's own filesystem had slowed about 50 times. That run doesn't count.
+- **Leftovers:** no Linuxemu process was left running; nginx stopped on
+  `nginx -s stop` (status 0).
+
+```text
+apk install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+busybox install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+gcc-make install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+git install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+inotify-tools install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+nginx install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+node install=pass startup=fail basic=skip concurrent=skip shutdown=skip compatible=no unsupported=3
+python install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+redis install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=1
+sqlite install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+vim install=pass startup=pass basic=pass concurrent=pass shutdown=pass compatible=yes unsupported=0
+corpus apps=11 compatible=10
+```
+
+The score is 10 of 11. **nginx is now compatible**: its worker starts
+(`FIOASYNC` and `F_SETOWN` on the master/worker socketpair), it serves
+(basic and concurrent), and it stops (shutdown). Every app compatible in
+part 3 still is.
+
+### Why each failing app fails
+
+| App | Stage | Cause | Roadmap |
+|---|---|---|---|
+| Node.js | startup | Fatal SIGSEGV at address 0 before printing its version (`pc=0x01a94688`, the same crash as in parts 1 and 3 at another load address), after `madvise` `ENOSYS` and a refused `mremap`. | Phase 4/6 (V8 memory and JIT) |
+
+### Unsupported calls per app
+
+| App | Calls (occurrences) |
+|---|---|
+| apk, GCC/make, Git, inotify-tools, SQLite, Vim | none |
+| BusyBox | `sendfile64` 3 (EINVAL, `sendfile-input`) |
+| nginx | `io_setup` 1 per process, 3 processes (ENOSYS) |
+| Node.js | `madvise` 17 (ENOSYS), `mremap` 1 (EINVAL, `mremap-kind`), `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+| Python | `membarrier` 1 per run, 2 runs (EINVAL, `membarrier-cmd`) |
+| Redis | `membarrier` 1 (EINVAL, `membarrier-cmd`) |
+
+nginx's `io_setup` is its start-up probe for Linux kernel AIO; on `ENOSYS`
+it falls back to its normal file I/O, so it isn't a gap.
+
+### libuv test suite
+
+`sh scripts/run-libuv-smoke.sh --all` on the same core:
+
+```text
+libuv_leftover_processes=0
+libuv_all pass=445 fail=38 skip=24
+```
+
+The gating subset (`scripts/libuv-subset.txt`, 158 tests) passes; none of
+the 38 failures is in it. `kill` failed in the first run (the SIGTERM lost
+after exec, `docs/FINDINGS.md`) and passes since the fix. The skips are libuv's own (exit 7): IPv6 not
+supported on the device (17), Windows-only tests (3), root-only (1),
+no recursive directory watching (1), no `/dev/tty` in the harness (1),
+no external IPv6 interface (1). The failures, by cause:
+
+| Tests | What libuv's assertion shows (errors as Linux numbers) |
+|---|---|
+| `fs_copyfile`, `fs_futime` (and their `_iouring` twins), `get_passwd`, `get_passwd2`, `get_group`, `platform_output`, `thread_name` | `ENOENT` (-2) from the call under test; not traced |
+| `fs_lutime` (and `_iouring`) | `EOPNOTSUPP` (-95) |
+| `fs_read_dir` (and `_iouring`) | `read` on a directory gets -90 (`EMSGSIZE`), not `EISDIR` |
+| `fs_readdir_file` (and `_iouring`) | `opendir`/`readdir` on a regular file succeeds, not `ENOTDIR` |
+| `fs_readdir_non_empty_dir` (and `_iouring`) | entry type is unknown, not `UV_DIRENT_FILE` |
+| `fs_statfs` (and `_iouring`) | `f_type` is 0 |
+| `ip6_addr_link_local` | `uv_interface_addresses` fails `EINVAL` |
+| `pipe_getsockname_abstract`, `pipe_getsockname_autobind` | abstract and autobound AF_UNIX names refused (`EOPNOTSUPP`, `EINVAL`) |
+| `poll_oob` | the client's out-of-band check is never seen |
+| `tcp_flags`, `udp_multicast_join`, `udp_send_unreachable` | `ENOPROTOOPT` (-92); option not traced |
+| `udp_recv_cb_close_pollerr`, `udp_send_pollerr_no_recv`, `udp_recvmsg_unreachable_error`, `udp_recvmsg_unreachable_error6` | `ENOPROTOOPT` (-92) binding with `UV_UDP_LINUX_RECVERR` (`IP_RECVERR`) |
+| `tcp_reuseport`, `udp_reuseport` | the second loop's socket never receives anything |
+| `tcp_rst` | `uv_guess_handle` on a TCP socket returns unknown |
+| `thread_affinity` | a CPU-affinity call fails `ENOSYS` (-38) |
+| `thread_priority` | the priority read back is outside the range libuv computes |
+| `udp_bind_reuseaddr`, `watcher_cross_stop` | `EADDRINUSE` (-98) binding a second UDP socket with `SO_REUSEADDR` |
+| `udp_connect` | `EAFNOSUPPORT` (-97); not traced |
+
+None of them is in the event-loop work of this part; they point at
+filesystem, procfs, socket-option and scheduling gaps (Phases 5–7). Only
+the subset gates.

@@ -1282,3 +1282,103 @@ only** (stream and datagram). AF_INET (TCP and UDP) gets `EINVAL` with the
 ptys. Otherwise one guest's TCP async I/O could kill later, unrelated
 processes. nginx asks for `SIGIO` only on its AF_UNIX master/worker
 socketpair, and libuv doesn't use `SIGIO`.
+
+## 2026-11-21 — Lost signal wake-up in poll and epoll waits (Phase 3 part 4, found by libuv)
+
+Found by libuv's `spawn_and_ping` (and earlier `spawn_same_stdout_stderr`),
+which timed out once in a long chain of runs (exit 124, the log ended at
+`close_cb`).
+
+- **Cause.** A guest signal handler runs only when the syscall returns:
+  the host handler sees a syscall in progress and queues the signal. The
+  signal-wait channel that wakes a blocked wait was open only for waits with
+  a signal mask (`ppoll`, `pselect6`, `epoll_pwait` with a mask). libuv calls
+  `epoll_pwait` with a NULL mask, so a SIGCHLD that arrived after the guest
+  entered the syscall but before QNX `poll()` blocked was only queued.
+  libuv's handler never wrote its signal pipe, `waitpid` never ran and, with
+  an infinite timeout, the loop slept until the test's 60 s kill. The child
+  exits right after closing its stdout, so it often signals just as the
+  parent re-enters `epoll_wait`. Plain `poll`, `select` and unmasked
+  `ppoll`/`pselect6` had the same window.
+- **Evidence.** Fixture check 17 (`libuv-gaps`): a SIGUSR1 handler writes a
+  self-pipe that is in an epoll set, a forked process signals once per round
+  after a sweeping delay, and `epoll_wait` (2 s) must report the pipe or
+  `EINTR`. It failed on the old core in 11 of 11 runs (rounds 5 to 1088)
+  and passed on the fixed core. Four parallel pre-fix `spawn_and_ping` loops
+  hung 3, 6, 5 and 5 times; in every hang `pidin` showed the process's one
+  thread in `SIGWAITINFO` (QNX `poll()` blocked), and a manual `SIGCHLD`
+  let the test finish with exit 0, so only the wake-up was lost.
+- **Fix.** `poll`, `ppoll`, `select`, `pselect6`, `epoll_wait` and
+  `epoll_pwait` always open and arm the thread's signal-wait channel (armed
+  at once if a signal is already queued), without touching the mask. Limits
+  are in `docs/compatibility.md` ("Event waits and signals").
+- **Not fixed.** Other blocking calls (`read` on a pipe, `nanosleep`, ...)
+  still have the same window between the trap and the QNX block.
+
+## 2026-11-21 — SIGTERM lost right after exec (Phase 3 part 4, found by libuv)
+
+Found by libuv's `kill` (timed out in the full-suite run) and by three
+helper processes (`spawn_helper4`) still running under pid 1 after a run,
+from `kill`, `process_ref` and `spawn_detached`. Two of them used about 35%
+CPU each.
+
+- **Cause: QNX.** A signal that arrives while a process is still being
+  exec'd is dropped. Native QNX `sleep` started from `sh` and sent
+  `SIGTERM` at once survived 3 of 3 times; native `hello` exited 0. A native
+  probe doing what libuv's `uv_spawn` does (a close-on-exec status pipe, then
+  `kill(child, SIGTERM)` on its EOF) lost the signal in 4 of 20 rounds.
+  Blocking every signal across the exec doesn't help: a blocked, pending
+  `SIGTERM` was also dropped (2 of 5 rounds).
+- **Why Linuxemu lost it every time.** The status pipe closes at the host
+  `execve`, and a Linuxemu image takes longer to start, so libuv's kill always
+  fell in the window. From the host, a `SIGTERM` sent at once to a starting
+  Linuxemu guest (libuv's helper or busybox `sleep`) was lost 3 of 3 times;
+  one sent 50 ms later or more always killed it.
+- **Fix.** Plain guest fds marked close-on-exec stay open across the host
+  `execve` (`LINUXEMU_GUEST_EXEC_CLOSE`), and the new image closes them just
+  before it enters the guest, so the old image's peers see the close only once
+  a signal can reach the new image. The same idea natively (the new image
+  closes the status pipe itself) killed the child in 20 of 20 rounds. Typed and
+  hidden fds keep the host's close-on-exec. Fixture check 18 (`libuv-gaps`)
+  fails on the previous core and passes on the fixed one; `kill`,
+  `process_ref` and `spawn_detached` pass 5 of 5 with nothing left behind.
+- **Side finding.** QNX's `fcntl(F_SETFD)` can return a nonzero value on
+  success when it clears `FD_CLOEXEC`; check it with `< 0`, not `!= 0`.
+- **Runner.** `run-libuv-smoke.sh` now kills and counts guests of its run
+  that are still alive at the end (`libuv_leftover_processes=N`).
+
+## 2026-11-21 — The python3 start-up SIGSEGV is a QNX mmap returning wrong file pages
+
+The `run-python-smoke` crash seen since Phase 0 (`fatal signal=0xb
+pc=0x60067dc4 address=0`) became reproducible at this gate: both full
+regressions failed on it, and then 10 of 10 fresh-install runs, on the part 4
+core and on the pre-phase core alike, so it isn't caused by this part.
+
+- **Where.** `0x60067dc4` is musl 1.2.6's `sysv_lookup` (offset `0x67dc4` in
+  `ld-musl-armhf.so.1`, loaded at `0x60000000`): it read `dso->hashtab`, which
+  was NULL, as was `dso->ghashtab`. Only `import zlib` crashed (and modules
+  that import it: `shutil`, `tempfile`, `http.server`); every other module in
+  the smoke imported. The trace showed the zlib extension module mapped (text
+  `0xb000` bytes, then its RW segment `MAP_PRIVATE|MAP_FIXED` from file offset
+  `0x8000`), then the crash, and `libz.so.1` never opened: musl had found no
+  hash table and no `DT_NEEDED`, so its dynamic section read as garbage.
+- **Evidence that QNX returned wrong pages.** While it reproduced, a native
+  probe mapping the module's offset `0x8000` `MAP_PRIVATE` with
+  `PROT_READ|PROT_WRITE`, fixed or not, differed from `pread` of the same bytes
+  from byte 0 on (1507 nonzero bytes, against 1243 in the file). The file
+  itself matched the apk's sha256.
+- **Not established: the trigger.** The state cleared within a few minutes
+  on its own; afterwards `PROT_READ` and RW mappings of every page matched,
+  `import zlib` worked, a fresh install (same inode, 206679) worked, and
+  `run-python-smoke` passed 3 of 3. A native probe of inode reuse (write, map,
+  unlink or rename or rewrite, write again, map) found no stale page in 150
+  rounds, although `unlink` reused the inode 48 times in 50. Leftover helper
+  processes were ruled out (killed before the 10 failing runs).
+- **Worked around.** Linuxemu used to pass private file mappings that are
+  not executable straight to QNX. Writable ones are now copied in with
+  `pread`, as executable ones already were, so a data segment no longer comes
+  from QNX's file mapping. Read-only private mappings are still mapped from
+  the file. `libuv-gaps` check 19 covers the copy path (contents, zeros after
+  the end of the file, private writes not reaching the file), but the bad
+  state itself could not be brought back, so the fix is not proven against
+  it.

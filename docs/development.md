@@ -227,7 +227,25 @@ exit 124). The subset prints `NAME exit=N expected=0` per test and ends
 with `linuxemu_libuv_failures=N`; `--all` ends with
 `libuv_all pass=P fail=F skip=S`. Per-test logs and diagnostics are in
 `build/libuv-smoke/`. The subset runs after `run-event-smoke` in the full
-regression.
+regression. Before its last line the runner prints
+`libuv_leftover_processes=N`: guests of the run still alive at the end (a
+helper its test left behind; the timeout kills only the test process) are
+killed, and each one counts as a failure.
+
+`--all` runs every test in the suite, 38 of which failed in the last run
+for gaps outside the event-loop work (results: [corpus-results.md](corpus-results.md)); only
+the subset gates. A few libuv tests, run back to back, are a useful check for
+races in the process and signal code: loop the 13 `spawn_*` tests with
+`LIBUV_SUBSET=file sh scripts/run-libuv-smoke.sh`, where `file` lists their
+names.
+
+QNX's io-pkt can leak a `SIGIO` into unrelated processes for a while after a
+process used async I/O on a TCP socket. Linuxemu refuses that (AF_UNIX only),
+but the native probe `build/native-probes/phase3d-tcp-sigio-leak` can still
+show whether the device is in that state. Run it only as `scan`, which
+should print `sigio=0`; its `arm` modes recreate the leak and are for
+research (`docs/FINDINGS.md`, "QNX io-pkt SIGIO leak after TCP async"). If a
+TCP test dies with `SIGIO` (exit 150), run `scan` and wait for it to read 0.
 
 Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
 
@@ -430,6 +448,11 @@ TPIDRURW must not hold persistent guest TLS. This QNX build does not context-swi
 - Linux `fdatasync` uses QNX `fsync`, which provides the required durability
   with stronger flushing semantics. `prlimit64` currently accepts the current
   process only.
+- Socket async I/O (`FIOASYNC`, `O_ASYNC`, `F_SETOWN`) works on AF_UNIX
+  sockets only, and the libuv fixes (`/proc/self/exe`, `fchmod` of a socket,
+  AF_UNIX bound names, the `wait4` delay) have limits; both are listed in
+  [compatibility.md](compatibility.md) ("Limits of the Phase 3 part 4 calls
+  (socket async I/O) and the libuv fixes").
 - inotify limits are listed in [compatibility.md](compatibility.md)
   ("Limits of the Phase 3 part 3 calls").
 - timerfd and signalfd limits are listed in
