@@ -1382,3 +1382,36 @@ core and on the pre-phase core alike, so it isn't caused by this part.
   the end of the file, private writes not reaching the file), but the bad
   state itself could not be brought back, so the fix is not proven against
   it.
+
+## 2026-11-22 — Phase 4 part 1: what anonymous executable patching was used for
+
+**A Linux `svc #0` that isn't patched runs a QNX kernel call.** Probe
+(2026-11-21, native QNX, ordinary user, scratch code not in the repo): a
+forked child ran `svc #0` in ARM and in Thumb state with `ip` set to an
+invalid kernel-call number (`0x7fff`). QNX's own kernel calls are
+`svc 0x51` with the call number in `ip`, returning to `svc + 4` on success
+and `svc + 8` on error (libc stubs: `svc 0x51; pop {…, pc}; pop {…, lr};
+b <errno path>`). The Linux `svc #0` returned at the error return in both
+states: **QNX ignores the `svc` immediate.** An unpatched Linux `svc` is
+never trapped; it silently runs whatever QNX call `ip` names. So system
+calls can't be caught when they run, and must be patched ahead of time
+wherever they can occur.
+
+**What anonymous patching was used for.** Before Phase 4 part 1 stops
+patching anonymous memory that `mprotect` makes executable, the check that
+reports such memory holding an `svc`-like word (`mprotect`
+`detail=anon-exec-svc`, with `LINUXEMU_DIAGNOSTICS`) ran over the full
+device regression and the whole corpus, on a core that still patched:
+
+- Full regression (`LINUXEMU_DIAGNOSTICS` set for every suite):
+  `linuxemu_full_regression_failures=0`, two records:
+  `runtime-exec-syscalls` (writes `mov r7,#20; svc #0; bx lr` into
+  anonymous memory and calls it: the one test of generated system calls)
+  and `mremap-syscalls` check 18 (plants an `svc` word only so the page gets
+  patched, then checks that `mremap` refuses patched memory).
+- Corpus (11 apps, 10 compatible as before): **no record**, Node.js
+  included (it still crashes at start-up, before any JIT flip).
+
+No program in the regression or the corpus generates system calls into
+anonymous memory; only two Linuxemu tests did, on purpose. Stopping
+anonymous patching affects those two tests and nothing else measured.
