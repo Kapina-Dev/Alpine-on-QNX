@@ -203,6 +203,32 @@ and commit the new binary:
 ALPINE_ROOT=build/fixture-rootfs sh scripts/build-guest-fixture.sh epoll-basic
 ```
 
+Run libuv's own tests (libuv 1.52.1, the version Alpine 3.24 ships). The
+device has no network, so fetch the pinned source on another machine and
+copy it over, then build the test runner on the device with the guest gcc:
+
+```sh
+sh scripts/fetch-libuv-source.sh   # laptop: artifacts/libuv/ (git-ignored)
+tar -cf - artifacts/libuv | ssh … 'cd DEV && tar -xf -'
+sh scripts/build-libuv-tests.sh    # device: build/libuv/uv_run_tests
+sh scripts/run-libuv-smoke.sh      # the event-loop subset
+sh scripts/run-libuv-smoke.sh --all
+```
+
+The build installs the pinned gcc/make/musl-dev closure
+(`docs/corpus/gcc-make-apks.sha256`) and the pinned `linux-headers` package
+(fetched with the source) in a fresh copy of the test rootfs, which it
+deletes afterwards. It takes about 22 minutes and is skipped while the
+binary is newer than the source archive. The subset,
+`scripts/libuv-subset.txt`, covers timers, idle, loop, ref, async, poll,
+thread pool, signal, spawn, pipe, TCP on 127.0.0.1 and fs_event tests; each runs from `/tmp/linuxemu-libuv` in the
+test rootfs with a 60 s limit (`LIBUV_TEST_TIMEOUT`; an ended test scores
+exit 124). The subset prints `NAME exit=N expected=0` per test and ends
+with `linuxemu_libuv_failures=N`; `--all` ends with
+`libuv_all pass=P fail=F skip=S`. Per-test logs and diagnostics are in
+`build/libuv-smoke/`. The subset runs after `run-event-smoke` in the full
+regression.
+
 Run runtime executable-map, `dlopen`, and multithreaded `posix_spawn` stress:
 
 ```sh

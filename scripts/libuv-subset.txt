@@ -1,0 +1,170 @@
+# libuv event-loop subset for scripts/run-libuv-smoke.sh (Phase 3 part 4
+# gate). One test name per line from libuv 1.52.1's test/test-list.h;
+# "#" starts a comment. Only the user removes a test from this list.
+#
+# Left out by construction: IPv6 (tcp6_*, *bind6*, *connect6*), TTY
+# (tty_*), DNS (getaddrinfo, getnameinfo, threadpool_cancel_getaddrinfo,
+# threadpool_cancel_getnameinfo), /proc readers (uv_resident_set_memory,
+# get_memory, uptime, cpu info) and process-title tests. Also left out:
+# addresses other than 127.0.0.1 (tcp_close_while_connecting and the
+# connect-timeout tests dial unroutable hosts, and the device has no
+# network) and Linux abstract-namespace pipes (pipe_getsockname_abstract,
+# pipe_getsockname_autobind), which are not a path under /tmp.
+
+# Timers.
+timer
+timer_again
+timer_start_twice
+timer_init
+timer_order
+timer_huge_timeout
+timer_huge_repeat
+timer_run_once
+timer_from_check
+timer_is_closing
+timer_null_callback
+timer_early_check
+timer_no_double_call_once
+timer_no_double_call_nowait
+timer_no_run_on_unref
+timer_zero_timeout
+
+# Idle handles.
+idle_starvation
+idle_check
+
+# Loop lifetime: alive, stop, update_time, close.
+loop_alive
+loop_stop
+loop_stop_before_run
+loop_update_time
+loop_close
+loop_instant_close
+loop_backend_timeout
+run_once
+run_nowait
+
+# ref/unref basics.
+ref
+idle_ref
+timer_ref
+timer_ref2
+has_ref
+unref_in_prepare_cb
+
+# async handles (eventfd-backed on Linux).
+async
+async_null_cb
+async_ref
+
+# uv_poll on 127.0.0.1 TCP sockets.
+poll_duplex
+poll_unidirectional
+poll_close
+
+# Thread pool (work, fs and random requests; no DNS).
+threadpool_queue_work_simple
+threadpool_queue_work_einval
+threadpool_multiple_event_loops
+threadpool_cancel_work
+threadpool_cancel_single
+threadpool_cancel_when_busy
+threadpool_cancel_random
+
+# Signal handles.
+signal_multiple_loops
+signal_pending_on_close
+signal_close_loop_alive
+we_get_signal
+we_get_signals
+we_get_signal_one_shot
+we_get_signals_mixed
+
+# Child processes: pipes and exit codes only (no files, TCP, setuid,
+# PATH lookup or detached sessions). The child is uv_run_tests itself,
+# found with uv_exepath().
+spawn_fails
+spawn_fails_check_for_waitpid_cleanup
+spawn_exit_code
+spawn_stdout
+spawn_stdin
+spawn_stdio_greater_than_3
+spawn_ignored_stdio
+spawn_and_kill
+spawn_and_kill_with_std
+spawn_and_ping
+spawn_same_stdout_stderr
+spawn_closed_process_io
+spawn_auto_unref
+
+# Unix-domain pipes; TEST_PIPENAME is "uv-test-sock" in the current
+# directory, so the socket path is under /tmp/linuxemu-libuv.
+pipe_ping_pong
+pipe_ping_pong_vec
+pipe_bind_error_addrinuse
+pipe_bind_error_addrnotavail
+pipe_bind_error_inval
+pipe_listen_without_bind
+pipe_bind_or_listen_error_after_close
+pipe_connect_bad_name
+pipe_connect_to_file
+pipe_connect_multiple
+pipe_connect_close_multiple
+pipe_connect_on_prepare
+pipe_getsockname
+pipe_overlong_path
+pipe_pending_instances
+pipe_server_close
+pipe_set_chmod
+pipe_set_non_blocking
+pipe_ref
+pipe_ref2
+pipe_ref3
+pipe_ref4
+shutdown_close_pipe
+
+# TCP on 127.0.0.1: echo ping-pong, close, shutdown.
+tcp_ping_pong
+tcp_ping_pong_vec
+tcp_writealot
+tcp_open
+tcp_bind_error_addrinuse_listen
+tcp_bind_localhost_ok
+tcp_listen_without_bind
+tcp_read_stop
+tcp_try_write
+tcp_ref
+tcp_ref2
+tcp_ref3
+tcp_close
+tcp_close_accept
+tcp_close_after_read_timeout
+tcp_close_reset_client
+tcp_close_reset_client_after_shutdown
+tcp_close_reset_accepted
+tcp_close_reset_accepted_after_shutdown
+tcp_close_reset_accepted_after_socket_shutdown
+tcp_shutdown_after_write
+shutdown_close_tcp
+shutdown_eof
+shutdown_twice
+
+# File system events (inotify-backed on Linux); watched paths are
+# relative to /tmp/linuxemu-libuv.
+fs_event_watch_dir
+fs_event_watch_file
+fs_event_watch_file_exact_path
+fs_event_watch_file_twice
+fs_event_watch_file_current_dir
+fs_event_watch_delete_dir
+fs_event_watch_invalid_path
+fs_event_no_callback_after_close
+fs_event_no_callback_on_close
+fs_event_immediate_close
+fs_event_close_with_pending_event
+fs_event_close_with_pending_delete_event
+fs_event_close_in_callback
+fs_event_start_and_close
+fs_event_getpath
+fs_event_ref
+fs_event_stop_in_cb
