@@ -595,8 +595,22 @@ static int32_t linux_chmodat(int directory_fd, const char *guest_path,
 
 static int32_t linux_fchmod(int descriptor, uint32_t mode)
 {
+    struct stat64 status;
+    int saved_errno;
+
     if (guest_fd_is_hidden(descriptor)) return -EBADF;
-    return linux_host_result(fchmod(descriptor, (mode_t)(mode & 07777u)));
+    if (fchmod(descriptor, (mode_t)(mode & 07777u)) == 0) return 0;
+    saved_errno = errno;
+    /* Linux changes only a socket inode's mode, which no path shows; QNX
+       refuses with EPERM, which callers read as a permission problem.
+       Refuse as unsupported instead, so they chmod the bound path. */
+    if (saved_errno == EPERM && fstat64(descriptor, &status) == 0 &&
+            S_ISSOCK(status.st_mode)) {
+        const uint32_t args[6] = { (uint32_t)descriptor, mode, 0, 0, 0, 0 };
+        return linux_unsupported(LINUX_NR_FCHMOD, LINUX_EOPNOTSUPP,
+            "fchmod-socket", args);
+    }
+    return -(int32_t)linux_errno_number(saved_errno);
 }
 
 /* Permission check against a status record, for the AT_EMPTY_PATH forms. */

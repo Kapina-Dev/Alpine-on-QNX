@@ -18,6 +18,10 @@
  *      does a client's getpeername() after connecting by the same name;
  *      a name bound as "/tmp/./NAME" also comes back as given (libuv
  *      pipe_getsockname)
+ *   15 fchmod() of a bound AF_UNIX socket fails EOPNOTSUPP (Linux would
+ *      change only the socket inode's mode; QNX refuses it with EPERM and
+ *      Linuxemu reports the refusal), and chmod() of the bound path sets
+ *      the mode stat() shows (libuv pipe_set_chmod)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -29,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -37,6 +42,7 @@
 #define PLAIN_FILE "/tmp/linuxemu-libuv-gaps-file"
 #define SOCKET_NAME "linuxemu-libuv-gaps-sock"
 #define DOTTED_NAME "/tmp/./linuxemu-libuv-gaps-sock2"
+#define CHMOD_NAME "/tmp/linuxemu-libuv-gaps-sock3"
 
 static volatile sig_atomic_t current_check;
 
@@ -223,6 +229,32 @@ static int check_bound_names(void)
     return 0;
 }
 
+static int check_socket_chmod(void)
+{
+    struct sockaddr_un address;
+    struct stat status;
+    int fd;
+
+    unlink(CHMOD_NAME);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return fail(15, "socket");
+    unix_address(&address, CHMOD_NAME);
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+        return fail(15, "bind");
+    errno = 0;
+    if (fchmod(fd, 0444) == 0 || errno != EOPNOTSUPP)
+        return fail(15, "fchmod of a socket");
+    if (chmod(CHMOD_NAME, 0444) != 0) return fail(15, "chmod 0444");
+    if (stat(CHMOD_NAME, &status) != 0 || !S_ISSOCK(status.st_mode) ||
+        (status.st_mode & 0777) != 0444) return fail(15, "stat after 0444");
+    if (chmod(CHMOD_NAME, 0666) != 0) return fail(15, "chmod 0666");
+    if (stat(CHMOD_NAME, &status) != 0 || (status.st_mode & 0777) != 0666)
+        return fail(15, "stat after 0666");
+    close(fd);
+    unlink(CHMOD_NAME);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -238,5 +270,6 @@ int main(int argc, char **argv)
     if ((result = check_exec(self)) != 0) return result;
     if ((result = check_connect_file()) != 0) return result;
     if ((result = check_bound_names()) != 0) return result;
+    if ((result = check_socket_chmod()) != 0) return result;
     return 0;
 }
