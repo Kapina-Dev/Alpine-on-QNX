@@ -229,5 +229,21 @@ if [ "$status" -ne 0 ]; then
     diag_fail diag-unwritable "guest status changed"
 fi
 
+# Anonymous memory made executable that holds an svc-like word is reported
+# (the guest's own status is checked by its run_guest line, not here).
+echo "=== diagnostics: diag-anon-exec ==="
+report="$diag_dir/anon-exec.txt"
+rm -f "$report"
+LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 30 \
+    "$linuxemu" "$guest_dir/jit-patch-hazard" 2>/dev/null
+status=$?
+lines=$(grep 'name=mprotect ' "$report" 2>/dev/null |
+    grep -c 'detail=anon-exec-svc')
+echo "diag-anon-exec exit=$status records=${lines:-0}"
+if [ "${lines:-0}" -lt 1 ]; then
+    diag_fail diag-anon-exec "no anon-exec-svc record"
+    cat "$report" 2>/dev/null
+fi
+
 echo "linuxemu_smoke_failures=$failures"
 test "$failures" -eq 0

@@ -62,6 +62,11 @@ int guest_memory_runtime_map_kind(uintptr_t address, size_t length,
 int guest_memory_runtime_protect(uintptr_t address, size_t length,
     int executable, int readwrite);
 int guest_memory_runtime_is_plain(uintptr_t address, size_t length);
+/* 1 when the runtime mapping at address is private anonymous memory, 0 when
+   it is file backed or untracked; *run_end is where that answer next
+   changes, clipped to limit. */
+int guest_memory_runtime_anonymous_at(uintptr_t address, uintptr_t limit,
+    uintptr_t *run_end);
 void guest_memory_runtime_unmap(uintptr_t address, size_t length);
 void guest_memory_after_fork(void);
 int guest_brk_initialize(uintptr_t initial_break);
@@ -78,6 +83,9 @@ struct arm_patch_site {
 };
 
 int arm_patch_range(uintptr_t start, size_t length);
+/* Read-only: 1 and *first when a 4-byte-aligned word in the range is one
+   arm_patch_range would rewrite (ARM svc #0 or TPIDRURO read), else 0. */
+int arm_patch_candidate(uintptr_t start, size_t length, uintptr_t *first);
 int arm_patch_thumb_range(uintptr_t start, size_t length);
 int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length);

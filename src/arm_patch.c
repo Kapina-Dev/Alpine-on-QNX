@@ -65,6 +65,24 @@ int arm_patch_range(uintptr_t start, size_t length)
     return 0;
 }
 
+int arm_patch_candidate(uintptr_t start, size_t length, uintptr_t *first)
+{
+    uintptr_t address = (start + 3u) & ~(uintptr_t)3u;
+    uintptr_t end;
+
+    if (length > UINTPTR_MAX - start) return 0;
+    end = start + length;
+    for (; address + 4u <= end && address >= start; address += 4) {
+        uint32_t word = *(const uint32_t *)address;
+        if (word == ARM_LINUX_SVC_0 ||
+            (word & ARM_TPIDRURO_MASK) == ARM_TPIDRURO_READ) {
+            *first = address;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int arm_patch_thumb_range(uintptr_t start, size_t length)
 {
     const uint16_t *code = (const uint16_t *)start;

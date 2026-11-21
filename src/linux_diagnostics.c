@@ -115,6 +115,11 @@ void linux_diag_set_enabled(int value)
     enabled = value != 0;
 }
 
+int linux_diag_is_enabled(void)
+{
+    return enabled;
+}
+
 void linux_diag_after_fork(void)
 {
     entry_count = 0;

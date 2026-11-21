@@ -1351,6 +1351,31 @@ static int32_t linux_mmap2(ucontext_t *context)
     return (int32_t)mapped_address;
 }
 
+/* With LINUXEMU_DIAGNOSTICS on, report anonymous memory being made
+   executable that holds a word arm_patch_range would rewrite: a generated
+   Linux svc, or a JIT data word that only looks like one. Read-only. */
+static void report_anonymous_exec_candidates(uintptr_t address, size_t length)
+{
+    uintptr_t end = address + length;
+    uintptr_t cursor = address;
+
+    if (!linux_diag_is_enabled()) return;
+    while (cursor < end) {
+        uintptr_t run_end;
+        uintptr_t first;
+        int anonymous = guest_memory_runtime_anonymous_at(cursor, end,
+            &run_end);
+        if (anonymous && arm_patch_candidate(cursor, run_end - cursor,
+                &first)) {
+            uint32_t args[6] = { (uint32_t)first, (uint32_t)address,
+                (uint32_t)length, 0, 0, 0 };
+            linux_diag_record(125, 0, "anon-exec-svc", args);
+            return;
+        }
+        cursor = run_end;
+    }
+}
+
 static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
     uint32_t linux_protection)
 {
@@ -1375,6 +1400,7 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
         if (mprotect((void *)address, mapped_length,
                 host_protection | PROT_READ | PROT_WRITE) != 0)
             return -(int32_t)linux_errno_number(errno);
+        report_anonymous_exec_candidates(address, mapped_length);
         if (arm_patch_range(address, mapped_length) != 0) {
             int saved_errno = errno;
             arm_patch_rollback(patches_before);

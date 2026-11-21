@@ -428,6 +428,38 @@ int guest_memory_runtime_is_plain(uintptr_t address, size_t length)
     return plain;
 }
 
+int guest_memory_runtime_anonymous_at(uintptr_t address, uintptr_t limit,
+    uintptr_t *run_end)
+{
+    uintptr_t cursor = address;
+    int first = -1;
+    pthread_mutex_lock(&runtime_mapping_lock);
+    while (cursor < limit) {
+        size_t i;
+        int anonymous = 0;
+        uintptr_t next = limit;
+        for (i = 0; i < runtime_mapping_count; ++i) {
+            if (runtime_mappings[i].start <= cursor &&
+                runtime_mappings[i].end > cursor) {
+                anonymous = runtime_mappings[i].anonymous;
+                next = runtime_mappings[i].end;
+                break;
+            }
+            /* Untracked gap: it runs to the next mapping's start. */
+            if (runtime_mappings[i].start > cursor &&
+                runtime_mappings[i].start < next)
+                next = runtime_mappings[i].start;
+        }
+        if (i == runtime_mapping_count) anonymous = 0;
+        if (first < 0) first = anonymous;
+        else if (anonymous != first) break;
+        cursor = next < limit ? next : limit;
+    }
+    pthread_mutex_unlock(&runtime_mapping_lock);
+    *run_end = cursor > address ? cursor : limit;
+    return first > 0;
+}
+
 void guest_memory_runtime_unmap(uintptr_t address, size_t length)
 {
     if (length == 0 || length > UINTPTR_MAX - address) return;

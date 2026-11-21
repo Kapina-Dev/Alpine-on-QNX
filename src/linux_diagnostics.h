@@ -34,6 +34,7 @@ void linux_diag_reset(void);
 /* Recording is off until enabled (Linuxemu enables it when
    LINUXEMU_DIAGNOSTICS is set), so the unset path records nothing. */
 void linux_diag_set_enabled(int enabled);
+int linux_diag_is_enabled(void);
 
 /* Empty the table in a fork child without taking the lock: another thread
    of the parent may have held it at fork time, and that thread does not
