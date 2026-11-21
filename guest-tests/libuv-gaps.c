@@ -13,11 +13,17 @@
  *   13 connect() of an AF_UNIX stream socket, blocking and nonblocking, to
  *      a regular file fails ECONNREFUSED, and to a missing path ENOENT
  *      (libuv pipe_connect_to_file)
+ *   14 getsockname() of an AF_UNIX socket bound to a relative name, from
+ *      /tmp, returns that name as given (length 2 + strlen + 1), and so
+ *      does a client's getpeername() after connecting by the same name;
+ *      a name bound as "/tmp/./NAME" also comes back as given (libuv
+ *      pipe_getsockname)
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +35,8 @@
 
 #define EXEC_LINK "/tmp/linuxemu-libuv-gaps-link"
 #define PLAIN_FILE "/tmp/linuxemu-libuv-gaps-file"
+#define SOCKET_NAME "linuxemu-libuv-gaps-sock"
+#define DOTTED_NAME "/tmp/./linuxemu-libuv-gaps-sock2"
 
 static volatile sig_atomic_t current_check;
 
@@ -151,6 +159,70 @@ static int check_connect_file(void)
     return 0;
 }
 
+static void unix_address(struct sockaddr_un *address, const char *path)
+{
+    memset(address, 0, sizeof(*address));
+    address->sun_family = AF_UNIX;
+    strcpy(address->sun_path, path);
+}
+
+/* getsockname or getpeername of fd is exactly the AF_UNIX name path. */
+static int has_name(int fd, int peer, const char *path)
+{
+    struct sockaddr_un address;
+    socklen_t length = sizeof(address);
+    int result;
+
+    memset(&address, 0, sizeof(address));
+    result = peer ? getpeername(fd, (struct sockaddr *)&address, &length) :
+        getsockname(fd, (struct sockaddr *)&address, &length);
+    if (result != 0) return 0;
+    if (length != offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1 ||
+        strcmp(address.sun_path, path) != 0) {
+        fprintf(stderr, "libuv-gaps: name is \"%s\" (length %u), want "
+            "\"%s\"\n", address.sun_path, (unsigned)length, path);
+        errno = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int check_bound_names(void)
+{
+    struct sockaddr_un address;
+    int server, client, dotted;
+
+    arm(14, 10);
+    if (chdir("/tmp") != 0) return fail(14, "chdir /tmp");
+    unlink(SOCKET_NAME);
+    unlink(DOTTED_NAME);
+    server = socket(AF_UNIX, SOCK_STREAM, 0);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    dotted = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server < 0 || client < 0 || dotted < 0) return fail(14, "socket");
+    unix_address(&address, SOCKET_NAME);
+    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(server, 1) != 0) return fail(14, "bind relative name");
+    if (!has_name(server, 0, SOCKET_NAME))
+        return fail(14, "getsockname of a relative name");
+    if (connect(client, (struct sockaddr *)&address, sizeof(address)) != 0)
+        return fail(14, "connect by relative name");
+    if (!has_name(client, 1, SOCKET_NAME))
+        return fail(14, "getpeername of a relative name");
+    unix_address(&address, DOTTED_NAME);
+    if (bind(dotted, (struct sockaddr *)&address, sizeof(address)) != 0)
+        return fail(14, "bind dotted name");
+    if (!has_name(dotted, 0, DOTTED_NAME))
+        return fail(14, "getsockname of a dotted name");
+    close(server);
+    close(client);
+    close(dotted);
+    unlink(SOCKET_NAME);
+    unlink(DOTTED_NAME);
+    alarm(0);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char self[PATH_MAX];
@@ -165,5 +237,6 @@ int main(int argc, char **argv)
     if ((result = check_exe(self)) != 0) return result;
     if ((result = check_exec(self)) != 0) return result;
     if ((result = check_connect_file()) != 0) return result;
+    if ((result = check_bound_names()) != 0) return result;
     return 0;
 }

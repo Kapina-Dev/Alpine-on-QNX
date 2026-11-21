@@ -136,6 +136,89 @@ static size_t bounded_string_length(const char *text, size_t limit)
     return length;
 }
 
+/* Linux's getsockname, getpeername, accept and recvfrom return an AF_UNIX
+   name as it was given to bind ("sock", relative to the binder's cwd).
+   QNX knows only the host path Linuxemu bound, which converts back to an
+   absolute guest path.  So each bind records its guest spelling by host
+   path, and store_address returns the spelling recorded for that path.
+   A host path names at most one bound socket at a time, and the latest
+   bind of a path replaces the record.  Known limits: the records live in
+   this process (fork children inherit them; after an exec, or for a name
+   bound by another process, the absolute guest path is returned) and only
+   the last BOUND_NAMES binds are kept.
+
+   No lock: a writer takes a slot by moving its sequence from even to odd
+   with a compare-and-swap (and records nothing if another writer holds
+   it), and a reader keeps a copy only when the sequence was even and
+   unchanged around the copy. */
+#define BOUND_NAMES 16
+
+struct bound_name {
+    volatile unsigned sequence;
+    char host[sizeof(((struct sockaddr_un *)0)->sun_path) + 1];
+    char guest[LINUX_UNIX_PATH_MAX + 1];
+};
+
+static struct bound_name bound_names[BOUND_NAMES];
+static volatile unsigned bound_name_next;
+
+/* A consistent copy of slot's host and guest names, or 0. */
+static int bound_name_read(struct bound_name *slot, char *host, char *guest)
+{
+    unsigned sequence = slot->sequence;
+    if (sequence == 0 || (sequence & 1u) != 0) return 0;
+    __sync_synchronize();
+    memcpy(host, slot->host, sizeof(slot->host));
+    memcpy(guest, slot->guest, sizeof(slot->guest));
+    __sync_synchronize();
+    return slot->sequence == sequence;
+}
+
+static void bound_name_record(const char *host_path, const char *guest_name)
+{
+    char host[sizeof(bound_names[0].host)];
+    char guest[sizeof(bound_names[0].guest)];
+    struct bound_name *slot = 0;
+    unsigned sequence;
+    size_t i;
+
+    if (strlen(host_path) >= sizeof(host) ||
+        strlen(guest_name) >= sizeof(guest)) return;
+    for (i = 0; i != BOUND_NAMES && slot == 0; ++i)
+        if (bound_name_read(&bound_names[i], host, guest) &&
+                strcmp(host, host_path) == 0)
+            slot = &bound_names[i];
+    if (slot == 0)
+        slot = &bound_names[__sync_fetch_and_add(&bound_name_next, 1u) %
+            BOUND_NAMES];
+    sequence = slot->sequence;
+    if ((sequence & 1u) != 0 ||
+        !__sync_bool_compare_and_swap(&slot->sequence, sequence,
+            sequence + 1u)) return;
+    __sync_synchronize();
+    strcpy(slot->host, host_path);
+    strcpy(slot->guest, guest_name);
+    __sync_synchronize();
+    slot->sequence = sequence + 2u;
+}
+
+/* The guest spelling recorded for host_path (host_length bytes, not
+   terminated) into guest (LINUX_UNIX_PATH_MAX + 1 bytes), or 0. */
+static int bound_name_find(const char *host_path, size_t host_length,
+    char *guest)
+{
+    char host[sizeof(bound_names[0].host)];
+    size_t i;
+
+    if (host_length >= sizeof(host)) return 0;
+    for (i = 0; i != BOUND_NAMES; ++i)
+        if (bound_name_read(&bound_names[i], host, guest) &&
+                strlen(host) == host_length &&
+                memcmp(host, host_path, host_length) == 0)
+            return 1;
+    return 0;
+}
+
 static int guest_address(const void *guest, uint32_t guest_length,
     int bind_address, struct sockaddr_storage *host, socklen_t *host_length)
 {
@@ -217,10 +300,15 @@ static int store_address(void *guest, uint32_t *guest_length,
             host_length - offsetof(struct sockaddr_un, sun_path) : 0;
         size_t path_length;
         size_t root_length = strlen(root);
+        char bound[LINUX_UNIX_PATH_MAX + 1];
         if (available > sizeof(address->sun_path))
             available = sizeof(address->sun_path);
         path_length = bounded_string_length(path, available);
-        if (path_length >= root_length && memcmp(path, root, root_length) == 0 &&
+        if (path_length != 0 && bound_name_find(path, path_length, bound)) {
+            path = bound;
+            path_length = strlen(bound);
+        } else if (path_length >= root_length &&
+            memcmp(path, root, root_length) == 0 &&
             (path_length == root_length || path[root_length] == '/')) {
             path += root_length;
             path_length -= root_length;
@@ -642,9 +730,25 @@ static int32_t address_call(uint32_t number, uint32_t *arguments)
         converted = guest_address((void *)arguments[1], arguments[2],
             number == LINUX_NR_BIND, &address, &length);
         if (converted != 0) return converted;
-        if (number == LINUX_NR_BIND)
-            return socket_result(bind((int)arguments[0],
-                (struct sockaddr *)&address, length));
+        if (number == LINUX_NR_BIND) {
+            const char *name = (const char *)arguments[1];
+            char guest_name[LINUX_UNIX_PATH_MAX + 1];
+            size_t name_length;
+            if (bind((int)arguments[0], (struct sockaddr *)&address,
+                    length) != 0) return socket_result(-1);
+            /* guest_address accepted it: a pathname name has a length of
+               3 to 110 bytes. */
+            if (address.ss_family == AF_UNIX && arguments[2] > 2) {
+                name_length = bounded_string_length(name + 2,
+                    arguments[2] - 2);
+                memcpy(guest_name, name + 2, name_length);
+                guest_name[name_length] = '\0';
+                bound_name_record(
+                    ((const struct sockaddr_un *)&address)->sun_path,
+                    guest_name);
+            }
+            return 0;
+        }
         if (connect((int)arguments[0], (struct sockaddr *)&address,
                 length) == 0) return 0;
         /* QNX finds AF_UNIX names in io-pkt's namespace and reports any
