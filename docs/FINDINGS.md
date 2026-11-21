@@ -1415,3 +1415,31 @@ device regression and the whole corpus, on a core that still patched:
 No program in the regression or the corpus generates system calls into
 anonymous memory; only two Linuxemu tests did, on purpose. Stopping
 anonymous patching affects those two tests and nothing else measured.
+
+## 2026-11-22 — Phase 4 part 1: flip cost and Node
+
+Measured on the Passport with the core that still patched anonymous memory
+(Task 1 of part 1) and the core that doesn't (Task 4).
+
+**Flip cost.** `guest-tests/jit-flip-bench.c` (fixture
+`jit-flip-bench-armhf`, not a regression test) flips 256 KiB of anonymous
+memory RW → RX → RW 1000 times. Three runs per core, alternating:
+
+| Core | usec for 1000 flip pairs |
+|---|---|
+| patches anonymous memory | 540911, 472000, 472000 |
+| doesn't | 308064, 289000, 287000 |
+
+About 40% less per flip. What is left is the two host `mprotect` calls and
+the instruction-cache `msync` over the range.
+
+**Node.js is not blocked by the JIT hazard.** `node -e 'console.log(1+1)'`
+from the pinned corpus closure (Node 24), with and without `--jitless`, on
+both cores: all four runs die at start-up with SIGSEGV at address 0, at a pc
+ending in `…688` (`0x016e2688`, `0x0113f688`, `0x017e7688`, `0x01df0688`:
+the same instruction at different load addresses). The unsupported calls
+are the same on both cores: `madvise` `ENOSYS` (17), `mremap`
+`mremap-kind` (1), `membarrier` `membarrier-cmd` (1). No `anon-exec-svc`
+record: Node crashes before its JIT flips any memory. The crash happens
+with the JIT off too, so it is V8's memory set-up, not code generation
+(the `madvise`/`mremap` work of Phase 6), as the roadmap expected.
