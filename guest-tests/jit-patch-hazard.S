@@ -4,7 +4,9 @@
     .global _start
     .type _start, %function
 
-/* Measurement, not a regression test. Exit 20: a data word changed when the
+/* Regression test since Phase 4 part 1 (run-linuxemu-smoke expects 0): a
+   JIT's data in anonymous memory made executable must not be rewritten.
+   Exit 20: a data word changed when the
    RW page flipped RX (hazard present). Exit 21: an mprotect failed in the
    5000-flip loop (the iteration is printed in decimal on stderr).
    Exit 0: neither happened. Exit 1: setup failed. A changed word does not

@@ -89,6 +89,8 @@ int main(int argc, char **argv)
     {
         const char *diagnostics = getenv("LINUXEMU_DIAGNOSTICS");
         int enabled = diagnostics != 0 && diagnostics[0] != '\0';
+        const char *patch = getenv("LINUXEMU_PATCH_ANONYMOUS");
+        linux_syscall_set_patch_anonymous(patch != 0 && strcmp(patch, "1") == 0);
         linux_diag_set_enabled(enabled);
         linux_diag_runtime_initialize();
         if (enabled) guest_signal_diagnostics_initialize();

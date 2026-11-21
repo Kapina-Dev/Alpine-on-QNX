@@ -14,7 +14,7 @@
 
 static char emulator_path[PATH_MAX];
 static char *host_arguments[MAX_EXEC_VECTOR + 6];
-static char *host_environment[MAX_EXEC_VECTOR + 11];
+static char *host_environment[MAX_EXEC_VECTOR + 12];
 /* Fd records carried into the new image (guest_fd_exec_records). */
 static char fd_records_variable[32768];
 static char personality_variable[48];
@@ -265,6 +265,14 @@ int guest_process_exec(const char *host_executable, const char *guest_executable
                 "LINUXEMU_DIAGNOSTICS=%s", diagnostics);
             host_environment[environment_count++] = diagnostics_variable;
         }
+    }
+    {
+        /* A host variable, not one the guest sees: carry it over the
+           guest environment the new image is given. */
+        const char *patch = getenv("LINUXEMU_PATCH_ANONYMOUS");
+        if (patch != 0 && strcmp(patch, "1") == 0)
+            host_environment[environment_count++] =
+                "LINUXEMU_PATCH_ANONYMOUS=1";
     }
     snprintf(executable_variable, sizeof(executable_variable),
         "LINUXEMU_GUEST_EXE=%s", guest_executable);

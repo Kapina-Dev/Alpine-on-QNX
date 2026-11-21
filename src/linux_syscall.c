@@ -1351,6 +1351,15 @@ static int32_t linux_mmap2(ucontext_t *context)
     return (int32_t)mapped_address;
 }
 
+/* LINUXEMU_PATCH_ANONYMOUS=1: patch anonymous memory made executable, as
+   before Phase 4 part 1, for a program that generates system calls. */
+static int patch_anonymous_memory;
+
+void linux_syscall_set_patch_anonymous(int enabled)
+{
+    patch_anonymous_memory = enabled != 0;
+}
+
 /* With LINUXEMU_DIAGNOSTICS on, report anonymous memory being made
    executable that holds a word arm_patch_range would rewrite: a generated
    Linux svc, or a JIT data word that only looks like one. Read-only. */
@@ -1397,15 +1406,28 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
         return 0;
     }
     if ((host_protection & PROT_EXEC) != 0) {
-        if (mprotect((void *)address, mapped_length,
-                host_protection | PROT_READ | PROT_WRITE) != 0)
-            return -(int32_t)linux_errno_number(errno);
-        report_anonymous_exec_candidates(address, mapped_length);
-        if (arm_patch_range(address, mapped_length) != 0) {
-            int saved_errno = errno;
-            arm_patch_rollback(patches_before);
-            mprotect((void *)address, mapped_length, host_protection);
-            return -(int32_t)linux_errno_number(saved_errno);
+        /* Run by run: file-backed memory is patched as when it was mapped;
+           anonymous memory (a JIT's code and data) is left alone unless
+           LINUXEMU_PATCH_ANONYMOUS=1, because a data word can't be told
+           from an svc and JIT code makes no system calls itself. */
+        uintptr_t end = address + mapped_length;
+        uintptr_t cursor = address;
+        while (cursor < end) {
+            uintptr_t run_end;
+            int anonymous = guest_memory_runtime_anonymous_at(cursor, end,
+                &run_end);
+            if (!anonymous || patch_anonymous_memory) {
+                int failed = mprotect((void *)cursor, run_end - cursor,
+                    host_protection | PROT_READ | PROT_WRITE) != 0 ||
+                    arm_patch_range(cursor, run_end - cursor) != 0;
+                if (failed) {
+                    int saved_errno = errno;
+                    arm_patch_rollback(patches_before);
+                    mprotect((void *)address, mapped_length, host_protection);
+                    return -(int32_t)linux_errno_number(saved_errno);
+                }
+            }
+            cursor = run_end;
         }
         if (msync((void *)address, mapped_length,
                 MS_INVALIDATE_ICACHE) != 0) {
@@ -1421,6 +1443,11 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
             arm_patch_rollback(patches_before);
         return -(int32_t)linux_errno_number(saved_errno);
     }
+    /* After the final protection, so the read can't fault on memory that
+       was PROT_NONE; execute-only memory isn't read. */
+    if ((host_protection & (PROT_EXEC | PROT_READ)) ==
+            (PROT_EXEC | PROT_READ))
+        report_anonymous_exec_candidates(address, mapped_length);
     if (guest_memory_runtime_protect(address, mapped_length,
             (host_protection & PROT_EXEC) != 0,
             host_protection == (PROT_READ | PROT_WRITE)) != 0)

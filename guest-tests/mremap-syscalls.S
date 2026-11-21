@@ -6,7 +6,9 @@
 
 /*
  * mremap for private anonymous read-write memory.  Each failing check exits
- * with its own number (10..18); 9 is a setup failure.
+ * with its own number (10..19); 9 is a setup failure.  Run with any argument
+ * (and LINUXEMU_PATCH_ANONYMOUS=1), check 18 expects the patched-memory
+ * refusal instead of the default behaviour.
  */
     .macro sys nr
     movw r7, #\nr
@@ -23,6 +25,7 @@
     .endm
 
 _start:
+    ldr r11, [sp]            @ argc: > 1 selects the patched mode of check 18
     /* 10: shrink 3 pages to 1 in place; page 0 keeps its pattern and the
        freed page is available to a hinted mmap again */
     mapanon 12288, 3
@@ -225,7 +228,9 @@ _start:
     cmp r0, r8
     bne f17
 
-    /* 18: memory that was patched (RW -> RX -> RW) is refused */
+    /* 18: memory flipped RW -> RX -> RW.  Default: anonymous memory is not
+       patched, so it is still plain and may move (19: its svc-like word
+       changed).  Patched mode: the patched page is refused (EINVAL). */
     mapanon 4096, 3
     cmn r0, #4096
     bhi f9
@@ -251,9 +256,18 @@ _start:
     movw r2, #8192
     mov r3, #1
     sys 163
-    cmn r0, #22
+    cmp r11, #1
+    bgt 18f
+    cmn r0, #4096
+    bhi f18
+    ldr r1, [r0]
+    ldr r2, =0xef000000
+    cmp r1, r2
+    bne f19
+    b 19f
+18: cmn r0, #22
     bne f18
-
+19:
     mov r0, #0
     b done
 f9: mov r0, #9
@@ -275,6 +289,8 @@ f16: mov r0, #16
 f17: mov r0, #17
     b done
 f18: mov r0, #18
+    b done
+f19: mov r0, #19
 done:
     sys 1
 

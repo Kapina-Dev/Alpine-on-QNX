@@ -89,7 +89,8 @@ set -x
 
 mkdir -p "$project_dir/build/guest-tests"
 for guest in write-exit unknown-syscall exit-status initial-stack \
-    memory-syscalls runtime-exec-syscalls file-syscalls \
+    memory-syscalls runtime-exec-syscalls runtime-exec-plain \
+    runtime-exec-mixed exec-argv1 file-syscalls \
     terminal-time-syscalls socket-syscalls unix-rights-backlog \
     fd-path-records wake-eventfd-dup getdents-chunks fd-close-all fd-exhaust \
     network-connect-syscalls entropy-syscalls thread-futex-syscalls \

@@ -86,6 +86,8 @@ int arm_patch_range(uintptr_t start, size_t length);
 /* Read-only: 1 and *first when a 4-byte-aligned word in the range is one
    arm_patch_range would rewrite (ARM svc #0 or TPIDRURO read), else 0. */
 int arm_patch_candidate(uintptr_t start, size_t length, uintptr_t *first);
+/* LINUXEMU_PATCH_ANONYMOUS=1: patch anonymous memory made executable. */
+void linux_syscall_set_patch_anonymous(int enabled);
 int arm_patch_thumb_range(uintptr_t start, size_t length);
 int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length);

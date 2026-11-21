@@ -33,7 +33,19 @@ run_guest unknown-syscall 0
 run_guest exit-status 37
 run_guest initial-stack 0 alpha beta
 run_guest memory-syscalls 0
+run_guest runtime-exec-plain 0
+run_guest jit-patch-hazard 0
+# Generated system calls in anonymous memory need LINUXEMU_PATCH_ANONYMOUS=1
+# (Phase 4 part 1).
+export LINUXEMU_PATCH_ANONYMOUS=1
 run_guest runtime-exec-syscalls 0
+# These open or execve host paths, so they need the host root; the second
+# checks that the switch survives an execve.
+export LINUXEMU_ROOT=/
+run_guest exec-argv1 0 "$guest_dir/runtime-exec-syscalls"
+unset LINUXEMU_PATCH_ANONYMOUS
+run_guest runtime-exec-mixed 0
+unset LINUXEMU_ROOT
 run_guest entropy-syscalls 0
 run_guest cacheflush-syscalls 0
 run_guest thread-futex-syscalls 0
@@ -59,6 +71,12 @@ LINUXEMU_ROOT=/ "$timeout_command" 10 \
     "$linuxemu" "$guest_dir/mremap-syscalls"
 status=$?
 echo "mremap-syscalls exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+echo "=== guest: mremap-syscalls patched ==="
+LINUXEMU_ROOT=/ LINUXEMU_PATCH_ANONYMOUS=1 "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/mremap-syscalls" patched
+status=$?
+echo "mremap-syscalls-patched exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
 diag_dir="$project_dir/build/diag"
@@ -243,6 +261,22 @@ echo "diag-anon-exec exit=$status records=${lines:-0}"
 if [ "${lines:-0}" -lt 1 ]; then
     diag_fail diag-anon-exec "no anon-exec-svc record"
     cat "$report" 2>/dev/null
+fi
+
+# Without LINUXEMU_PATCH_ANONYMOUS, a generated svc in anonymous memory is
+# not patched (it runs as a QNX kernel call and the guest dies); it must at
+# least be named in the report, and the guest must not hang.
+echo "=== diagnostics: diag-anon-svc-unpatched ==="
+report="$diag_dir/anon-svc-unpatched.txt"
+rm -f "$report"
+LINUXEMU_DIAGNOSTICS="$report" "$timeout_command" 10 \
+    "$linuxemu" "$guest_dir/runtime-exec-syscalls" 2>/dev/null
+status=$?
+lines=$(grep 'name=mprotect ' "$report" 2>/dev/null |
+    grep -c 'detail=anon-exec-svc')
+echo "diag-anon-svc-unpatched exit=$status records=${lines:-0}"
+if [ "${lines:-0}" -lt 1 ] || [ "$status" -eq 124 ]; then
+    diag_fail diag-anon-svc-unpatched "no record, or the guest hung"
 fi
 
 echo "linuxemu_smoke_failures=$failures"
