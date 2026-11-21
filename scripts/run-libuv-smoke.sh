@@ -71,6 +71,10 @@ timed()
     wait "$timed_pid"
     timed_status=$?
     kill -KILL "$timed_watchdog" 2>/dev/null
+    # Reap it here: QNX's sh does not restart a call that the SIGCHLD of
+    # the killed watchdog interrupts, so a later redirection failed EINTR
+    # ("cannot create .../helpers.txt: Interrupted function call").
+    wait "$timed_watchdog" 2>/dev/null
     if [ -f "$timeout_marker" ]; then
         rm -f "$timeout_marker"
         timed_status=124
@@ -111,6 +115,12 @@ if [ "$list_status" -ne 0 ]; then
     exit 1
 fi
 awk '/\(helpers:/ { print $1 }' "$output_dir/list.txt" >"$output_dir/helpers.txt"
+# Without the list every helper test would run without its helper.
+if [ ! -s "$output_dir/helpers.txt" ]; then
+    echo "no helper list in $output_dir/helpers.txt"
+    echo "linuxemu_libuv_failures=1"
+    exit 1
+fi
 
 if [ "$mode" = all ]; then
     awk 'NF { print $1 }' "$output_dir/list.txt" >"$output_dir/tests.txt"
