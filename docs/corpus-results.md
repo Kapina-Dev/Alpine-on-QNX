@@ -385,11 +385,12 @@ the subset gates.
 
 ## Phase 4 part 1: 2026-11-22
 
-- **Device:** Passport, QNX 8.0.0, as the ordinary user, on battery (82%
-  to 75% over the gate).
-- **Linuxemu:** branch `phase4a-jit-safety` at `89c2ba7`, core sha256
-  `aa9fe3754932b70017ac101094f73c15bf03c59f3a72a5767642360875dae8aa`.
-  Anonymous memory made executable is no longer patched.
+- **Device:** Passport, QNX 8.0.0, as the ordinary user, on battery.
+- **Linuxemu:** branch `phase4a-jit-safety` after the final review's fixes,
+  core sha256
+  `2ec8b786b327daab95e8ce30666ae353ba8c554f16c363cb8a0a13f5c38172d0`.
+  Anonymous memory made executable is no longer patched. The run before
+  those fixes (core `aa9fe375…`) scored the same.
 - **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
 
 ```text

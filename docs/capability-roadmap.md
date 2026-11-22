@@ -802,17 +802,22 @@ binaries and the Android items are later parts.
 - Anonymous memory that `mprotect` makes executable is no longer patched
   (the user's call: JIT code makes no system calls). File mappings are
   patched as before, run by run within one `mprotect`. This ends the data
-  corruption Phase 2 measured, makes a flip about 40% cheaper, and lets
+  corruption Phase 2 measured, makes a flip about a third cheaper, and lets
   `mremap` move a JIT page once it is read-write again.
 - Before the default changed, a read-only check (`mprotect`
   `detail=anon-exec-svc` with `LINUXEMU_DIAGNOSTICS`) ran over the full
   regression and the corpus: only two Linuxemu tests generated system calls
   into anonymous memory, no program did.
 - `LINUXEMU_PATCH_ANONYMOUS=1` restores the old patching, across `execve`.
+- Every run is still made writable for the instruction-cache sync: QNX's
+  `msync(MS_INVALIDATE_ICACHE)` fails on a non-writable range with
+  untouched pages, which a JIT's `PROT_NONE` reservation committed straight
+  to read-execute hit (found by the final review; `runtime-exec-reserved`).
 - A LuaJIT smoke (`run-jit-smoke`) joins the full regression as its 17th
   suite.
 
-**Gate results** (core `aa9fe375…`, branch at `89c2ba7`).
+**Gate results** (core `2ec8b786…`, after the final review's fixes; the
+run before them, core `aa9fe375…`, gave the same results).
 
 - Full device regression: `linuxemu_full_regression_failures=0`,
   `jit-patch-hazard` and the new tests included.

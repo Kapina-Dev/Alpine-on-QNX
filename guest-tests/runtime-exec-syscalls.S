@@ -36,6 +36,10 @@ _start:
     cmp r0, #0
     bne fail_mprotect
 
+    /* ip names the QNX kernel call an unpatched svc would run (QNX
+       ignores the svc immediate): make it an invalid one, so the run
+       without LINUXEMU_PATCH_ANONYMOUS can't do anything on the host. */
+    movw ip, #0x7fff
     blx r4
     cmp r0, r6
     bne fail_execute

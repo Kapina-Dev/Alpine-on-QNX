@@ -34,6 +34,7 @@ run_guest exit-status 37
 run_guest initial-stack 0 alpha beta
 run_guest memory-syscalls 0
 run_guest runtime-exec-plain 0
+run_guest runtime-exec-reserved 0
 run_guest jit-patch-hazard 0
 # Generated system calls in anonymous memory need LINUXEMU_PATCH_ANONYMOUS=1
 # (Phase 4 part 1).

@@ -1416,25 +1416,23 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
             uintptr_t run_end;
             int anonymous = guest_memory_runtime_anonymous_at(cursor, end,
                 &run_end);
-            if (!anonymous || patch_anonymous_memory) {
-                int failed = mprotect((void *)cursor, run_end - cursor,
-                    host_protection | PROT_READ | PROT_WRITE) != 0 ||
-                    arm_patch_range(cursor, run_end - cursor) != 0;
-                if (failed) {
-                    int saved_errno = errno;
-                    arm_patch_rollback(patches_before);
-                    mprotect((void *)address, mapped_length, host_protection);
-                    return -(int32_t)linux_errno_number(saved_errno);
-                }
+            /* Every run is made writable for the icache sync: QNX's
+               msync(MS_INVALIDATE_ICACHE) fails ENOMEM on a range that
+               isn't writable and holds a page never touched (a JIT's
+               PROT_NONE reservation, a partly written code area). */
+            int failed = mprotect((void *)cursor, run_end - cursor,
+                host_protection | PROT_READ | PROT_WRITE) != 0 ||
+                ((!anonymous || patch_anonymous_memory) &&
+                    arm_patch_range(cursor, run_end - cursor) != 0) ||
+                msync((void *)cursor, run_end - cursor,
+                    MS_INVALIDATE_ICACHE) != 0;
+            if (failed) {
+                int saved_errno = errno;
+                arm_patch_rollback(patches_before);
+                mprotect((void *)address, mapped_length, host_protection);
+                return -(int32_t)linux_errno_number(saved_errno);
             }
             cursor = run_end;
-        }
-        if (msync((void *)address, mapped_length,
-                MS_INVALIDATE_ICACHE) != 0) {
-            int saved_errno = errno;
-            arm_patch_rollback(patches_before);
-            mprotect((void *)address, mapped_length, host_protection);
-            return -(int32_t)linux_errno_number(saved_errno);
         }
     }
     if (mprotect((void *)address, mapped_length, host_protection) != 0) {

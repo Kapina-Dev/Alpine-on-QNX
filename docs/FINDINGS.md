@@ -1434,10 +1434,22 @@ memory RW → RX → RW 1000 times. Three runs per core, alternating:
 | Core | usec for 1000 flip pairs |
 |---|---|
 | patches anonymous memory | 540911, 472000, 472000 |
-| doesn't | 308064, 289000, 287000 |
+| doesn't (first version) | 308064, 289000, 287000 |
+| doesn't, final (writable for the icache sync) | 433000, 317000, 314000 |
 
-About 40% less per flip. What is left is the two host `mprotect` calls and
-the instruction-cache `msync` over the range.
+The final version is about a third cheaper per flip than patching (the
+first of its runs was a warm-up). What is left is the host `mprotect`
+calls and the instruction-cache `msync` over the range.
+
+**QNX's icache `msync` needs a writable range when pages are untouched.**
+Found by the final review's case (a JIT reservation: anonymous `PROT_NONE`,
+committed with `mprotect` to read-execute). Native probe, 2 pages of
+anonymous memory: `msync(MS_INVALIDATE_ICACHE)` returns 0 at RW, touched or
+not; at RX it fails `ENOMEM` (12) when either page was never touched, and
+returns 0 only when both were. The patching core never saw this because
+its scan read every word, which made QNX allocate the pages. So Linuxemu
+still makes every run writable for the sync and only skips the patching
+for anonymous runs (`runtime-exec-reserved`).
 
 **Node.js is not blocked by the JIT hazard.** `node -e 'console.log(1+1)'`
 from the pinned corpus closure (Node 24), with and without `--jitless`, on
