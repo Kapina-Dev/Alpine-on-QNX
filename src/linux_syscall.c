@@ -1406,10 +1406,12 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
         return 0;
     }
     if ((host_protection & PROT_EXEC) != 0) {
-        /* Run by run: file-backed memory is patched as when it was mapped;
-           anonymous memory (a JIT's code and data) is left alone unless
-           LINUXEMU_PATCH_ANONYMOUS=1, because a data word can't be told
-           from an svc and JIT code makes no system calls itself. */
+        /* Run by run. File-backed memory was patched, by mapping symbol,
+           when it was mapped, so it isn't scanned again (an ARM-only rescan
+           would rewrite Thumb code's data). Anonymous memory (a JIT's code
+           and data) is left alone unless LINUXEMU_PATCH_ANONYMOUS=1,
+           because a data word can't be told from an svc and JIT code makes
+           no system calls itself. */
         uintptr_t end = address + mapped_length;
         uintptr_t cursor = address;
         while (cursor < end) {
@@ -1422,7 +1424,7 @@ static int32_t linux_mprotect_runtime(uintptr_t address, size_t length,
                PROT_NONE reservation, a partly written code area). */
             int failed = mprotect((void *)cursor, run_end - cursor,
                 host_protection | PROT_READ | PROT_WRITE) != 0 ||
-                ((!anonymous || patch_anonymous_memory) &&
+                (anonymous && patch_anonymous_memory &&
                     arm_patch_range(cursor, run_end - cursor) != 0) ||
                 msync((void *)cursor, run_end - cursor,
                     MS_INVALIDATE_ICACHE) != 0;
