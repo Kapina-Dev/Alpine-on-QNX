@@ -73,6 +73,26 @@ else
 fi
 rm -f "$refusal_report"
 
+# SQLite built Thumb with unwind tables, when it has been built
+# (scripts/build-sqlite-thumb-fixture.sh): the same comparison, then SQL
+# through the stripped copy.
+sqlite_dir="$project_dir/build/sqlite-thumb"
+if [ -f "$sqlite_dir/libsqlite3.so" ] &&
+    [ -f "$sqlite_dir/libsqlite3.stripped.so" ]; then
+    echo "=== stripped SQLite: patched as the unstripped one ==="
+    cp "$sqlite_dir/libsqlite3.so" "$sqlite_dir/libsqlite3.stripped.so" \
+        "$alpine_root$stripped_dir/" || exit 2
+    "$timeout_command" 120 "$linuxemu" --linuxemu-exec "$alpine_root" / \
+        "$fixture_dir/stripped-compare-armhf" /tmp/stripped-compare \
+        "$stripped_dir/libsqlite3.so" "$stripped_dir/libsqlite3.stripped.so" \
+        sqlite
+    status=$?
+    echo "stripped-sqlite exit=$status expected=0"
+    if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+else
+    echo "=== stripped SQLite: not built, skipped ==="
+fi
+
 echo "=== multithreaded posix_spawn stress: $spawn_count ==="
 "$timeout_command" 120 "$linuxemu" --linuxemu-exec "$alpine_root" / \
     "$fixture_dir/spawn-thread-stress-armhf" /tmp/spawn-thread-stress \
