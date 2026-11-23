@@ -398,6 +398,34 @@ static void test_map_builder(void)
             "map k: uncovered TLS read, refused");
         code_map_result_free(&r);
     }
+    /* (l) one unwind extent covering Thumb code and, after it, ARM code
+       reached by blx (ld merges identical adjacent exidx entries): the
+       call target starts an ARM function. */
+    {
+        uint16_t code[] = { 0xf000, 0xe806 /* blx 0x1010 */, 0x4770, 0xbf00,
+            0xbf00, 0xbf00, 0xbf00, 0xbf00,
+            0x0000, 0xef00 /* svc 0 */, 0xff1e, 0xe12f /* bx lr */ };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 12, f, 1);
+        check(r.refused == 0, "map l: not refused");
+        check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
+            state_at(&r, 0x1010) == CODE_STATE_ARM &&
+            state_at(&r, 0x1014) == CODE_STATE_ARM,
+            "map l: call target splits the extent into ARM");
+        code_map_result_free(&r);
+    }
+    /* (m) a tail call (b.w) to another function's start hands on the
+       mode, without being a call. */
+    {
+        uint16_t code[] = { 0xf000, 0xb806 /* b.w 0x1010 */, 0xbf00, 0xbf00,
+            0xbf00, 0xbf00, 0xbf00, 0xbf00, 0xdf00, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
+            { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 10, f, 2);
+        check(r.refused == 0 && f[1].mode == MODE_THUMB &&
+            state_at(&r, 0x1010) == CODE_STATE_THUMB, "map m: tail call");
+        code_map_result_free(&r);
+    }
 }
 
 int main(void)

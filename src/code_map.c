@@ -227,24 +227,45 @@ int thumb_cmp_imm(const uint16_t *code, size_t halfwords, unsigned *reg,
 
 enum byte_class { BYTE_UNDECODED = 0, BYTE_DATA, BYTE_ARM, BYTE_THUMB };
 
+/* Per-address marks a decoding round leaves (struct builder.reached). */
+#define REACHED_CALL_ARM 1u
+#define REACHED_CALL_THUMB 2u
+#define REACHED_BRANCH_ARM 4u
+#define REACHED_BRANCH_THUMB 8u
+
 /* A tbb/tbh is bounded by a cmp of its index register within this many
    preceding instructions (GCC emits cmp; bhi; tbb). */
 #define TABLE_CMP_WINDOW 4u
-/* Rounds the literal-pool set may keep changing without a mode change. */
-#define DATA_ROUNDS 8u
+/* Rounds before giving up on a fixpoint. */
+#define MAX_ROUNDS 64u
 
+struct span {
+    uint32_t start;
+    uint32_t limit;  /* end before clipping at the next start */
+    enum fn_mode mode;
+};
+
+/*
+ * One round decodes every function whose mode is known, using the literal
+ * data (data) and the call/branch targets (reached) the previous round
+ * found, and records what it finds into next_data and next_reached. The
+ * function list is the caller's plus every call target (a merged unwind
+ * entry can cover functions of both modes). Rounds repeat until nothing
+ * changes, so nothing a discarded decoding found survives.
+ */
 struct builder {
     const uint8_t *bytes;
     uint32_t base;
     size_t size;
-    struct code_function *functions;
-    size_t count;
-    uint8_t *klass;      /* enum byte_class per byte, this round */
-    uint8_t *data;       /* literal data known going into this round */
-    uint8_t *next_data;  /* literal data found this round */
-    int mode_changed;
-    int conflict;
-    uint8_t *poisoned;   /* per function: reached in both modes */
+    const struct code_function *initial;
+    size_t initial_count;
+    struct span *spans;
+    size_t span_count;
+    uint8_t *klass;
+    uint8_t *data;
+    uint8_t *next_data;
+    uint8_t *reached;
+    uint8_t *next_reached;
 };
 
 static uint16_t read16(const uint8_t *p)
@@ -258,14 +279,9 @@ static uint32_t read32(const uint8_t *p)
         ((uint32_t)p[3] << 24);
 }
 
-static void mark(uint8_t *array, struct builder *b, uint32_t address,
-    uint32_t length, uint8_t value)
+static int in_section(const struct builder *b, uint32_t address)
 {
-    uint32_t i;
-    for (i = 0; i < length; ++i) {
-        uint32_t offset = address + i - b->base;
-        if (address + i >= b->base && offset < b->size) array[offset] = value;
-    }
+    return address >= b->base && address - b->base < b->size;
 }
 
 static int any_data(const struct builder *b, size_t offset, size_t length)
@@ -276,40 +292,23 @@ static int any_data(const struct builder *b, size_t offset, size_t length)
     return 0;
 }
 
-static size_t find_function_start(const struct builder *b, uint32_t address)
+static void note(struct builder *b, const struct insn_info *info)
 {
-    size_t low = 0;
-    size_t high = b->count;
-    while (low < high) {
-        size_t middle = low + (high - low) / 2;
-        if (b->functions[middle].start < address) low = middle + 1;
-        else high = middle;
+    uint32_t i;
+    if (info->literal_valid) {
+        for (i = 0; i < info->literal_size; ++i)
+            if (in_section(b, info->literal + i))
+                b->next_data[info->literal + i - b->base] = 1;
     }
-    if (low < b->count && b->functions[low].start == address) return low;
-    return b->count;
-}
-
-static void propagate(struct builder *b, const struct insn_info *info)
-{
-    size_t index;
-    enum fn_mode mode;
-    if (!info->target_valid) return;
-    index = find_function_start(b, info->target);
-    if (index == b->count || b->poisoned[index]) return;
-    mode = info->target_thumb ? MODE_THUMB : MODE_ARM;
-    if (b->functions[index].mode == MODE_UNKNOWN) {
-        b->functions[index].mode = mode;
-        b->mode_changed = 1;
-    } else if (b->functions[index].mode != mode) {
-        b->poisoned[index] = 1;
-        b->conflict = 1;
+    if (info->target_valid && in_section(b, info->target)) {
+        uint8_t mark;
+        if (info->flow == FLOW_CALL)
+            mark = info->target_thumb ? REACHED_CALL_THUMB : REACHED_CALL_ARM;
+        else
+            mark = info->target_thumb ? REACHED_BRANCH_THUMB :
+                REACHED_BRANCH_ARM;
+        b->next_reached[info->target - b->base] |= mark;
     }
-}
-
-static void note_literal(struct builder *b, const struct insn_info *info)
-{
-    if (info->literal_valid)
-        mark(b->next_data, b, info->literal, info->literal_size, 1);
 }
 
 static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
@@ -340,16 +339,15 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
             continue;
         }
         memset(b->klass + offset, BYTE_THUMB, info.width);
-        note_literal(b, &info);
-        propagate(b, &info);
+        note(b, &info);
         if (info.flow == FLOW_TABLE) {
             uint32_t length = 0;
             int bounded = 0;
             for (i = 0; i < TABLE_CMP_WINDOW; ++i) {
                 if (recent[i].valid && recent[i].reg == info.table_reg) {
+                    bounded = recent[i].imm < 0x10000u;
                     length = (recent[i].imm + 1u) * info.table_entry_size;
                     length = (length + 1u) & ~1u;
-                    bounded = recent[i].imm < 0x10000u;
                     break;
                 }
             }
@@ -361,8 +359,8 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
             memset(recent, 0, sizeof(recent));
             continue;
         }
-        memmove(&recent[1], &recent[0], sizeof(recent[0]) *
-            (TABLE_CMP_WINDOW - 1u));
+        memmove(&recent[1], &recent[0],
+            sizeof(recent[0]) * (TABLE_CMP_WINDOW - 1u));
         recent[0].valid = thumb_cmp_imm(code, available, &recent[0].reg,
             &recent[0].imm);
         offset += info.width;
@@ -381,21 +379,87 @@ static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
         arm_insn_info(read32(b->bytes + offset), b->base + (uint32_t)offset,
             &info);
         memset(b->klass + offset, BYTE_ARM, 4);
-        note_literal(b, &info);
-        propagate(b, &info);
+        note(b, &info);
     }
+}
+
+static int compare_spans(const void *left, const void *right)
+{
+    const struct span *a = left;
+    const struct span *b = right;
+    return a->start < b->start ? -1 : a->start > b->start;
+}
+
+static enum fn_mode combine(enum fn_mode mode, uint8_t marks)
+{
+    int arm = mode == MODE_ARM || (marks & (REACHED_CALL_ARM |
+        REACHED_BRANCH_ARM)) != 0;
+    int thumb = mode == MODE_THUMB || (marks & (REACHED_CALL_THUMB |
+        REACHED_BRANCH_THUMB)) != 0;
+    if (arm && thumb) return MODE_UNKNOWN; /* reached in both modes */
+    return arm ? MODE_ARM : thumb ? MODE_THUMB : MODE_UNKNOWN;
+}
+
+/* The caller's functions plus every call target, sorted, each clipped at
+   the next start, with modes from the evidence and from reached. */
+static void build_spans(struct builder *b)
+{
+    size_t i;
+    size_t count = 0;
+    size_t unique = 0;
+
+    for (i = 0; i < b->initial_count; ++i) {
+        b->spans[count].start = b->initial[i].start;
+        b->spans[count].limit = b->initial[i].end;
+        b->spans[count].mode = b->initial[i].mode;
+        count++;
+    }
+    for (i = 0; i < b->size; ++i) {
+        if ((b->reached[i] & (REACHED_CALL_ARM | REACHED_CALL_THUMB)) == 0)
+            continue;
+        b->spans[count].start = b->base + (uint32_t)i;
+        b->spans[count].limit = b->base + (uint32_t)b->size;
+        b->spans[count].mode = MODE_UNKNOWN;
+        count++;
+    }
+    qsort(b->spans, count, sizeof(*b->spans), compare_spans);
+    for (i = 0; i < count; ++i) {
+        if (unique > 0 && b->spans[unique - 1].start == b->spans[i].start) {
+            /* A call target that is also one of the caller's functions:
+               keep the caller's extent and evidence. */
+            if (b->spans[i].mode != MODE_UNKNOWN ||
+                b->spans[unique - 1].mode == MODE_UNKNOWN)
+                b->spans[unique - 1] = b->spans[i];
+            continue;
+        }
+        /* A call target inside a caller's function ends where that one
+           did. */
+        if (unique > 0 && b->spans[i].limit > b->spans[unique - 1].limit &&
+            b->spans[i].start < b->spans[unique - 1].limit)
+            b->spans[i].limit = b->spans[unique - 1].limit;
+        b->spans[unique++] = b->spans[i];
+    }
+    for (i = 0; i < unique; ++i) {
+        uint32_t start = b->spans[i].start;
+        if (i + 1 < unique && b->spans[i + 1].start < b->spans[i].limit)
+            b->spans[i].limit = b->spans[i + 1].start;
+        b->spans[i].mode = combine(b->spans[i].mode,
+            b->reached[start - b->base]);
+    }
+    b->span_count = unique;
 }
 
 static void decode_round(struct builder *b)
 {
     size_t i;
+    build_spans(b);
     memset(b->klass, BYTE_UNDECODED, b->size);
     memset(b->next_data, 0, b->size);
-    for (i = 0; i < b->count; ++i) {
-        const struct code_function *f = &b->functions[i];
-        if (b->poisoned[i]) continue;
-        if (f->mode == MODE_THUMB) decode_thumb(b, f->start, f->end);
-        else if (f->mode == MODE_ARM) decode_arm(b, f->start, f->end);
+    memset(b->next_reached, 0, b->size);
+    for (i = 0; i < b->span_count; ++i) {
+        const struct span *f = &b->spans[i];
+        if (f->mode == MODE_THUMB) decode_thumb(b, f->start, f->limit);
+        else if (f->mode == MODE_ARM) decode_arm(b, f->start, f->limit);
     }
     for (i = 0; i < b->size; ++i)
         if (b->data[i]) b->klass[i] = BYTE_DATA;
@@ -430,8 +494,11 @@ static int emit_symbols(const struct builder *b, struct code_map_result *out)
     size_t count = 0;
     enum code_state previous = CODE_STATE_DATA;
 
-    out->symbols = malloc(sizeof(*out->symbols) * (b->size ? b->size : 1));
+    for (i = 0; i < b->size; ++i)
+        if (i == 0 || b->klass[i] != b->klass[i - 1]) count++;
+    out->symbols = malloc(sizeof(*out->symbols) * (count ? count : 1));
     if (out->symbols == 0) return -1;
+    count = 0;
     for (i = 0; i < b->size; ++i) {
         enum code_state state = b->klass[i] == BYTE_ARM ? CODE_STATE_ARM :
             b->klass[i] == BYTE_THUMB ? CODE_STATE_THUMB : CODE_STATE_DATA;
@@ -451,8 +518,8 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     struct code_map_result *out)
 {
     struct builder b;
-    enum fn_mode *initial;
-    unsigned data_rounds = 0;
+    size_t allocation = size ? size : 1;
+    unsigned round;
     size_t i;
     long site;
     int result = -1;
@@ -462,46 +529,44 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     b.bytes = bytes;
     b.base = base;
     b.size = size;
-    b.functions = functions;
-    b.count = function_count;
-    /* Clip function extents to the section. */
+    /* Clip the caller's functions to the section. */
     for (i = 0; i < function_count; ++i) {
         if (functions[i].start < base) functions[i].start = base;
-        if (functions[i].end > base + size) functions[i].end = base + (uint32_t)size;
+        if (functions[i].end > base + size)
+            functions[i].end = base + (uint32_t)size;
         if (functions[i].end < functions[i].start)
             functions[i].end = functions[i].start;
     }
-    b.klass = malloc(size ? size : 1);
-    b.data = calloc(size ? size : 1, 1);
-    b.next_data = malloc(size ? size : 1);
-    b.poisoned = calloc(function_count ? function_count : 1, 1);
-    initial = malloc(sizeof(*initial) * (function_count ? function_count : 1));
-    if (b.klass == 0 || b.data == 0 || b.next_data == 0 || b.poisoned == 0 ||
-        initial == 0) goto done;
-    for (i = 0; i < function_count; ++i) initial[i] = functions[i].mode;
+    b.initial = functions;
+    b.initial_count = function_count;
+    /* Call targets are halfword-aligned: at most size / 2 of them. */
+    b.spans = malloc(sizeof(*b.spans) * (function_count + size / 2u + 1u));
+    b.klass = malloc(allocation);
+    b.data = calloc(allocation, 1);
+    b.next_data = malloc(allocation);
+    b.reached = calloc(allocation, 1);
+    b.next_reached = malloc(allocation);
+    if (b.spans == 0 || b.klass == 0 || b.data == 0 || b.next_data == 0 ||
+        b.reached == 0 || b.next_reached == 0) goto done;
 
-    for (;;) {
-        b.mode_changed = 0;
-        b.conflict = 0;
+    for (round = 0;; ++round) {
         decode_round(&b);
-        if (b.conflict) {
-            /* Start over from the evidence, without the poisoned ones:
-               modes they handed on came from a decoding that can't be
-               trusted. */
-            for (i = 0; i < function_count; ++i)
-                functions[i].mode = b.poisoned[i] ? MODE_UNKNOWN : initial[i];
-            memset(b.data, 0, size);
-            data_rounds = 0;
-            continue;
-        }
-        if (memcmp(b.data, b.next_data, size) == 0 && !b.mode_changed) break;
-        if (b.mode_changed) data_rounds = 0;
-        else if (++data_rounds >= DATA_ROUNDS) {
-            /* Pools that keep moving: no safe boundaries anywhere. */
+        if (memcmp(b.data, b.next_data, size) == 0 &&
+            memcmp(b.reached, b.next_reached, size) == 0) break;
+        if (round + 1u == MAX_ROUNDS) {
+            /* No fixpoint: no instruction boundary can be trusted. */
             memset(b.klass, BYTE_UNDECODED, size);
             break;
         }
         memcpy(b.data, b.next_data, size);
+        memcpy(b.reached, b.next_reached, size);
+    }
+    /* Report the modes the caller's functions ended with. */
+    for (i = 0; i < function_count; ++i) {
+        size_t j;
+        for (j = 0; j < b.span_count; ++j)
+            if (b.spans[j].start == functions[i].start)
+                functions[i].mode = b.spans[j].mode;
     }
     site = first_undecoded_site(&b);
     if (site >= 0) {
@@ -510,11 +575,12 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     }
     result = emit_symbols(&b, out);
 done:
+    free(b.spans);
     free(b.klass);
     free(b.data);
     free(b.next_data);
-    free(b.poisoned);
-    free(initial);
+    free(b.reached);
+    free(b.next_reached);
     return result;
 }
 
