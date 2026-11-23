@@ -175,6 +175,39 @@ static void test_insn_info(void)
         check(info.it_length == 0, "thumb nop: no it block");
     }
 
+    /* adr: an address, not a load (literal_size 0). */
+    {
+        static const struct { uint16_t hw0, hw1; uint32_t address, target;
+            const char *name; } adr[] = {
+            { 0xa303, 0, 0x1000, 0x1010, "adr r3 (T1)" },
+            { 0xf20f, 0x0010, 0x1002, 0x1014, "addw r0, pc, #16" },
+            { 0xf2af, 0x0106, 0x1006, 0x1002, "subw r1, pc, #6" },
+        };
+        unsigned i;
+        char label[96];
+        for (i = 0; i < 3; ++i) {
+            struct insn_info info = thumb_at(adr[i].hw0, adr[i].hw1,
+                adr[i].address);
+            snprintf(label, sizeof(label), "thumb %s", adr[i].name);
+            check(info.flow == FLOW_NEXT && info.literal_valid &&
+                info.literal == adr[i].target && info.literal_size == 0,
+                label);
+        }
+        {
+            struct insn_info info = arm_at(0xe28f0008, 0x2000);
+            check(info.literal_valid && info.literal == 0x2010 &&
+                info.literal_size == 0, "arm add r0, pc, #8");
+            info = arm_at(0xe24f1008, 0x2004);
+            check(info.literal_valid && info.literal == 0x2004 &&
+                info.literal_size == 0, "arm sub r1, pc, #8");
+            info = arm_at(0xe28f0c01, 0x2000); /* add r0, pc, #256 */
+            check(info.literal_valid && info.literal == 0x2108,
+                "arm add r0, pc, #256 (rotated)");
+            info = arm_at(0xe08f2003, 0x2008);
+            check(!info.literal_valid, "arm add r2, pc, r3: no address");
+        }
+    }
+
     /* svc and udf are not conditional branches. */
     {
         struct insn_info info = thumb_at(0xdf00, 0, 0x100);
@@ -491,6 +524,30 @@ static void test_map_builder(void)
         struct code_map_result r = build_thumb(code, 10, f, 2);
         check(r.refused == 0 && f[1].mode == MODE_THUMB &&
             state_at(&r, 0x1010) == CODE_STATE_THUMB, "map m: tail call");
+        code_map_result_free(&r);
+    }
+    /* (r) a pool after a call that never returns, reached only through
+       adr: decoding stops at it; it isn't trusted as data, so a pattern in
+       it refuses the section. */
+    {
+        uint16_t code[] = { 0xa302 /* adr r3, 0x100c */, 0x4798 /* blx r3 */,
+            0xbf00, 0xbf00, 0xf3af, 0x8000 /* nop.w */, 0xdf00, 0xdf00 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(state_at(&r, 0x100c) == CODE_STATE_DATA &&
+            state_at(&r, 0x1008) == CODE_STATE_THUMB,
+            "map r: adr target not decoded as code");
+        check(r.refused == 1 && r.refused_address == 0x100c,
+            "map r: pattern in an adr pool refuses");
+        code_map_result_free(&r);
+    }
+    {
+        uint16_t code[] = { 0xa302, 0x4798, 0xbf00, 0xbf00, 0xf3af, 0x8000,
+            0x5c00, 0x0526 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 0 && state_at(&r, 0x100c) == CODE_STATE_DATA,
+            "map r2: adr pool without a pattern");
         code_map_result_free(&r);
     }
     /* (n) tbh bounded by a register compare: the length is inferred

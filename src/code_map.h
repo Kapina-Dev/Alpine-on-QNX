@@ -28,7 +28,7 @@ struct insn_info {
     int target_thumb;          /* mode at target */
     int literal_valid;         /* reads PC-relative data */
     uint32_t literal;          /* absolute address of the data */
-    unsigned literal_size;     /* 1, 2, 4 or 8 */
+    unsigned literal_size;     /* 1, 2, 4 or 8; 0: adr (an address only) */
     unsigned table_reg;        /* FLOW_TABLE: index register */
     unsigned table_entry_size; /* FLOW_TABLE: 1 (tbb), 2 (tbh), 4 (ARM) */
     unsigned it_length;        /* Thumb IT: instructions it makes conditional */

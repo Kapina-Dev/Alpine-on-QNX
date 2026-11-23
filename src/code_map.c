@@ -43,6 +43,9 @@ static void thumb16_info(uint16_t hw, uint32_t address, struct insn_info *out)
     } else if ((hw & 0xf800u) == 0x4800u) {
         /* ldr Rt, [pc, #imm8*4] (T1) */
         set_literal(out, thumb_literal_base(address), 1, (hw & 0xffu) * 4u, 4);
+    } else if ((hw & 0xf800u) == 0xa000u) {
+        /* adr Rd, label (T1): an address, size unknown */
+        set_literal(out, thumb_literal_base(address), 1, (hw & 0xffu) * 4u, 0);
     } else if ((hw & 0xf500u) == 0xb100u) {
         /* cbz/cbnz Rn, label: forward only */
         set_target(out, FLOW_BRANCH, address + 4u +
@@ -149,6 +152,14 @@ static void thumb32_info(uint16_t hw0, uint16_t hw1, uint32_t address,
             (hw1 & 0x0100u) ? 8u : 4u);
         return;
     }
+    if (((hw0 & 0xfbffu) == 0xf20fu || (hw0 & 0xfbffu) == 0xf2afu) &&
+        (hw1 & 0x8000u) == 0) {
+        /* adr.w Rd, label (addw/subw Rd, pc, #imm12) */
+        set_literal(out, base, (hw0 & 0x00a0u) == 0,
+            ((uint32_t)(hw0 & 0x0400u) << 1) | ((hw1 >> 4) & 0x700u) |
+            (hw1 & 0xffu), 0);
+        return;
+    }
     if (hw0 == 0xe8dfu && (hw1 & 0xffe0u) == 0xf000u) {
         /* tbb/tbh [pc, Rm{, lsl #1}] */
         out->flow = FLOW_TABLE;
@@ -224,7 +235,14 @@ int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
             return 0;
         }
     }
-    if ((word & 0x0f3f0000u) == 0x051f0000u) {
+    if ((word & 0x0fef0000u) == 0x028f0000u ||
+        (word & 0x0fef0000u) == 0x024f0000u) {
+        /* adr: add/sub Rd, pc, #const, an address of unknown size */
+        uint32_t rotate = ((word >> 8) & 0xfu) * 2u;
+        uint32_t value = word & 0xffu;
+        if (rotate != 0) value = (value >> rotate) | (value << (32u - rotate));
+        set_literal(out, pc, (word & 0x00800000u) != 0, value, 0);
+    } else if ((word & 0x0f3f0000u) == 0x051f0000u) {
         /* ldr/ldrb Rt, [pc, #+/-imm12] */
         set_literal(out, pc, add, word & 0xfffu,
             (word & 0x00400000u) ? 1u : 4u);
@@ -294,6 +312,11 @@ enum byte_class { BYTE_UNDECODED = 0, BYTE_DATA, BYTE_ARM, BYTE_THUMB };
 #define REACHED_BRANCH_ARM 4u
 #define REACHED_BRANCH_THUMB 8u
 
+/* struct builder.data: bytes a PC-relative load reads (data), or that an
+   adr points at (not decoded, not trusted either). */
+#define DATA_LOADED 1u
+#define DATA_BARRIER 2u
+
 /* A tbb/tbh is bounded by a cmp of its index register within this many
    preceding instructions (GCC emits cmp; bhi; tbb). */
 #define TABLE_CMP_WINDOW 4u
@@ -359,10 +382,17 @@ static int any_data(const struct builder *b, size_t offset, size_t length)
 static void note(struct builder *b, const struct insn_info *info)
 {
     uint32_t i;
-    if (info->literal_valid) {
+    if (info->literal_valid && info->literal_size == 0) {
+        /* adr: what it points at isn't known, so it is neither decoded
+           (it may be a pool) nor trusted as data (it may be code). */
+        for (i = 0; i < 2u; ++i)
+            if (in_section(b, info->literal + i) &&
+                b->next_data[info->literal + i - b->base] == 0)
+                b->next_data[info->literal + i - b->base] = DATA_BARRIER;
+    } else if (info->literal_valid) {
         for (i = 0; i < info->literal_size; ++i)
             if (in_section(b, info->literal + i))
-                b->next_data[info->literal + i - b->base] = 1;
+                b->next_data[info->literal + i - b->base] = DATA_LOADED;
     }
     if (info->target_valid && in_section(b, info->target)) {
         uint8_t mark;
@@ -621,7 +651,7 @@ static void decode_round(struct builder *b)
         else if (f->mode == MODE_ARM) decode_arm(b, f->start, f->limit);
     }
     for (i = 0; i < b->size; ++i)
-        if (b->data[i]) b->klass[i] = BYTE_DATA;
+        if (b->data[i] == DATA_LOADED) b->klass[i] = BYTE_DATA;
 }
 
 /* First possible patch site starting in an undecoded byte, or -1. */
