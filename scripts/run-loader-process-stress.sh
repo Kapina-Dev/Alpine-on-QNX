@@ -10,9 +10,10 @@ timeout_command=${TIMEOUT_COMMAND:-timeout}
 spawn_count=${SPAWN_COUNT:-100}
 failures=0
 module=/tmp/libphase9.so
+thumb_module=/tmp/libthumb.so
 
 for fixture in phase9-module-armhf.so dlopen-stress-armhf \
-    spawn-thread-stress-armhf; do
+    spawn-thread-stress-armhf thumb-module-armhf.so thumb-dlopen-armhf; do
     if [ ! -f "$fixture_dir/$fixture" ]; then
         echo "missing fixture: $fixture_dir/$fixture" >&2
         exit 2
@@ -20,13 +21,21 @@ for fixture in phase9-module-armhf.so dlopen-stress-armhf \
 done
 
 cp "$fixture_dir/phase9-module-armhf.so" "$alpine_root$module" || exit 2
-trap 'rm -f "$alpine_root$module"' EXIT
+cp "$fixture_dir/thumb-module-armhf.so" "$alpine_root$thumb_module" || exit 2
+trap 'rm -f "$alpine_root$module" "$alpine_root$thumb_module"' EXIT
 
 echo "=== dlopen executable mapping stress ==="
 "$timeout_command" 30 "$linuxemu" --linuxemu-exec "$alpine_root" / \
     "$fixture_dir/dlopen-stress-armhf" /tmp/dlopen-stress "$module"
 status=$?
 echo "dlopen-stress exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
+echo "=== Thumb library through dlopen ==="
+"$timeout_command" 30 "$linuxemu" --linuxemu-exec "$alpine_root" / \
+    "$fixture_dir/thumb-dlopen-armhf" /tmp/thumb-dlopen "$thumb_module"
+status=$?
+echo "thumb-dlopen exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
 echo "=== multithreaded posix_spawn stress: $spawn_count ==="
