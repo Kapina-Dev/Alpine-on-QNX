@@ -205,9 +205,205 @@ static void test_insn_info(void)
     }
 }
 
+
+/* ---- map builder ---- */
+
+static struct code_map_result build_thumb(const uint16_t *code, size_t halfwords,
+    struct code_function *functions, size_t count)
+{
+    struct code_map_result result;
+    uint8_t bytes[256];
+    memcpy(bytes, code, halfwords * 2u); /* host is little-endian */
+    memset(&result, 0, sizeof(result));
+    if (code_map_build(bytes, 0x1000, halfwords * 2u, functions, count,
+            &result) != 0)
+        result.refused = -1;
+    return result;
+}
+
+static enum code_state state_at(const struct code_map_result *result,
+    uint32_t address)
+{
+    uint32_t end;
+    return mapping_state_at(result->symbols, result->symbol_count, address,
+        0x2000, &end);
+}
+
+static void test_map_builder(void)
+{
+    /* (a) forward pool holding 0xdf00: data; the real svc is Thumb code. */
+    {
+        uint16_t code[] = { 0x4801 /* ldr r0, [pc, #4] -> 0x1008 */,
+            0xdf00 /* svc 0 */, 0x4770, 0xbf00, 0xdf00, 0xdf00 };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 6, f, 1);
+        check(r.refused == 0, "map a: not refused");
+        check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
+            state_at(&r, 0x1002) == CODE_STATE_THUMB, "map a: svc is Thumb");
+        check(state_at(&r, 0x1008) == CODE_STATE_DATA &&
+            state_at(&r, 0x100a) == CODE_STATE_DATA, "map a: pool is data");
+        code_map_result_free(&r);
+    }
+    /* (b) pool referenced only backwards, after being walked as code. */
+    {
+        uint16_t code[] = { 0xe002 /* b.n 0x1008 */, 0xbf00,
+            0xdf00, 0xdf00 /* pool */,
+            0xf85f, 0x0008 /* ldr.w r0, [pc, #-8] -> 0x1004 */,
+            0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 0, "map b: not refused");
+        check(state_at(&r, 0x1004) == CODE_STATE_DATA &&
+            state_at(&r, 0x1006) == CODE_STATE_DATA,
+            "map b: backward pool is data");
+        check(state_at(&r, 0x1008) == CODE_STATE_THUMB &&
+            state_at(&r, 0x100c) == CODE_STATE_THUMB, "map b: code after pool");
+        code_map_result_free(&r);
+    }
+    /* (c) tbb bounded by cmp of its index: the table is data. */
+    {
+        uint16_t code[] = { 0x2b03 /* cmp r3, #3 */,
+            0xd803 /* bhi.n 0x100c */, 0xe8df, 0xf003 /* tbb [pc, r3] */,
+            0xdf00, 0xdf00 /* 4 table bytes */, 0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 0, "map c: not refused");
+        check(state_at(&r, 0x1008) == CODE_STATE_DATA &&
+            state_at(&r, 0x100a) == CODE_STATE_DATA, "map c: table is data");
+        check(state_at(&r, 0x100c) == CODE_STATE_THUMB,
+            "map c: code after the table");
+        code_map_result_free(&r);
+    }
+    /* (c2) cmp of another register: unbounded, the table bytes hold a
+       pattern -> refused at the table. */
+    {
+        uint16_t code[] = { 0x2a03 /* cmp r2, #3 */, 0xd803,
+            0xe8df, 0xf003, 0xdf00, 0xdf00, 0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 1 && r.refused_address == 0x1008,
+            "map c2: cmp of another register, refused at table");
+        code_map_result_free(&r);
+    }
+    /* (c3) cmp too far back (5 instructions): unbounded. */
+    {
+        uint16_t code[] = { 0x2b03, 0xbf00, 0xbf00, 0xbf00, 0xbf00, 0xbf00,
+            0xe8df, 0xf003, 0xdf00, 0xdf00, 0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 12, f, 1);
+        check(r.refused == 1 && r.refused_address == 0x1010,
+            "map c3: cmp out of the window, refused");
+        code_map_result_free(&r);
+    }
+    /* (d) unbounded tbb, an svc after the table: refused at the svc. */
+    {
+        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0101, 0x0101,
+            0xdf00, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 1 && r.refused_address == 0x100c,
+            "map d: unbounded table then svc, refused at svc");
+        code_map_result_free(&r);
+    }
+    /* (e) unbounded tbb, no pattern after: not refused, rest not code. */
+    {
+        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0101, 0x0101,
+            0xbf00, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 0, "map e: not refused");
+        check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
+            state_at(&r, 0x100c) == CODE_STATE_DATA,
+            "map e: decoded up to the table only");
+        code_map_result_free(&r);
+    }
+    /* (f) bl into a function of unknown mode makes it Thumb. */
+    {
+        uint16_t code[] = { 0xf000, 0xf806 /* bl 0x1010 */, 0x4770, 0xbf00,
+            0xbf00, 0xbf00, 0xbf00, 0xbf00,
+            0xdf00 /* svc */, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
+            { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 10, f, 2);
+        check(r.refused == 0, "map f: not refused");
+        check(f[1].mode == MODE_THUMB, "map f: callee became Thumb");
+        check(state_at(&r, 0x1010) == CODE_STATE_THUMB, "map f: callee is $t");
+        code_map_result_free(&r);
+    }
+    /* (f2) blx into a function of unknown mode makes it ARM. */
+    {
+        uint16_t code[] = { 0xf000, 0xe806 /* blx 0x1010 */, 0x4770, 0xbf00,
+            0xbf00, 0xbf00, 0xbf00, 0xbf00,
+            0x0000, 0xef00 /* svc 0 */, 0xff1e, 0xe12f /* bx lr */ };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
+            { 0x1010, 0x1018, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 12, f, 2);
+        check(r.refused == 0, "map f2: not refused");
+        check(f[1].mode == MODE_ARM, "map f2: callee became ARM");
+        check(state_at(&r, 0x1010) == CODE_STATE_ARM, "map f2: callee is $a");
+        code_map_result_free(&r);
+    }
+    /* (g) unknown-mode function holding an ARM svc: refused. */
+    {
+        uint16_t code[] = { 0x4770, 0xbf00, 0x0000, 0xef00, 0xff1e, 0xe12f };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
+            { 0x1004, 0x100c, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 6, f, 2);
+        check(r.refused == 1 && r.refused_address == 0x1004,
+            "map g: unknown mode with svc, refused");
+        code_map_result_free(&r);
+    }
+    /* (h) the same without a pattern: not refused, left as data. */
+    {
+        uint16_t code[] = { 0x4770, 0xbf00, 0x0000, 0xe1a0, 0xff1e, 0xe12f };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
+            { 0x1004, 0x100c, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 6, f, 2);
+        check(r.refused == 0, "map h: not refused");
+        check(state_at(&r, 0x1004) == CODE_STATE_DATA,
+            "map h: unknown function is not patched");
+        code_map_result_free(&r);
+    }
+    /* (i) ARM function whose literal is 0xef000000: data. */
+    {
+        uint16_t code[] = { 0x0000, 0xe59f /* ldr r0, [pc, #0] -> 0x1008 */,
+            0xff1e, 0xe12f, 0x0000, 0xef00 };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_ARM } };
+        struct code_map_result r = build_thumb(code, 6, f, 1);
+        check(r.refused == 0, "map i: not refused");
+        check(state_at(&r, 0x1000) == CODE_STATE_ARM &&
+            state_at(&r, 0x1008) == CODE_STATE_DATA, "map i: literal is data");
+        code_map_result_free(&r);
+    }
+    /* (j) callee reached as Thumb by bl and as ARM by blx: conflict, the
+       callee's mode is unknown and its svc refuses the section. */
+    {
+        uint16_t code[] = { 0xf000, 0xf806 /* bl 0x1010 */, 0x4770, 0xbf00,
+            0xf000, 0xe802 /* blx 0x1010 */, 0x4770, 0xbf00,
+            0xdf00, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
+            { 0x1008, 0x1010, MODE_THUMB }, { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_map_result r = build_thumb(code, 10, f, 3);
+        check(f[2].mode == MODE_UNKNOWN, "map j: conflicting mode is unknown");
+        check(r.refused == 1 && r.refused_address == 0x1010,
+            "map j: refused at the svc");
+        code_map_result_free(&r);
+    }
+    /* (k) bytes no function covers, holding a Thumb TLS read: refused. */
+    {
+        uint16_t code[] = { 0xee1d, 0x0f70, 0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1004, 0x1008, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 4, f, 1);
+        check(r.refused == 1 && r.refused_address == 0x1000,
+            "map k: uncovered TLS read, refused");
+        code_map_result_free(&r);
+    }
+}
+
 int main(void)
 {
     test_insn_info();
+    test_map_builder();
     printf("code_map_test_failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }

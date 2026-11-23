@@ -37,4 +37,34 @@ int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out);
 int thumb_cmp_imm(const uint16_t *code, size_t halfwords, unsigned *reg,
     uint32_t *imm);
 
+enum fn_mode { MODE_UNKNOWN, MODE_ARM, MODE_THUMB };
+
+struct code_function {
+    uint32_t start; /* link address, no Thumb bit */
+    uint32_t end;
+    enum fn_mode mode;
+};
+
+struct code_map_result {
+    struct mapping_symbol *symbols; /* sorted $a/$t/$d */
+    size_t symbol_count;
+    int refused;
+    uint32_t refused_address;
+};
+
+/*
+ * Decode [base, base + size) of one executable section. functions: sorted,
+ * non-overlapping, ends set. Modes are propagated in place: a call or
+ * branch to another function's start sets its mode, to a fixpoint; a
+ * function reached in both modes becomes MODE_UNKNOWN. Words read by
+ * PC-relative loads and bounded tbb/tbh tables are data. Bytes left
+ * undecoded are $d; if any holds a possible patch site in either mode,
+ * refused is set (refused_address is the first such site).
+ * Returns 0, or -1 on allocation failure.
+ */
+int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
+    struct code_function *functions, size_t function_count,
+    struct code_map_result *out);
+void code_map_result_free(struct code_map_result *result);
+
 #endif
