@@ -1510,3 +1510,69 @@ open io-pkt problem, not reproduced on the rerun).
 **Still not covered:** stripped libraries (no `.symtab`, so no mapping
 symbols; most AOSP libraries), the Android gate items and the
 modified-bionic decision.
+
+## 2026-11-23 — Phase 4 part 3: stripped-binary decoding (Passport, devuser; laptop host)
+
+**Facts the design rests on (checked):**
+- Stripping removes `.symtab` but keeps section headers, `.dynsym`,
+  `.rel.dyn` and `.ARM.exidx`. The roadmap's "AOSP libraries ship without
+  section headers" was wrong and is corrected there.
+- `.ARM.exidx` entries give function starts without the Thumb bit.
+  `.dynsym` function values, `R_ARM_RELATIVE` function pointers and
+  `e_entry` carry it.
+- Alpine's gcc emits no `.ARM.exidx` for C unless `-funwind-tables`;
+  Android builds with it. Code built with it needs libgcc's unwind
+  personality routines, and the test rootfs has no `libgcc_s`, so the
+  fixtures link libgcc statically.
+
+**Found while building it:**
+- GNU ld merges adjacent `.ARM.exidx` entries with the same unwind data.
+  In the fixture one entry covered several Thumb functions and the ARM
+  functions after them, so unwind entries alone can't give function
+  boundaries or modes. Direct call targets start functions, and a
+  relocated odd pointer that only lies inside unwind coverage is weak
+  evidence (it never cuts a function decoded from strong evidence).
+- A linear sweep through each function decodes constant pools that code
+  reaches with `adr` (not a load) as instructions: 284 bytes in SQLite.
+  Decoding now follows control flow. A call is assumed to return, so the
+  sweep also walked from a call to `__stack_chk_fail` into the pool after
+  it (gcc 15); `adr` targets now stop decoding without being trusted as
+  data.
+- A `tbh` bounded by a register compare (`cmp r1, r3`) left SQLite's
+  parser function undecoded and, through the calls inside it, 45% of the
+  library. A table without a `cmp` bound takes its length from its
+  entries when the nearest case starts right at its end; every table is
+  trusted only if all its entries land past it inside the function.
+- Recomputing the function starts from scratch each round cycled forever
+  on Thumb glibc (a tail call into a body that calls back before itself,
+  found by the final review). Starts now accumulate; targets in bytes
+  trusted as data are dropped.
+
+**Checks (host, `code-map-test UNSTRIPPED STRIPPED`, byte by byte against
+the unstripped file's mapping symbols):** SQLite 3.54.1 built for Thumb with
+`-funwind-tables` by the laptop's gcc 12 and by Alpine's gcc 15 on the
+device: no data decoded as code and no code in the wrong mode; 6-8% of the
+code stays undecoded (no patterns in it). The review also ran libasan
+(70 real `svc` sites; it is refused at a function nothing calls directly),
+134 Alpine ELFs (no Thumb evidence, untouched, 55 ms for all on the host)
+and 100k mutated-header files under ASan/UBSan (clean). Stripped Debian
+armhf `libc.so.6`, `libm.so.6` and `libubsan.so.1` settle (libc in 0.16 s
+on the host) and are refused: code reached only through addresses formed
+in code (`ldr rX, =offset; add rX, pc`) stays undecoded and holds system
+calls. That evidence is part 4's.
+
+**Device:** the stripped mixed library is patched exactly like its
+unstripped twin (on the part 2 core the stripped copy's Thumb `svc` at
+offset 0x97b was left unpatched); the unknown-mode library is refused with
+`Exec format error` and `detail=undecodable-code`; `thumb-entry-stripped`
+runs (the part 2 core couldn't load it). SQLite's own code makes no system
+calls, so its guest comparison is identical on the part 2 core too: the
+host comparison is the check that tells the cores apart. Loading the
+stripped SQLite pair and running SQL takes 0.68 s on the final core,
+against 0.42-0.60 s on the core before the review fixes, which decoded it
+in fewer rounds.
+
+**Gate:** full device regression `linuxemu_full_regression_failures=0`
+and corpus 10 of 11 (the same apps as in part 2), on core
+`50b74a6d781316483bf474a9e56188cf0915d55f3f87714e18e96388b7683d27` (after the final review's fixes) and on the core before them
+(`afe6095b…`).

@@ -499,10 +499,33 @@ Other limits:
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
   in files that carry a symbol table with ARM mapping symbols (`$a`, `$t`,
   `$d`): the program, its interpreter, and libraries mapped at run time.
-  Their data runs are left alone. A file without a symbol table (a stripped
-  library) is still scanned as ARM only, so its Thumb code isn't patched.
-  Memory made executable with `mprotect` is not patched again: file pages
-  were patched when they were mapped, and anonymous memory isn't patched.
+  Their data runs are left alone. Memory made executable with `mprotect`
+  is not patched again: file pages were patched when they were mapped, and
+  anonymous memory isn't patched.
+- A file without mapping symbols (stripped) is scanned as ARM, as before,
+  unless it shows Thumb evidence: an odd `.dynsym` function, `e_entry` or
+  `DT_INIT`/`DT_FINI`, or an odd `R_ARM_RELATIVE` word naming an
+  unwind-table entry or a `.dynsym` function. Then it is decoded.
+  Functions start at its `.ARM.exidx` entries, `.dynsym` functions, that
+  evidence, direct call targets and branches out of a function. Each
+  function's mode comes from the evidence and from the calls and branches
+  that reach it. An odd `R_ARM_RELATIVE` word that only lies inside the
+  unwind table's coverage is weak evidence: it decodes only code nothing
+  else reaches. Decoding follows control flow, so literal pools, the
+  targets of `adr`, and `tbb`/`tbh` tables are not decoded as code.
+- If a byte range left undecoded holds a possible patch site in either
+  mode (an `svc #0` or a TPIDRURO read), the file is refused. The load or
+  the `mmap` fails with `ENOEXEC`, and a `LINUXEMU_DIAGNOSTICS` record
+  `detail=undecodable-code` gives the link address in its first argument
+  (one record per process; `LINUXEMU_VERBOSE` prints each refusal). A
+  section whose decoding doesn't settle is left undecoded as a whole.
+  Like patching, this applies to every file mapping that overlaps code,
+  read-only ones included, so a refused library can't be `mmap`ed at all.
+  Code reached only indirectly (a computed jump, or a function whose
+  address is only formed in code) stays undecoded. On the host, stripped
+  Debian armhf `libc.so.6`, `libm.so.6` and `libubsan.so.1` are refused
+  this way; SQLite built for Thumb is not. Files without section headers
+  are refused by the loader and not patched when mapped at run time.
 - Thumb entry points and Thumb signal handlers (address bit 0 set) run in
   Thumb state.
 - Priority-inheritance and robust-list futex operations are unsupported.

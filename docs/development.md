@@ -275,6 +275,41 @@ The Thumb `dlopen` fixtures (`thumb-module-armhf.so`, a Thumb-2 library, and
 `sh scripts/build-thumb-fixtures.sh`. They are left unstripped on purpose:
 Linuxemu patches a runtime-mapped library by its mapping symbols.
 
+The stripped-decoding fixtures (Phase 4 part 3) are rebuilt the same way
+with `sh scripts/build-stripped-fixtures.sh`: a mixed ARM/Thumb library
+built with `-funwind-tables`, kept unstripped (`stripped-mixed-armhf.so`,
+the ground truth) and stripped (`stripped-mixed-armhf.stripped.so`); a
+stripped Thumb library with a function of unknowable mode that holds an
+`svc` (`stripped-unknown-armhf.so`, which Linuxemu must refuse); and
+`stripped-compare-armhf`, which `dlopen`s a pair, compares their mapped
+code byte for byte and calls the stripped copy. The libraries link libgcc
+statically: the test rootfs has no `libgcc_s`. `run-loader-process-stress`
+runs both cases.
+
+The decoder (`src/code_map.c`) is pure and host-tested:
+
+```sh
+gcc -std=gnu99 -Isrc -o build/code-map-test tests/code-map-test.c \
+    src/code_map.c src/thumb_decode.c
+build/code-map-test                        # unit cases and the fixtures
+build/code-map-test UNSTRIPPED STRIPPED    # one pair against its symbols
+```
+
+The pair form decodes the stripped file and compares it with the
+unstripped file's mapping symbols, byte by byte: data decoded as code and
+code decoded in the wrong mode must both be 0 (code left undecoded is only
+coverage). Any ARM library with a symbol table and its `strip`ped copy
+works, for example one built on the laptop with `arm-linux-gnueabihf-gcc`.
+
+SQLite is the real-world check. On the laptop,
+`sh scripts/fetch-sqlite-amalgamation.sh` fetches the pinned 3.54.1
+amalgamation into `artifacts/sqlite/` (checked against
+`docs/corpus/sqlite-amalgamation.sha256`); copy it to the device and run
+`sh scripts/build-sqlite-thumb-fixture.sh` there (Alpine `build-base`
+installed). It builds `build/sqlite-thumb/libsqlite3.so` (Thumb,
+`-funwind-tables`) and its stripped copy, which `run-loader-process-stress`
+then compares and queries when they are present.
+
 Run the pinned Python 3.14.7 suite from the clean 16-package rootfs:
 
 ```sh

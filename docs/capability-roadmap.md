@@ -778,7 +778,10 @@ work in ARM, Thumb, and mixed modes without modifying embedded data.
   library itself with `mmap`/`mprotect`, and ART maps `.oat` files with
   `PROT_EXEC`.
 - Stage 2 (executable-segment decoding) is required. Most AOSP `/system/lib`
-  and APK native libraries ship without section headers.
+  and APK native libraries are stripped: no `.symtab`, so no mapping
+  symbols. (Stripping keeps section headers, `.dynsym`, `.rel.dyn` and
+  `.ARM.exidx`; Phase 4 part 3 corrected an earlier "ship without section
+  headers" here.)
 - Extra gate: stripped, mostly Thumb-2 AOSP 6.0.1 `libc.so`, `libm.so`, and
   `libutils.so` load through bionic's linker. A Thumb NDK test binary's raw
   `syscall()` calls are intercepted.
@@ -870,6 +873,51 @@ run before them, core `ae2d4dde…`, gave the same results): full device regress
 
 **Next parts.** Stripped-binary decoding (stage 2 above), then the Android
 gate items and the modified-bionic decision.
+
+### Phase 4 part 3 status: done (2026-11-23)
+
+Stripped-binary decoding (stages 2 and 3 above), on branch
+`phase4c-stripped-decoding`. Design and plan:
+`docs/superpowers/specs/2026-11-23-phase4c-stripped-decoding-design.md` and
+`docs/superpowers/plans/2026-11-23-phase4c-stripped-decoding.md`. The user
+chose decoding only, proven on our own stripped Thumb libraries; the
+Android gate (AOSP libraries through bionic's linker) is part 4.
+
+**What landed.**
+
+- A file without mapping symbols that shows Thumb evidence is decoded into
+  synthesized mapping symbols (`src/code_map.c`, pure and host-tested):
+  functions from `.ARM.exidx`, `.dynsym`, the evidence and direct call
+  targets; modes from evidence and the calls that reach them; decoding
+  follows control flow, so pools, `adr` targets and `tbb`/`tbh` tables
+  are not code. Files without Thumb evidence (all of Alpine) keep the
+  ARM-only scan.
+- Stage 3: a possible patch site in bytes left undecoded refuses the file
+  (`ENOEXEC`, diagnostic `detail=undecodable-code`).
+- Fixtures: a mixed ARM/Thumb library compared byte for byte with its
+  unstripped twin in the guest, an unknown-mode library that must be
+  refused, a stripped Thumb program, and SQLite 3.54.1 built for Thumb
+  (compared and queried when built). On the host,
+  `code-map-test UNSTRIPPED STRIPPED` checks a pair byte by byte against
+  the unstripped file's mapping symbols.
+
+**Follow-ups.**
+
+- Coverage: code reached only indirectly stays undecoded. Static
+  functions whose address is only formed in code (`ldr rX, =offset;
+  add rX, pc`) are the main gap; stripped Debian armhf glibc is refused
+  for it on the host. Part 4 (bionic) will need that evidence.
+- The final review's deferred minors: the refusal record doesn't name the
+  file; a refused file also fails read-only `mmap`s (from the older
+  "patch every file mapping" design); test-harness caps.
+
+**Gate results** (core `50b74a6d…`, after the final review's fixes; the
+run before them, core `afe6095b…`, gave the same results): full device
+regression `linuxemu_full_regression_failures=0`; corpus 10 of 11, the
+same apps.
+
+**Next parts.** The Android gate items (AOSP 6.0.1 libraries through
+bionic's linker, a Thumb NDK binary) and the modified-bionic decision.
 
 ## Phase 5: synthetic Linux procfs
 

@@ -426,3 +426,22 @@ corpus apps=11 compatible=10
 The same ten apps are compatible. Node.js still fails at start-up with the
 same SIGSEGV at address 0 (V8's memory set-up, Phase 6). Alpine's packages
 are ARM code, so this part changes no corpus app's patching.
+
+## Phase 4 part 3: 2026-11-23
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user.
+- **Linuxemu:** branch `phase4c-stripped-decoding` after the final
+  review's fixes, core sha256
+  `50b74a6d781316483bf474a9e56188cf0915d55f3f87714e18e96388b7683d27`.
+  Stripped files with Thumb evidence are decoded instead of scanned as ARM.
+  The run before those fixes (core `afe6095b…`) scored the same.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+
+```text
+corpus apps=11 compatible=10
+```
+
+The same ten apps are compatible. Node.js still fails at start-up (V8's
+memory set-up, Phase 6). Alpine's packages are stripped ARM code with no
+Thumb evidence, so they keep the ARM-only scan: this part changes no
+corpus app's patching.
