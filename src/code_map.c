@@ -311,6 +311,10 @@ enum byte_class { BYTE_UNDECODED = 0, BYTE_DATA, BYTE_ARM, BYTE_THUMB };
 #define REACHED_CALL_THUMB 2u
 #define REACHED_BRANCH_ARM 4u
 #define REACHED_BRANCH_THUMB 8u
+/* Calls and branches found decoding a weak function: weak starts. */
+#define REACHED_WEAK_ARM 16u
+#define REACHED_WEAK_THUMB 32u
+#define REACHED_STRONG_CALL (REACHED_CALL_ARM | REACHED_CALL_THUMB)
 
 /* struct builder.data: bytes a PC-relative load reads (data), or that an
    adr points at (not decoded, not trusted either). */
@@ -320,22 +324,29 @@ enum byte_class { BYTE_UNDECODED = 0, BYTE_DATA, BYTE_ARM, BYTE_THUMB };
 /* A tbb/tbh is bounded by a cmp of its index register within this many
    preceding instructions (GCC emits cmp; bhi; tbb). */
 #define TABLE_CMP_WINDOW 4u
-/* Rounds before giving up on a fixpoint. */
-#define MAX_ROUNDS 64u
+/* Starts accumulate (dropped only where data is trusted), so the rounds
+   settle; rounds where only the literal data changes are capped, and so is
+   the whole, in case they don't. */
+#define DATA_ROUNDS 8u
+#define MAX_ROUNDS 256u
 
 struct span {
     uint32_t start;
     uint32_t limit;  /* end before clipping at the next start */
     enum fn_mode mode;
+    int weak;
 };
 
 /*
  * One round decodes every function whose mode is known, using the literal
- * data (data) and the call/branch targets (reached) the previous round
- * found, and records what it finds into next_data and next_reached. The
- * function list is the caller's plus every call target (a merged unwind
- * entry can cover functions of both modes). Rounds repeat until nothing
- * changes, so nothing a discarded decoding found survives.
+ * data (data) the previous round found and the call/branch targets
+ * (reached) all rounds found, and records into next_data and next_reached.
+ * The function list is the caller's plus every call target and every
+ * branch out of a function (a merged unwind entry can cover functions of
+ * both modes). Literal data is recomputed each round, so a load found in a
+ * discarded decoding doesn't survive; starts accumulate, so the rounds
+ * settle. Weak functions are decoded last and only where nothing else
+ * decoded; what they reach is weak too, and their loads are barriers.
  */
 struct builder {
     const uint8_t *bytes;
@@ -350,9 +361,12 @@ struct builder {
     uint8_t *next_data;
     uint8_t *reached;
     uint8_t *next_reached;
+    size_t span_capacity;
     uint32_t *work;
     size_t work_count;
     size_t work_capacity;
+    int weak_pass;
+    int failed;      /* allocation failure */
 };
 
 static uint16_t read16(const uint8_t *p)
@@ -379,10 +393,14 @@ static int any_data(const struct builder *b, size_t offset, size_t length)
     return 0;
 }
 
-static void note(struct builder *b, const struct insn_info *info)
+/* Record what an instruction of the function [start, end) reads and
+   reaches. A branch out of the function is a tail call: it starts a
+   function like a call. */
+static void note(struct builder *b, const struct insn_info *info,
+    uint32_t start, uint32_t end)
 {
     uint32_t i;
-    if (info->literal_valid && info->literal_size == 0) {
+    if (info->literal_valid && (info->literal_size == 0 || b->weak_pass)) {
         /* adr: what it points at isn't known, so it is neither decoded
            (it may be a pool) nor trusted as data (it may be code). */
         for (i = 0; i < 2u; ++i)
@@ -396,7 +414,10 @@ static void note(struct builder *b, const struct insn_info *info)
     }
     if (info->target_valid && in_section(b, info->target)) {
         uint8_t mark;
-        if (info->flow == FLOW_CALL)
+        int outside = info->target < start || info->target >= end;
+        if (b->weak_pass)
+            mark = info->target_thumb ? REACHED_WEAK_THUMB : REACHED_WEAK_ARM;
+        else if (info->flow == FLOW_CALL || outside)
             mark = info->target_thumb ? REACHED_CALL_THUMB : REACHED_CALL_ARM;
         else
             mark = info->target_thumb ? REACHED_BRANCH_THUMB :
@@ -408,7 +429,14 @@ static void note(struct builder *b, const struct insn_info *info)
 /* Work list of addresses still to decode in the current function. */
 static void push(struct builder *b, uint32_t address)
 {
-    if (b->work_count < b->work_capacity) b->work[b->work_count++] = address;
+    if (b->work_count == b->work_capacity) {
+        size_t capacity = b->work_capacity ? b->work_capacity * 2u : 256u;
+        uint32_t *work = realloc(b->work, capacity * sizeof(*work));
+        if (work == 0) { b->failed = 1; return; }
+        b->work = work;
+        b->work_capacity = capacity;
+    }
+    b->work[b->work_count++] = address;
 }
 
 /* A branch target to follow: inside the function, not already decoded and
@@ -482,7 +510,7 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
             if (info.width == 4 && b->klass[offset + 2u] != BYTE_UNDECODED)
                 break;
             memset(b->klass + offset, BYTE_THUMB, info.width);
-            note(b, &info);
+            note(b, &info, start, end);
             if (it_left > 0) it_left--;
             flow = info.flow;
             /* Inside an IT block a jump or return is conditional. */
@@ -509,6 +537,22 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
                     length = inferred_table_length(b, table,
                         info.table_entry_size, end);
                 if (length == 0 || length > end - table) break;
+                /* Trust the table only if every entry lands past it and
+                   inside the function, and it covers no decoded code:
+                   otherwise its length is wrong; decode no further. */
+                for (i = 0; i < length; ++i)
+                    if (b->klass[table - b->base + i] != BYTE_UNDECODED)
+                        break;
+                if (i < length) break;
+                for (i = 0; i < length / info.table_entry_size; ++i) {
+                    size_t entry = table - b->base + i * info.table_entry_size;
+                    uint32_t value = info.table_entry_size == 1 ?
+                        b->bytes[entry] : read16(b->bytes + entry);
+                    if (table + 2u * value < table + length ||
+                        table + 2u * value >= end)
+                        break;
+                }
+                if (i < length / info.table_entry_size) break;
                 memset(b->klass + (table - b->base), BYTE_DATA, length);
                 for (i = 0; i < length / info.table_entry_size; ++i) {
                     size_t entry = table - b->base + i * info.table_entry_size;
@@ -545,7 +589,7 @@ static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
             uint32_t address = b->base + (uint32_t)offset;
             arm_insn_info(read32(b->bytes + offset), address, &info);
             memset(b->klass + offset, BYTE_ARM, 4);
-            note(b, &info);
+            note(b, &info, start, end);
             if (info.target_valid && (info.flow == FLOW_BRANCH ||
                     info.flow == FLOW_JUMP) &&
                 followable(b, info.target, start, end))
@@ -579,8 +623,14 @@ static int compare_spans(const void *left, const void *right)
     return a->start < b->start ? -1 : a->start > b->start;
 }
 
-static enum fn_mode combine(enum fn_mode mode, uint8_t marks)
+static enum fn_mode combine(enum fn_mode mode, uint8_t marks, int weak)
 {
+    if (weak) {
+        /* Weak functions take only weak marks: a strong call there made
+           it a strong function instead. */
+        marks = (uint8_t)((marks & REACHED_WEAK_ARM ? REACHED_CALL_ARM : 0) |
+            (marks & REACHED_WEAK_THUMB ? REACHED_CALL_THUMB : 0));
+    }
     int arm = mode == MODE_ARM || (marks & (REACHED_CALL_ARM |
         REACHED_BRANCH_ARM)) != 0;
     int thumb = mode == MODE_THUMB || (marks & (REACHED_CALL_THUMB |
@@ -589,36 +639,63 @@ static enum fn_mode combine(enum fn_mode mode, uint8_t marks)
     return arm ? MODE_ARM : thumb ? MODE_THUMB : MODE_UNKNOWN;
 }
 
-/* The caller's functions plus every call target, sorted, each clipped at
-   the next start, with modes from the evidence and from reached. */
+static int add_span(struct builder *b, uint32_t start, uint32_t limit,
+    enum fn_mode mode, int weak)
+{
+    if (b->span_count == b->span_capacity) {
+        size_t capacity = b->span_capacity ? b->span_capacity * 2u : 64u;
+        struct span *spans = realloc(b->spans, capacity * sizeof(*spans));
+        if (spans == 0) { b->failed = 1; return -1; }
+        b->spans = spans;
+        b->span_capacity = capacity;
+    }
+    b->spans[b->span_count].start = start;
+    b->spans[b->span_count].limit = limit;
+    b->spans[b->span_count].mode = mode;
+    b->spans[b->span_count].weak = weak;
+    b->span_count++;
+    return 0;
+}
+
+static int compare_spans_weak_last(const void *left, const void *right)
+{
+    const struct span *a = left;
+    const struct span *b = right;
+    if (a->weak != b->weak) return a->weak - b->weak;
+    return a->start < b->start ? -1 : a->start > b->start;
+}
+
+/* Strong spans: the caller's strong functions plus every call target,
+   sorted, each clipped at the next strong start. Weak spans after them:
+   the caller's weak functions and weak targets not already a strong start,
+   each ending at the next strong start, cutting nothing. Modes come from
+   the evidence and from reached. */
 static void build_spans(struct builder *b)
 {
     size_t i;
-    size_t count = 0;
+    size_t strong;
     size_t unique = 0;
+    uint32_t section_end = b->base + (uint32_t)b->size;
 
-    for (i = 0; i < b->initial_count; ++i) {
-        b->spans[count].start = b->initial[i].start;
-        b->spans[count].limit = b->initial[i].end;
-        b->spans[count].mode = b->initial[i].mode;
-        count++;
-    }
-    for (i = 0; i < b->size; ++i) {
-        if ((b->reached[i] & (REACHED_CALL_ARM | REACHED_CALL_THUMB)) == 0)
-            continue;
-        b->spans[count].start = b->base + (uint32_t)i;
-        b->spans[count].limit = b->base + (uint32_t)b->size;
-        b->spans[count].mode = MODE_UNKNOWN;
-        count++;
-    }
-    qsort(b->spans, count, sizeof(*b->spans), compare_spans);
-    for (i = 0; i < count; ++i) {
+    b->span_count = 0;
+    for (i = 0; i < b->initial_count; ++i)
+        if (!b->initial[i].weak)
+            add_span(b, b->initial[i].start, b->initial[i].end,
+                b->initial[i].mode, 0);
+    for (i = 0; i < b->size; ++i)
+        if (b->reached[i] & REACHED_STRONG_CALL)
+            add_span(b, b->base + (uint32_t)i, section_end, MODE_UNKNOWN, 0);
+    if (b->failed) return;
+    qsort(b->spans, b->span_count, sizeof(*b->spans), compare_spans);
+    for (i = 0; i < b->span_count; ++i) {
         if (unique > 0 && b->spans[unique - 1].start == b->spans[i].start) {
             /* A call target that is also one of the caller's functions:
                keep the caller's extent and evidence. */
-            if (b->spans[i].mode != MODE_UNKNOWN ||
+            if (b->spans[i].mode != MODE_UNKNOWN &&
                 b->spans[unique - 1].mode == MODE_UNKNOWN)
-                b->spans[unique - 1] = b->spans[i];
+                b->spans[unique - 1].mode = b->spans[i].mode;
+            if (b->spans[i].limit < b->spans[unique - 1].limit)
+                b->spans[unique - 1].limit = b->spans[i].limit;
             continue;
         }
         /* A call target inside a caller's function ends where that one
@@ -633,9 +710,44 @@ static void build_spans(struct builder *b)
         if (i + 1 < unique && b->spans[i + 1].start < b->spans[i].limit)
             b->spans[i].limit = b->spans[i + 1].start;
         b->spans[i].mode = combine(b->spans[i].mode,
-            b->reached[start - b->base]);
+            b->reached[start - b->base], 0);
     }
-    b->span_count = unique;
+    b->span_count = strong = unique;
+
+    for (i = 0; i < b->initial_count + b->size; ++i) {
+        uint32_t start;
+        uint32_t limit;
+        enum fn_mode mode;
+        size_t low = 0;
+        size_t high = strong;
+        if (i < b->initial_count) {
+            if (!b->initial[i].weak) continue;
+            start = b->initial[i].start;
+            limit = b->initial[i].end;
+            mode = b->initial[i].mode;
+        } else {
+            size_t offset = i - b->initial_count;
+            if ((b->reached[offset] & (REACHED_WEAK_ARM |
+                    REACHED_WEAK_THUMB)) == 0) continue;
+            start = b->base + (uint32_t)offset;
+            limit = section_end;
+            mode = MODE_UNKNOWN;
+        }
+        /* The first strong start after this one ends it. */
+        while (low < high) {
+            size_t middle = low + (high - low) / 2;
+            if (b->spans[middle].start <= start) low = middle + 1;
+            else high = middle;
+        }
+        if (low > 0 && b->spans[low - 1].start == start) continue;
+        if (low < strong && b->spans[low].start < limit)
+            limit = b->spans[low].start;
+        add_span(b, start, limit, combine(mode, b->reached[start - b->base],
+            1), 1);
+    }
+    if (b->failed) return;
+    qsort(b->spans + strong, b->span_count - strong, sizeof(*b->spans),
+        compare_spans_weak_last);
 }
 
 static void decode_round(struct builder *b)
@@ -644,14 +756,21 @@ static void decode_round(struct builder *b)
     build_spans(b);
     memset(b->klass, BYTE_UNDECODED, b->size);
     memset(b->next_data, 0, b->size);
-    memset(b->next_reached, 0, b->size);
+    /* Starts accumulate: a round only adds marks. */
+    memcpy(b->next_reached, b->reached, b->size);
     for (i = 0; i < b->span_count; ++i) {
         const struct span *f = &b->spans[i];
+        b->weak_pass = f->weak;
         if (f->mode == MODE_THUMB) decode_thumb(b, f->start, f->limit);
         else if (f->mode == MODE_ARM) decode_arm(b, f->start, f->limit);
     }
-    for (i = 0; i < b->size; ++i)
+    b->weak_pass = 0;
+    for (i = 0; i < b->size; ++i) {
         if (b->data[i] == DATA_LOADED) b->klass[i] = BYTE_DATA;
+        /* A target in bytes trusted as data came from data decoded as
+           code somewhere: drop it, so it can't start a function. */
+        if (b->klass[i] == BYTE_DATA) b->next_reached[i] = 0;
+    }
 }
 
 /* First possible patch site starting in an undecoded byte, or -1. */
@@ -708,6 +827,7 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
 {
     struct builder b;
     size_t allocation = size ? size : 1;
+    unsigned data_rounds;
     unsigned round;
     size_t i;
     long site;
@@ -728,37 +848,46 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     }
     b.initial = functions;
     b.initial_count = function_count;
-    /* Call targets are halfword-aligned: at most size / 2 of them. */
-    b.spans = malloc(sizeof(*b.spans) * (function_count + size / 2u + 1u));
     b.klass = malloc(allocation);
     b.data = calloc(allocation, 1);
     b.next_data = malloc(allocation);
     b.reached = calloc(allocation, 1);
     b.next_reached = malloc(allocation);
-    /* Each work entry is a distinct undecoded halfword. */
-    b.work_capacity = size / 2u + 1u;
-    b.work = malloc(sizeof(*b.work) * b.work_capacity);
-    if (b.spans == 0 || b.klass == 0 || b.data == 0 || b.next_data == 0 ||
-        b.reached == 0 || b.next_reached == 0 || b.work == 0) goto done;
+    if (b.klass == 0 || b.data == 0 || b.next_data == 0 ||
+        b.reached == 0 || b.next_reached == 0) goto done;
 
-    for (round = 0;; ++round) {
+    for (data_rounds = 0, round = 0;; ++round) {
+        int reached_changed;
         decode_round(&b);
-        if (memcmp(b.data, b.next_data, size) == 0 &&
-            memcmp(b.reached, b.next_reached, size) == 0) break;
-        if (round + 1u == MAX_ROUNDS) {
-            /* No fixpoint: no instruction boundary can be trusted. */
+        if (b.failed) goto done;
+        reached_changed = memcmp(b.reached, b.next_reached, size) != 0;
+        if (!reached_changed && memcmp(b.data, b.next_data, size) == 0)
+            break;
+        if (reached_changed) data_rounds = 0;
+        if ((!reached_changed && ++data_rounds == DATA_ROUNDS) ||
+            round + 1u == MAX_ROUNDS) {
+            /* The pools keep moving: no instruction boundary can be
+               trusted. */
             memset(b.klass, BYTE_UNDECODED, size);
+            out->unsettled = 1;
             break;
         }
         memcpy(b.data, b.next_data, size);
         memcpy(b.reached, b.next_reached, size);
     }
-    /* Report the modes the caller's functions ended with. */
+    /* Report the modes the caller's functions ended with (spans are
+       sorted by start, strong ones first). */
     for (i = 0; i < function_count; ++i) {
         size_t j;
-        for (j = 0; j < b.span_count; ++j)
-            if (b.spans[j].start == functions[i].start)
+        for (j = 0; j < b.span_count; ++j) {
+            if (b.spans[j].start == functions[i].start &&
+                b.spans[j].weak == functions[i].weak) {
                 functions[i].mode = b.spans[j].mode;
+                break;
+            }
+            if (!b.spans[j].weak && b.spans[j].start > functions[i].start &&
+                !functions[i].weak) break;
+        }
     }
     site = first_undecoded_site(&b);
     if (site >= 0) {
@@ -985,14 +1114,16 @@ static int section_named(const struct elf_view *e, unsigned index,
 }
 
 /* Unwind-table function starts (exidx entries hold no Thumb bit) and
-   .dynsym functions: the starts. Thumb evidence: odd .dynsym functions,
-   e_entry, DT_INIT/DT_FINI, and R_ARM_RELATIVE words: an odd one inside
-   the unwind table's coverage or naming an odd .dynsym function, an even
-   one naming an unwind-table start or an even .dynsym function. An odd
-   data pointer into code outside that coverage (a string in .text before
-   the first unwind entry) isn't taken for a function. */
+   .dynsym functions: the starts. Mode evidence: .dynsym functions,
+   e_entry, DT_INIT/DT_FINI, and R_ARM_RELATIVE words naming an
+   unwind-table start or a .dynsym function of their mode. An odd
+   R_ARM_RELATIVE word elsewhere inside the unwind table's coverage is weak
+   Thumb evidence: ld merges adjacent unwind entries, so a function may
+   have no start of its own, but the word may also point at data in code.
+   One outside that coverage (a string in .text before the first unwind
+   entry) is no evidence at all. */
 static void gather(const struct elf_view *e, struct evidence_list *starts,
-    struct evidence_list *modes)
+    struct evidence_list *modes, struct evidence_list *weak)
 {
     unsigned i;
     uint32_t j;
@@ -1049,11 +1180,15 @@ static void gather(const struct elf_view *e, struct evidence_list *starts,
             /* Starts hold exidx entries (MODE_UNKNOWN) and .dynsym
                functions (their mode). */
             if ((value & 1u) != 0 ?
-                    in_exidx_coverage(e, starts, value - 1u) ||
+                    has_evidence_exidx(starts, value - 1u) ||
                     has_evidence(starts, value - 1u, MODE_THUMB) :
                     has_evidence_exidx(starts, value) ||
                     has_evidence(starts, value, MODE_ARM))
                 add_pointer(e, modes, value);
+            else if ((value & 1u) != 0 &&
+                in_exidx_coverage(e, starts, value - 1u))
+                /* Inside a merged unwind entry, or data in code: weak. */
+                add_evidence(weak, value - 1u, MODE_THUMB);
         }
     }
 }
@@ -1069,7 +1204,7 @@ static enum fn_mode evidence_mode(const struct evidence_list *modes,
 
 static int decode_section(const struct elf_view *e, unsigned index,
     const struct evidence_list *starts, const struct evidence_list *modes,
-    struct code_map_result *out)
+    const struct evidence_list *weak, struct code_map_result *out)
 {
     uint32_t base = sh_field(e, index, 12);
     uint32_t size = sh_field(e, index, 20);
@@ -1081,12 +1216,13 @@ static int decode_section(const struct elf_view *e, unsigned index,
     int result;
 
     functions = malloc(sizeof(*functions) *
-        (starts->count + modes->count + 1u));
+        (starts->count + modes->count + weak->count + 1u));
     if (functions == 0) return -1;
     if (section_named(e, index, ".plt")) {
         /* GNU PLT stubs are ARM and have no unwind entries. */
         functions[count].start = base;
         functions[count].mode = MODE_ARM;
+        functions[count].weak = 0;
         count++;
     } else {
         for (i = 0; i < starts->count + modes->count; ++i) {
@@ -1095,6 +1231,7 @@ static int decode_section(const struct elf_view *e, unsigned index,
             if (address < base || address - base >= size) continue;
             functions[count].start = address;
             functions[count].mode = evidence_mode(modes, address);
+            functions[count].weak = 0;
             count++;
         }
         qsort(functions, count, sizeof(*functions), compare_evidence_fn);
@@ -1110,10 +1247,24 @@ static int decode_section(const struct elf_view *e, unsigned index,
             functions[i].end = i + 1 < count ? functions[i + 1].start :
                 base + size;
     }
+    /* Weak functions after them; code_map_build ends each at the next
+       strong start. */
+    if (!section_named(e, index, ".plt")) {
+        for (i = 0; i < weak->count; ++i) {
+            uint32_t address = weak->items[i].address;
+            if (address < base || address - base >= size) continue;
+            functions[count].start = address;
+            functions[count].end = base + size;
+            functions[count].mode = MODE_THUMB;
+            functions[count].weak = 1;
+            count++;
+        }
+    }
     result = code_map_build(e->file + sh_field(e, index, 16), base, size,
         functions, count, &section);
     free(functions);
     if (result != 0) return -1;
+    if (section.unsettled) out->unsettled = 1;
     if (section.refused && !out->refused) {
         out->refused = 1;
         out->refused_address = section.refused_address;
@@ -1138,6 +1289,7 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
     struct elf_view e;
     struct evidence_list starts;
     struct evidence_list modes;
+    struct evidence_list weak;
     uint32_t shoff;
     size_t i;
     int thumb = 0;
@@ -1146,6 +1298,7 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
     memset(out, 0, sizeof(*out));
     memset(&starts, 0, sizeof(starts));
     memset(&modes, 0, sizeof(modes));
+    memset(&weak, 0, sizeof(weak));
     if (file_size < EHDR_SIZE || memcmp(file, "\177ELF\001\001", 6) != 0 ||
         read16(file + 18) != 40u /* EM_ARM */ ||
         read16(file + 46) != SHDR_SIZE) return 0;
@@ -1157,10 +1310,11 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
         !in_file(&e, shoff, e.section_count * SHDR_SIZE)) return 0;
     e.sections = file + shoff;
 
-    gather(&e, &starts, &modes);
-    if (starts.failed || modes.failed) goto done;
+    gather(&e, &starts, &modes, &weak);
+    if (starts.failed || modes.failed || weak.failed) goto done;
     for (i = 0; i < modes.count; ++i)
         if (modes.items[i].mode == MODE_THUMB) thumb = 1;
+    if (weak.count > 0) thumb = 1;
     if (!thumb) {
         result = 0;
         goto done;
@@ -1168,7 +1322,7 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
     qsort(modes.items, modes.count, sizeof(*modes.items), compare_evidence);
     for (i = 0; i < e.section_count; ++i) {
         if (!code_section_at(&e, (unsigned)i)) continue;
-        if (decode_section(&e, (unsigned)i, &starts, &modes, out) != 0) {
+        if (decode_section(&e, (unsigned)i, &starts, &modes, &weak, out) != 0) {
             code_map_result_free(out);
             goto done;
         }
@@ -1179,5 +1333,6 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
 done:
     free(starts.items);
     free(modes.items);
+    free(weak.items);
     return result;
 }

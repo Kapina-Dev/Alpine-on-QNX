@@ -50,6 +50,8 @@ struct code_function {
     uint32_t start; /* link address, no Thumb bit */
     uint32_t end;
     enum fn_mode mode;
+    int weak;       /* evidence that may name data: never cuts another
+                       function and decodes only bytes nothing else does */
 };
 
 struct code_map_result {
@@ -57,13 +59,15 @@ struct code_map_result {
     size_t symbol_count;
     int refused;
     uint32_t refused_address;
+    int unsettled;  /* no fixpoint: the section was left undecoded */
 };
 
 /*
  * Decode [base, base + size) of one executable section. functions: sorted,
- * non-overlapping, ends set. Modes are propagated in place: a call or
- * branch to another function's start sets its mode, to a fixpoint; a
- * function reached in both modes becomes MODE_UNKNOWN. Words read by
+ * non-overlapping (weak ones may lie inside others), ends set. Modes are
+ * propagated in place: a call, or a branch out of a function, starts a
+ * function of the mode it names, to a fixpoint; a function reached in both
+ * modes becomes MODE_UNKNOWN. Words read by
  * PC-relative loads and bounded tbb/tbh tables are data. Bytes left
  * undecoded are $d; if any holds a possible patch site in either mode,
  * refused is set (refused_address is the first such site).

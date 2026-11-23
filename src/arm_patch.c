@@ -4,6 +4,7 @@
 #include "thumb_decode.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,22 +154,90 @@ static int code_section(const Elf32_Shdr *section)
         (section->sh_flags & SHF_EXECINSTR) != 0 && section->sh_size != 0;
 }
 
+/* The last file decoded: musl maps a library 1-3 times while loading it,
+   and each mapping that holds code asks for its symbols. */
+static pthread_mutex_t synthesis_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int valid;
+    dev_t device;
+    ino_t inode;
+    off64_t size;
+    time_t modified;
+    struct code_map_result map;
+} synthesis_cache;
+
+/* Decode the file, or copy the cached result for it. */
+static int decode_file(int fd, uint64_t file_size, struct code_map_result *map)
+{
+    struct stat64 status;
+    void *file;
+    int result;
+    int keyed = fstat64(fd, &status) == 0;
+
+    memset(map, 0, sizeof(*map));
+    pthread_mutex_lock(&synthesis_lock);
+    if (keyed && synthesis_cache.valid &&
+        synthesis_cache.device == status.st_dev &&
+        synthesis_cache.inode == status.st_ino &&
+        synthesis_cache.size == status.st_size &&
+        synthesis_cache.modified == status.st_mtime) {
+        *map = synthesis_cache.map;
+        map->symbols = 0;
+        if (map->symbol_count != 0) {
+            map->symbols = malloc(map->symbol_count * sizeof(*map->symbols));
+            if (map->symbols == 0) {
+                pthread_mutex_unlock(&synthesis_lock);
+                return -1;
+            }
+            memcpy(map->symbols, synthesis_cache.map.symbols,
+                map->symbol_count * sizeof(*map->symbols));
+        }
+        pthread_mutex_unlock(&synthesis_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&synthesis_lock);
+
+    file = mmap(0, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED) return -1;
+    result = code_map_from_elf(file, (size_t)file_size, map);
+    munmap(file, (size_t)file_size);
+    if (result != 0) return -1;
+
+    if (keyed) {
+        struct mapping_symbol *copy = 0;
+        if (map->symbol_count != 0) {
+            copy = malloc(map->symbol_count * sizeof(*copy));
+            if (copy != 0)
+                memcpy(copy, map->symbols,
+                    map->symbol_count * sizeof(*copy));
+        }
+        if (map->symbol_count == 0 || copy != 0) {
+            pthread_mutex_lock(&synthesis_lock);
+            if (synthesis_cache.valid)
+                code_map_result_free(&synthesis_cache.map);
+            synthesis_cache.valid = 1;
+            synthesis_cache.device = status.st_dev;
+            synthesis_cache.inode = status.st_ino;
+            synthesis_cache.size = status.st_size;
+            synthesis_cache.modified = status.st_mtime;
+            synthesis_cache.map = *map;
+            synthesis_cache.map.symbols = copy;
+            pthread_mutex_unlock(&synthesis_lock);
+        }
+    }
+    return 0;
+}
+
 /* No mapping symbols: decode the file (src/code_map.c). Refuses with
    ENOEXEC when a possible patch site can't be classified. */
 static int synthesize_mapping_symbols(int fd, uint64_t file_size,
     struct mapping_symbol **out, size_t *count)
 {
     struct code_map_result map;
-    void *file;
-    int result;
 
     if (file_size == 0 || file_size > SIZE_MAX) return 0;
-    file = mmap(0, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (file == MAP_FAILED) return -1;
-    result = code_map_from_elf(file, (size_t)file_size, &map);
-    munmap(file, (size_t)file_size);
-    if (result != 0) {
-        errno = ENOMEM;
+    if (decode_file(fd, file_size, &map) != 0) {
+        if (errno == 0) errno = ENOMEM;
         return -1;
     }
     if (map.refused) {
@@ -176,8 +245,9 @@ static int synthesize_mapping_symbols(int fd, uint64_t file_size,
         linux_diag_record(0, 0, "undecodable-code", args);
         if (getenv("LINUXEMU_VERBOSE") != 0)
             fprintf(stderr, "linuxemu: stripped code at link address 0x%x "
-                "can't be decoded safely; refusing the file\n",
-                (unsigned)map.refused_address);
+                "can't be decoded safely%s; refusing the file\n",
+                (unsigned)map.refused_address, map.unsettled ?
+                " (the decoding didn't settle)" : "");
         code_map_result_free(&map);
         errno = ENOEXEC;
         return -1;

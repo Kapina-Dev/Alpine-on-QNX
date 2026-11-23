@@ -333,7 +333,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0x4801 /* ldr r0, [pc, #4] -> 0x1008 */,
             0xdf00 /* svc 0 */, 0x4770, 0xbf00, 0xdf00, 0xdf00 };
-        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 6, f, 1);
         check(r.refused == 0, "map a: not refused");
         check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
@@ -348,7 +348,7 @@ static void test_map_builder(void)
             0xdf00, 0xdf00 /* pool */,
             0xf85f, 0x0008 /* ldr.w r0, [pc, #-8] -> 0x1004 */,
             0x4770, 0xbf00 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 0, "map b: not refused");
         check(state_at(&r, 0x1004) == CODE_STATE_DATA &&
@@ -358,12 +358,14 @@ static void test_map_builder(void)
             state_at(&r, 0x100c) == CODE_STATE_THUMB, "map b: code after pool");
         code_map_result_free(&r);
     }
-    /* (c) tbb bounded by cmp of its index: the table is data. */
+    /* (c) tbb bounded by cmp of its index: the table is data. (A valid
+       tbb table can't hold 0xdf00 at an even offset: that is entry 0, a
+       target inside the table, which makes the table untrusted.) */
     {
         uint16_t code[] = { 0x2b03 /* cmp r3, #3 */,
             0xd803 /* bhi.n 0x100c */, 0xe8df, 0xf003 /* tbb [pc, r3] */,
-            0xdf00, 0xdf00 /* 4 table bytes */, 0x4770, 0xbf00 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+            0x0202, 0x0202 /* 4 entries -> 0x100c */, 0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 0, "map c: not refused");
         check(state_at(&r, 0x1008) == CODE_STATE_DATA &&
@@ -377,7 +379,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0x2a03 /* cmp r2, #3 */, 0xd803,
             0xe8df, 0xf003, 0xdf00, 0xdf00, 0x4770, 0xbf00 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 1 && r.refused_address == 0x1008,
             "map c2: cmp of another register, refused at table");
@@ -387,7 +389,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0x2b03, 0xbf00, 0xbf00, 0xbf00, 0xbf00, 0xbf00,
             0xe8df, 0xf003, 0xdf00, 0xdf00, 0x4770, 0xbf00 };
-        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 12, f, 1);
         check(r.refused == 1 && r.refused_address == 0x1010,
             "map c3: cmp out of the window, refused");
@@ -399,7 +401,7 @@ static void test_map_builder(void)
            inferred either. */
         uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0000, 0x0000,
             0xdf00, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 1 && r.refused_address == 0x100c,
             "map d: unbounded table then svc, refused at svc");
@@ -409,7 +411,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0000, 0x0000,
             0xbf00, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 0, "map e: not refused");
         check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
@@ -422,8 +424,8 @@ static void test_map_builder(void)
         uint16_t code[] = { 0xf000, 0xf806 /* bl 0x1010 */, 0x4770, 0xbf00,
             0xbf00, 0xbf00, 0xbf00, 0xbf00,
             0xdf00 /* svc */, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
-            { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 },
+            { 0x1010, 0x1014, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 10, f, 2);
         check(r.refused == 0, "map f: not refused");
         check(f[1].mode == MODE_THUMB, "map f: callee became Thumb");
@@ -435,8 +437,8 @@ static void test_map_builder(void)
         uint16_t code[] = { 0xf000, 0xe806 /* blx 0x1010 */, 0x4770, 0xbf00,
             0xbf00, 0xbf00, 0xbf00, 0xbf00,
             0x0000, 0xef00 /* svc 0 */, 0xff1e, 0xe12f /* bx lr */ };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
-            { 0x1010, 0x1018, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 },
+            { 0x1010, 0x1018, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 12, f, 2);
         check(r.refused == 0, "map f2: not refused");
         check(f[1].mode == MODE_ARM, "map f2: callee became ARM");
@@ -446,8 +448,8 @@ static void test_map_builder(void)
     /* (g) unknown-mode function holding an ARM svc: refused. */
     {
         uint16_t code[] = { 0x4770, 0xbf00, 0x0000, 0xef00, 0xff1e, 0xe12f };
-        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
-            { 0x1004, 0x100c, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB, 0 },
+            { 0x1004, 0x100c, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 6, f, 2);
         check(r.refused == 1 && r.refused_address == 0x1004,
             "map g: unknown mode with svc, refused");
@@ -456,8 +458,8 @@ static void test_map_builder(void)
     /* (h) the same without a pattern: not refused, left as data. */
     {
         uint16_t code[] = { 0x4770, 0xbf00, 0x0000, 0xe1a0, 0xff1e, 0xe12f };
-        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
-            { 0x1004, 0x100c, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB, 0 },
+            { 0x1004, 0x100c, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 6, f, 2);
         check(r.refused == 0, "map h: not refused");
         check(state_at(&r, 0x1004) == CODE_STATE_DATA,
@@ -468,7 +470,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0x0000, 0xe59f /* ldr r0, [pc, #0] -> 0x1008 */,
             0xff1e, 0xe12f, 0x0000, 0xef00 };
-        struct code_function f[] = { { 0x1000, 0x100c, MODE_ARM } };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_ARM, 0 } };
         struct code_map_result r = build_thumb(code, 6, f, 1);
         check(r.refused == 0, "map i: not refused");
         check(state_at(&r, 0x1000) == CODE_STATE_ARM &&
@@ -481,8 +483,8 @@ static void test_map_builder(void)
         uint16_t code[] = { 0xf000, 0xf806 /* bl 0x1010 */, 0x4770, 0xbf00,
             0xf000, 0xe802 /* blx 0x1010 */, 0x4770, 0xbf00,
             0xdf00, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB },
-            { 0x1008, 0x1010, MODE_THUMB }, { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB, 0 },
+            { 0x1008, 0x1010, MODE_THUMB, 0 }, { 0x1010, 0x1014, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 10, f, 3);
         check(f[2].mode == MODE_UNKNOWN, "map j: conflicting mode is unknown");
         check(r.refused == 1 && r.refused_address == 0x1010,
@@ -492,7 +494,7 @@ static void test_map_builder(void)
     /* (k) bytes no function covers, holding a Thumb TLS read: refused. */
     {
         uint16_t code[] = { 0xee1d, 0x0f70, 0x4770, 0xbf00 };
-        struct code_function f[] = { { 0x1004, 0x1008, MODE_THUMB } };
+        struct code_function f[] = { { 0x1004, 0x1008, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 4, f, 1);
         check(r.refused == 1 && r.refused_address == 0x1000,
             "map k: uncovered TLS read, refused");
@@ -505,7 +507,7 @@ static void test_map_builder(void)
         uint16_t code[] = { 0xf000, 0xe806 /* blx 0x1010 */, 0x4770, 0xbf00,
             0xbf00, 0xbf00, 0xbf00, 0xbf00,
             0x0000, 0xef00 /* svc 0 */, 0xff1e, 0xe12f /* bx lr */ };
-        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 12, f, 1);
         check(r.refused == 0, "map l: not refused");
         check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
@@ -519,8 +521,8 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xf000, 0xb806 /* b.w 0x1010 */, 0xbf00, 0xbf00,
             0xbf00, 0xbf00, 0xbf00, 0xbf00, 0xdf00, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB },
-            { 0x1010, 0x1014, MODE_UNKNOWN } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 },
+            { 0x1010, 0x1014, MODE_UNKNOWN, 0 } };
         struct code_map_result r = build_thumb(code, 10, f, 2);
         check(r.refused == 0 && f[1].mode == MODE_THUMB &&
             state_at(&r, 0x1010) == CODE_STATE_THUMB, "map m: tail call");
@@ -532,7 +534,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xa302 /* adr r3, 0x100c */, 0x4798 /* blx r3 */,
             0xbf00, 0xbf00, 0xf3af, 0x8000 /* nop.w */, 0xdf00, 0xdf00 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(state_at(&r, 0x100c) == CODE_STATE_DATA &&
             state_at(&r, 0x1008) == CODE_STATE_THUMB,
@@ -544,10 +546,65 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xa302, 0x4798, 0xbf00, 0xbf00, 0xf3af, 0x8000,
             0x5c00, 0x0526 };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 0 && state_at(&r, 0x100c) == CODE_STATE_DATA,
             "map r2: adr pool without a pattern");
+        code_map_result_free(&r);
+    }
+    /* (s) a tail call (b.w) out of its function into a body that calls
+       back before itself: the body's call adds a start that cuts the
+       tail call's function; the decoding must still settle. */
+    {
+        uint16_t code[] = { 0xf000, 0xb806 /* 0x1000 b.w 0x1010 */,
+            0xbf00, 0xbf00, 0x4770 /* 0x1008 bx lr */, 0xbf00, 0xbf00,
+            0xbf00, 0xf7ff, 0xfffa /* 0x1010 bl 0x1008 */,
+            0xdf00 /* 0x1014 svc */, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_THUMB, 0 } };
+        struct code_map_result r = build_thumb(code, 12, f, 1);
+        check(r.refused == 0 && !r.unsettled &&
+            state_at(&r, 0x1014) == CODE_STATE_THUMB,
+            "map s: tail call into a body that calls back settles");
+        code_map_result_free(&r);
+    }
+    /* (t) a weak Thumb start (an odd pointer known only to lie inside the
+       unwind table's coverage) inside an ARM function never cuts it. */
+    {
+        uint16_t code[] = { 0x0000, 0xea00 /* 0x1000 b 0x1008 */,
+            0x6261, 0x6463 /* 0x1004 "abcd" */, 0x0000, 0xef00 /* svc */,
+            0xff1e, 0xe12f /* bx lr */ };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_ARM, 0 },
+            { 0x1004, 0x1010, MODE_THUMB, 1 } };
+        struct code_map_result r = build_thumb(code, 8, f, 2);
+        check(r.refused == 0 && state_at(&r, 0x1008) == CODE_STATE_ARM &&
+            state_at(&r, 0x100c) == CODE_STATE_ARM,
+            "map t: weak Thumb start doesn't cut an ARM function");
+        code_map_result_free(&r);
+    }
+    /* (t2) a weak start alone still decodes a function nothing else
+       reaches (a static function only in a pointer table). */
+    {
+        uint16_t code[] = { 0x4770, 0xbf00, 0xee1d, 0x0f70 /* mrc */, 0x4770,
+            0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1004, MODE_THUMB, 0 },
+            { 0x1004, 0x100c, MODE_THUMB, 1 } };
+        struct code_map_result r = build_thumb(code, 6, f, 2);
+        check(r.refused == 0 && state_at(&r, 0x1004) == CODE_STATE_THUMB,
+            "map t2: weak start decodes an unreached function");
+        code_map_result_free(&r);
+    }
+    /* (u) a tbb bound larger than the table (cmp #5, 4 table bytes)
+       would cover a case's svc another branch reaches: the table is not
+       trusted, so the svc refuses instead of being hidden. */
+    {
+        uint16_t code[] = { 0x2b05 /* cmp r3, #5 */, 0xd803 /* bhi 0x100c */,
+            0xe8df, 0xf003 /* tbb */, 0x0202, 0x0202,
+            0xdf00 /* 0x100c svc */, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(state_at(&r, 0x100c) == CODE_STATE_THUMB ||
+            (r.refused == 1 && r.refused_address == 0x100c),
+            "map u: table over a branch target is not trusted");
         code_map_result_free(&r);
     }
     /* (n) tbh bounded by a register compare: the length is inferred
@@ -557,7 +614,7 @@ static void test_map_builder(void)
             0xe8df, 0xf011 /* tbh [pc, r1, lsl #1], table at 0x1008 */,
             0x0002, 0x0003 /* -> 0x100c, 0x100e */,
             0xdf00 /* case 0: svc */, 0x4770 /* case 1: bx lr */ };
-        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
         check(r.refused == 0, "map n: inferred table, not refused");
         check(state_at(&r, 0x1008) == CODE_STATE_DATA &&
@@ -571,7 +628,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xbf08 /* it eq */, 0xbd00 /* popeq {pc} */,
             0xdf00 /* svc */, 0x4770 };
-        struct code_function f[] = { { 0x1000, 0x1008, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x1008, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 4, f, 1);
         check(r.refused == 0 && state_at(&r, 0x1004) == CODE_STATE_THUMB,
             "map o: conditional return in an IT block");
@@ -583,7 +640,7 @@ static void test_map_builder(void)
     {
         uint16_t code[] = { 0xa301 /* adr r3, 0x1008 */, 0xbf00, 0x4770,
             0xbf00, 0xdf00, 0xdf00 };
-        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB } };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 } };
         struct code_map_result r = build_thumb(code, 6, f, 1);
         check(state_at(&r, 0x1008) == CODE_STATE_DATA,
             "map p: adr pool not decoded as code");
@@ -604,7 +661,7 @@ static void test_map_builder(void)
             0xff1e, 0xe12f /* 0x101c bx lr */,
             0x0f70, 0xee1d /* 0x1020 mrc p15, 0, r0, c13, c0, 3 */,
             0xff1e, 0xe12f /* 0x1024 bx lr */ };
-        struct code_function f[] = { { 0x1000, 0x1028, MODE_ARM } };
+        struct code_function f[] = { { 0x1000, 0x1028, MODE_ARM, 0 } };
         struct code_map_result r = build_thumb(code, 20, f, 1);
         check(r.refused == 0, "map q: ARM switch not refused");
         check(state_at(&r, 0x1018) == CODE_STATE_ARM &&
@@ -736,7 +793,8 @@ static size_t patch_sites(const uint8_t *file, const struct mapping_symbol *symb
 }
 
 /* Patch sites of stripped (decoded) against full (its mapping symbols). */
-static void compare_pair(const char *full_path, const char *stripped_path)
+static void compare_pair(const char *full_path, const char *stripped_path,
+    int allow_data_as_code)
 {
     size_t full_size, stripped_size;
     uint8_t *full = read_file(full_path, &full_size);
@@ -793,7 +851,8 @@ static void compare_pair(const char *full_path, const char *stripped_path)
             "code left undecoded %zu (first wrong %#x)\n", total,
             as_code_wrongly, wrong_mode, missed, first_wrong);
         check(wrong_mode == 0, "pair: no code decoded in the wrong mode");
-        check(as_code_wrongly == 0, "pair: no data decoded as code");
+        if (!allow_data_as_code)
+            check(as_code_wrongly == 0, "pair: no data decoded as code");
     }
     for (k = 0; k < want_count || k < got_count; ++k)
         if (k >= want_count || k >= got_count || want[k] != got[k]) {
@@ -873,6 +932,12 @@ static void test_fixture_files(void)
         code_map_result_free(&r);
         free(arm);
     }
+    /* An odd pointer to a string inside an ARM function (weak Thumb
+       evidence) must not split the function: its svc stays ARM. The
+       string itself may be decoded (it holds no pattern). */
+    compare_pair("tests/fixtures/odd-pointer-arm.so",
+        "tests/fixtures/odd-pointer-arm.stripped.so", 1);
+
     /* Not an ELF file: nothing. */
     check(code_map_from_elf((const uint8_t *)"hello", 5, &r) == 0 &&
         r.symbol_count == 0 && !r.refused, "fixtures: non-ELF ignored");
@@ -885,7 +950,7 @@ int main(int argc, char **argv)
 {
     /* code-map-test UNSTRIPPED STRIPPED: compare one pair only. */
     if (argc == 3) {
-        compare_pair(argv[1], argv[2]);
+        compare_pair(argv[1], argv[2], 0);
         printf("code_map_test_failures=%d\n", failures);
         return failures == 0 ? 0 : 1;
     }
