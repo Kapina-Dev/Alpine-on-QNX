@@ -91,10 +91,12 @@ void linux_syscall_set_patch_anonymous(int enabled);
 int arm_patch_thumb_range(uintptr_t start, size_t length);
 struct mapping_symbol;
 /* Mapping symbols ($a/$t/$d) of a file's .symtab at their link addresses
-   (st_value), sorted, into *out (0 with *count = 0 when there are none or
-   the table is malformed); only those in executable SHT_PROGBITS sections.
-   -1 when the table can't be read (allocation or I/O). The caller frees
-   *out. */
+   (st_value), sorted, into *out; only those in executable SHT_PROGBITS
+   sections. A file without any (stripped) that shows Thumb evidence is
+   decoded into synthesized ones (src/code_map.c); otherwise 0 with
+   *count = 0 (ARM). -1 when the table can't be read (allocation or I/O),
+   or with ENOEXEC when stripped code can't be decoded safely (recorded as
+   diagnostic detail=undecodable-code). The caller frees *out. */
 int arm_mapping_symbols_load(int fd, const Elf32_Shdr *sections,
     size_t section_count, uint64_t file_size, struct mapping_symbol **out,
     size_t *count);

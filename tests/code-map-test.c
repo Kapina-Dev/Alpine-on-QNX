@@ -428,10 +428,189 @@ static void test_map_builder(void)
     }
 }
 
+/* ---- whole files: stripped fixtures against their unstripped twins ---- */
+
+static uint8_t *read_file(const char *path, size_t *size)
+{
+    FILE *file = fopen(path, "rb");
+    uint8_t *bytes;
+    long length;
+    if (file == 0) return 0;
+    fseek(file, 0, SEEK_END);
+    length = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    bytes = malloc((size_t)length);
+    if (bytes != 0 && fread(bytes, 1, (size_t)length, file) != (size_t)length) {
+        free(bytes);
+        bytes = 0;
+    }
+    fclose(file);
+    *size = (size_t)length;
+    return bytes;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+        ((uint32_t)p[3] << 24);
+}
+
+static uint16_t le16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+#define SHDR(file, i) ((file) + le32((file) + 32) + 40u * (i))
+
+/* Mapping symbols from .symtab (the ground truth of an unstripped file). */
+static size_t symtab_mapping(const uint8_t *file, struct mapping_symbol *out,
+    size_t capacity)
+{
+    unsigned count = le16(file + 48);
+    unsigned i;
+    size_t found = 0;
+    for (i = 0; i < count; ++i) {
+        const uint8_t *sh = SHDR(file, i);
+        const uint8_t *strings;
+        uint32_t j;
+        if (le32(sh + 4) != 2) continue; /* SHT_SYMTAB */
+        strings = file + le32(SHDR(file, le32(sh + 24)) + 16);
+        for (j = 0; j < le32(sh + 20) / 16u; ++j) {
+            const uint8_t *sym = file + le32(sh + 16) + 16u * j;
+            enum code_state state;
+            uint16_t index = le16(sym + 14);
+            if (index == 0 || index >= count ||
+                (le32(SHDR(file, index) + 8) & 4u) == 0 ||
+                !mapping_symbol_state((const char *)strings + le32(sym),
+                    &state) || found == capacity)
+                continue;
+            out[found].address = le32(sym + 4);
+            out[found].state = state;
+            found++;
+        }
+    }
+    mapping_sort(out, found);
+    return found;
+}
+
+/* Patch sites (address * 4 + kind) the patcher would find in the file's
+   code sections, given mapping symbols. */
+static size_t patch_sites(const uint8_t *file, const struct mapping_symbol *symbols,
+    size_t symbol_count, uint32_t *out, size_t capacity)
+{
+    unsigned count = le16(file + 48);
+    unsigned i;
+    size_t found = 0;
+    for (i = 0; i < count; ++i) {
+        const uint8_t *sh = SHDR(file, i);
+        uint32_t address = le32(sh + 12);
+        uint32_t end = address + le32(sh + 20);
+        const uint8_t *bytes = file + le32(sh + 16);
+        if (le32(sh + 4) != 1 || (le32(sh + 8) & 4u) == 0) continue;
+        while (address < end) {
+            uint32_t run_end;
+            enum code_state state = mapping_state_at(symbols, symbol_count,
+                address, end, &run_end);
+            uint32_t a;
+            if (state == CODE_STATE_ARM) {
+                for (a = (address + 3u) & ~3u; a + 4u <= run_end; a += 4u) {
+                    uint32_t w = le32(bytes + a - le32(sh + 12));
+                    if ((w == 0xef000000u || (w & 0xffff0fffu) == 0xee1d0f70u)
+                        && found < capacity)
+                        out[found++] = a * 4u + 1u;
+                }
+            } else if (state == CODE_STATE_THUMB) {
+                uint32_t first = (address + 1u) & ~1u;
+                struct thumb_patch sites[64];
+                size_t n = thumb_scan((const uint16_t *)(bytes + first -
+                    le32(sh + 12)), (run_end - first) / 2u, sites, 64);
+                size_t k;
+                for (k = 0; k < n && k < 64 && found < capacity; ++k)
+                    out[found++] = (first + sites[k].offset) * 4u + 2u;
+            }
+            address = run_end;
+        }
+    }
+    return found;
+}
+
+static void test_fixture_files(void)
+{
+    size_t full_size, stripped_size, unknown_size;
+    uint8_t *full = read_file("guest-tests/fixtures/stripped-mixed-armhf.so",
+        &full_size);
+    uint8_t *stripped = read_file(
+        "guest-tests/fixtures/stripped-mixed-armhf.stripped.so", &stripped_size);
+    uint8_t *unknown = read_file("guest-tests/fixtures/stripped-unknown-armhf.so",
+        &unknown_size);
+    struct mapping_symbol truth[4096];
+    size_t truth_count;
+    uint32_t want[256], got[256];
+    size_t want_count, got_count;
+    struct code_map_result r;
+
+    check(full != 0 && stripped != 0 && unknown != 0, "fixtures: readable");
+    if (full == 0 || stripped == 0 || unknown == 0) return;
+
+    truth_count = symtab_mapping(full, truth, 4096);
+    check(truth_count > 0, "fixtures: unstripped has mapping symbols");
+    want_count = patch_sites(full, truth, truth_count, want, 256);
+    check(want_count >= 8, "fixtures: unstripped has patch sites");
+    printf("  unstripped patch sites: %zu\n", want_count);
+
+    check(code_map_from_elf(stripped, stripped_size, &r) == 0 && !r.refused &&
+        r.symbol_count > 0, "fixtures: stripped decodes");
+    got_count = patch_sites(stripped, r.symbols, r.symbol_count, got, 256);
+    check(got_count == want_count &&
+        memcmp(got, want, want_count * sizeof(want[0])) == 0,
+        "fixtures: stripped patch sites equal the unstripped ones");
+    if (got_count != want_count ||
+        memcmp(got, want, want_count * sizeof(want[0])) != 0) {
+        size_t k;
+        for (k = 0; k < want_count || k < got_count; ++k)
+            printf("  site %zu: want %#x/%u got %#x/%u\n", k,
+                k < want_count ? want[k] / 4u : 0, k < want_count ? want[k] % 4u : 0,
+                k < got_count ? got[k] / 4u : 0, k < got_count ? got[k] % 4u : 0);
+    }
+    code_map_result_free(&r);
+
+    /* The unstripped file read without its symtab decodes the same way. */
+    check(code_map_from_elf(full, full_size, &r) == 0 && !r.refused,
+        "fixtures: unstripped decodes without its symtab");
+    got_count = patch_sites(full, r.symbols, r.symbol_count, got, 256);
+    check(got_count == want_count &&
+        memcmp(got, want, want_count * sizeof(want[0])) == 0,
+        "fixtures: unstripped by decoding equals its mapping symbols");
+    code_map_result_free(&r);
+
+    check(code_map_from_elf(unknown, unknown_size, &r) == 0 && r.refused,
+        "fixtures: unknown-mode svc refused");
+    code_map_result_free(&r);
+
+    /* An ARM-only file (no Thumb evidence): no symbols, ARM scan as before. */
+    {
+        size_t size;
+        uint8_t *arm = read_file("guest-tests/fixtures/phase9-module-armhf.so",
+            &size);
+        check(arm != 0 && code_map_from_elf(arm, size, &r) == 0 &&
+            !r.refused && r.symbol_count == 0,
+            "fixtures: ARM-only library has no Thumb evidence");
+        code_map_result_free(&r);
+        free(arm);
+    }
+    /* Not an ELF file: nothing. */
+    check(code_map_from_elf((const uint8_t *)"hello", 5, &r) == 0 &&
+        r.symbol_count == 0 && !r.refused, "fixtures: non-ELF ignored");
+    free(full);
+    free(stripped);
+    free(unknown);
+}
+
 int main(void)
 {
     test_insn_info();
     test_map_builder();
+    test_fixture_files();
     printf("code_map_test_failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -67,4 +67,17 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     struct code_map_result *out);
 void code_map_result_free(struct code_map_result *result);
 
+/*
+ * A whole little-endian ARM ELF file image, read without its .symtab:
+ * when it shows Thumb evidence (an odd .dynsym function, e_entry,
+ * DT_INIT/DT_FINI, or an R_ARM_RELATIVE word naming an unwind-table or
+ * .dynsym function with the Thumb bit), decode every executable section
+ * from its .ARM.exidx function starts and that evidence. out gets the
+ * synthesized mapping symbols, sorted, at link addresses, or refused.
+ * No Thumb evidence, or no usable section headers: no symbols (the file
+ * is ARM as before). Returns 0, or -1 on allocation failure.
+ */
+int code_map_from_elf(const uint8_t *file, size_t file_size,
+    struct code_map_result *out);
+
 #endif

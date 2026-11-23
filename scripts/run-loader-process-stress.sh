@@ -11,9 +11,12 @@ spawn_count=${SPAWN_COUNT:-100}
 failures=0
 module=/tmp/libphase9.so
 thumb_module=/tmp/libthumb.so
+stripped_dir=/tmp/linuxemu-stripped-fixtures
 
 for fixture in phase9-module-armhf.so dlopen-stress-armhf \
-    spawn-thread-stress-armhf thumb-module-armhf.so thumb-dlopen-armhf; do
+    spawn-thread-stress-armhf thumb-module-armhf.so thumb-dlopen-armhf \
+    stripped-mixed-armhf.so stripped-mixed-armhf.stripped.so \
+    stripped-unknown-armhf.so stripped-compare-armhf; do
     if [ ! -f "$fixture_dir/$fixture" ]; then
         echo "missing fixture: $fixture_dir/$fixture" >&2
         exit 2
@@ -22,7 +25,13 @@ done
 
 cp "$fixture_dir/phase9-module-armhf.so" "$alpine_root$module" || exit 2
 cp "$fixture_dir/thumb-module-armhf.so" "$alpine_root$thumb_module" || exit 2
-trap 'rm -f "$alpine_root$module" "$alpine_root$thumb_module"' EXIT
+mkdir -p "$alpine_root$stripped_dir" || exit 2
+for fixture in stripped-mixed-armhf.so stripped-mixed-armhf.stripped.so \
+    stripped-unknown-armhf.so; do
+    cp "$fixture_dir/$fixture" "$alpine_root$stripped_dir/$fixture" || exit 2
+done
+trap 'rm -f "$alpine_root$module" "$alpine_root$thumb_module"; \
+    rm -rf "$alpine_root$stripped_dir"' EXIT
 
 echo "=== dlopen executable mapping stress ==="
 "$timeout_command" 30 "$linuxemu" --linuxemu-exec "$alpine_root" / \
@@ -37,6 +46,32 @@ echo "=== Thumb library through dlopen ==="
 status=$?
 echo "thumb-dlopen exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
+echo "=== stripped mixed ARM/Thumb library: patched as the unstripped one ==="
+"$timeout_command" 30 "$linuxemu" --linuxemu-exec "$alpine_root" / \
+    "$fixture_dir/stripped-compare-armhf" /tmp/stripped-compare \
+    "$stripped_dir/stripped-mixed-armhf.so" \
+    "$stripped_dir/stripped-mixed-armhf.stripped.so" mixed
+status=$?
+echo "stripped-compare exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+
+echo "=== stripped library with an undecodable svc: refused ==="
+refusal_report=$(mktemp "${TMPDIR:-/tmp}/linuxemu-refusal.XXXXXX") || exit 2
+LINUXEMU_DIAGNOSTICS="$refusal_report" "$timeout_command" 30 "$linuxemu" \
+    --linuxemu-exec "$alpine_root" / \
+    "$fixture_dir/stripped-compare-armhf" /tmp/stripped-compare \
+    --refused "$stripped_dir/stripped-unknown-armhf.so"
+status=$?
+echo "stripped-refused exit=$status expected=0"
+if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
+if grep -q "detail=undecodable-code" "$refusal_report"; then
+    echo "stripped-refused diagnostic=present expected=present"
+else
+    echo "stripped-refused diagnostic=missing expected=present"
+    failures=$((failures + 1))
+fi
+rm -f "$refusal_report"
 
 echo "=== multithreaded posix_spawn stress: $spawn_count ==="
 "$timeout_command" 120 "$linuxemu" --linuxemu-exec "$alpine_root" / \

@@ -1,9 +1,13 @@
 #include "linuxemu.h"
+#include "code_map.h"
+#include "linux_diagnostics.h"
 #include "thumb_decode.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 #define ARM_LINUX_SVC_0 0xef000000u
@@ -149,6 +153,44 @@ static int code_section(const Elf32_Shdr *section)
         (section->sh_flags & SHF_EXECINSTR) != 0 && section->sh_size != 0;
 }
 
+/* No mapping symbols: decode the file (src/code_map.c). Refuses with
+   ENOEXEC when a possible patch site can't be classified. */
+static int synthesize_mapping_symbols(int fd, uint64_t file_size,
+    struct mapping_symbol **out, size_t *count)
+{
+    struct code_map_result map;
+    void *file;
+    int result;
+
+    if (file_size == 0 || file_size > SIZE_MAX) return 0;
+    file = mmap(0, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED) return -1;
+    result = code_map_from_elf(file, (size_t)file_size, &map);
+    munmap(file, (size_t)file_size);
+    if (result != 0) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (map.refused) {
+        uint32_t args[6] = { map.refused_address, 0, 0, 0, 0, 0 };
+        linux_diag_record(0, 0, "undecodable-code", args);
+        if (getenv("LINUXEMU_VERBOSE") != 0)
+            fprintf(stderr, "linuxemu: stripped code at link address 0x%x "
+                "can't be decoded safely; refusing the file\n",
+                (unsigned)map.refused_address);
+        code_map_result_free(&map);
+        errno = ENOEXEC;
+        return -1;
+    }
+    if (map.symbol_count == 0) {
+        code_map_result_free(&map);
+        return 0;
+    }
+    *out = map.symbols;
+    *count = map.symbol_count;
+    return 0;
+}
+
 int arm_mapping_symbols_load(int fd, const Elf32_Shdr *sections,
     size_t section_count, uint64_t file_size, struct mapping_symbol **out,
     size_t *count)
@@ -214,6 +256,8 @@ int arm_mapping_symbols_load(int fd, const Elf32_Shdr *sections,
         symbols = 0;
     }
     *out = symbols;
+    if (result == 0 && *count == 0)
+        result = synthesize_mapping_symbols(fd, file_size, out, count);
     return result;
 }
 

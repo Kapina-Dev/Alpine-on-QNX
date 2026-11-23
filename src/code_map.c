@@ -590,3 +590,373 @@ void code_map_result_free(struct code_map_result *result)
     result->symbols = 0;
     result->symbol_count = 0;
 }
+
+/* ---- ELF evidence ---- */
+
+/* Field offsets of the 32-bit little-endian ELF structures used here. */
+#define EHDR_SIZE 52u
+#define SHDR_SIZE 40u
+#define SHT_PROGBITS_ 1u
+#define SHT_SYMTAB_ 2u
+#define SHT_DYNAMIC_ 6u
+#define SHT_NOBITS_ 8u
+#define SHT_REL_ 9u
+#define SHT_DYNSYM_ 11u
+#define SHT_ARM_EXIDX_ 0x70000001u
+#define SHF_EXECINSTR_ 4u
+#define STT_FUNC_ 2u
+#define DT_INIT_ 12u
+#define DT_FINI_ 13u
+#define R_ARM_RELATIVE_ 23u
+
+struct elf_view {
+    const uint8_t *file;
+    size_t size;
+    const uint8_t *sections;
+    unsigned section_count;
+};
+
+struct evidence {
+    uint32_t address;  /* no Thumb bit */
+    enum fn_mode mode;
+};
+
+struct evidence_list {
+    struct evidence *items;
+    size_t count;
+    size_t capacity;
+    int failed;
+};
+
+static uint32_t sh_field(const struct elf_view *e, unsigned index,
+    unsigned offset)
+{
+    return read32(e->sections + (size_t)index * SHDR_SIZE + offset);
+}
+
+static int in_file(const struct elf_view *e, uint32_t offset, uint32_t length)
+{
+    return offset <= e->size && length <= e->size - offset;
+}
+
+static int code_section_at(const struct elf_view *e, unsigned index)
+{
+    return sh_field(e, index, 4) == SHT_PROGBITS_ &&
+        (sh_field(e, index, 8) & SHF_EXECINSTR_) != 0 &&
+        sh_field(e, index, 20) != 0 &&
+        in_file(e, sh_field(e, index, 16), sh_field(e, index, 20));
+}
+
+/* Index of the code section holding link address, or section_count. */
+static unsigned code_section_of(const struct elf_view *e, uint32_t address)
+{
+    unsigned i;
+    for (i = 0; i < e->section_count; ++i)
+        if (code_section_at(e, i) && address >= sh_field(e, i, 12) &&
+            address - sh_field(e, i, 12) < sh_field(e, i, 20))
+            return i;
+    return e->section_count;
+}
+
+/* The file bytes behind link address (any section with file contents). */
+static const uint8_t *bytes_at(const struct elf_view *e, uint32_t address,
+    uint32_t length)
+{
+    unsigned i;
+    for (i = 0; i < e->section_count; ++i) {
+        uint32_t start = sh_field(e, i, 12);
+        uint32_t size = sh_field(e, i, 20);
+        uint32_t offset = sh_field(e, i, 16);
+        if (sh_field(e, i, 4) == SHT_NOBITS_ || start == 0 ||
+            address < start || address - start > size ||
+            length > size - (address - start) ||
+            !in_file(e, offset, size)) continue;
+        return e->file + offset + (address - start);
+    }
+    return 0;
+}
+
+static void add_evidence(struct evidence_list *list, uint32_t address,
+    enum fn_mode mode)
+{
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity ? list->capacity * 2u : 64u;
+        struct evidence *items = realloc(list->items,
+            capacity * sizeof(*items));
+        if (items == 0) { list->failed = 1; return; }
+        list->items = items;
+        list->capacity = capacity;
+    }
+    list->items[list->count].address = address;
+    list->items[list->count].mode = mode;
+    list->count++;
+}
+
+/* A value naming code: odd is Thumb at value - 1, even is ARM. */
+static void add_pointer(const struct elf_view *e, struct evidence_list *list,
+    uint32_t value)
+{
+    uint32_t address = value & ~1u;
+    if (code_section_of(e, address) == e->section_count) return;
+    add_evidence(list, address, (value & 1u) ? MODE_THUMB : MODE_ARM);
+}
+
+static int compare_evidence(const void *left, const void *right)
+{
+    const struct evidence *a = left;
+    const struct evidence *b = right;
+    return a->address < b->address ? -1 : a->address > b->address;
+}
+
+/* list sorted by address: is there an entry at address (of mode, unless
+   MODE_UNKNOWN)? */
+static int has_evidence(const struct evidence_list *list, uint32_t address,
+    enum fn_mode mode)
+{
+    size_t low = 0;
+    size_t high = list->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (list->items[middle].address < address) low = middle + 1;
+        else high = middle;
+    }
+    for (; low < list->count && list->items[low].address == address; ++low)
+        if (mode == MODE_UNKNOWN || list->items[low].mode == mode) return 1;
+    return 0;
+}
+
+/* An unwind-table start (recorded with MODE_UNKNOWN) at address. */
+static int has_evidence_exidx(const struct evidence_list *list,
+    uint32_t address)
+{
+    size_t low = 0;
+    size_t high = list->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (list->items[middle].address < address) low = middle + 1;
+        else high = middle;
+    }
+    for (; low < list->count && list->items[low].address == address; ++low)
+        if (list->items[low].mode == MODE_UNKNOWN) return 1;
+    return 0;
+}
+
+static int compare_evidence_fn(const void *left, const void *right)
+{
+    const struct code_function *a = left;
+    const struct code_function *b = right;
+    return a->start < b->start ? -1 : a->start > b->start;
+}
+
+static int compare_symbols(const void *left, const void *right)
+{
+    const struct mapping_symbol *a = left;
+    const struct mapping_symbol *b = right;
+    return a->address < b->address ? -1 : a->address > b->address;
+}
+
+static int section_named(const struct elf_view *e, unsigned index,
+    const char *name)
+{
+    unsigned strings = read16(e->file + 50);
+    uint32_t offset;
+    size_t length = strlen(name) + 1u;
+    if (strings >= e->section_count) return 0;
+    offset = sh_field(e, strings, 16) + sh_field(e, index, 0);
+    if (!in_file(e, offset, (uint32_t)length)) return 0;
+    return memcmp(e->file + offset, name, length) == 0;
+}
+
+/* Unwind-table function starts (exidx entries hold no Thumb bit) and
+   .dynsym functions: the starts. Thumb evidence: odd .dynsym functions,
+   e_entry, DT_INIT/DT_FINI; R_ARM_RELATIVE words only when they name one
+   of the starts, so an odd data pointer into code (a string in .text)
+   isn't taken for a function. */
+static void gather(const struct elf_view *e, struct evidence_list *starts,
+    struct evidence_list *modes)
+{
+    unsigned i;
+    uint32_t j;
+    uint32_t entry = read32(e->file + 24);
+
+    for (i = 0; i < e->section_count; ++i) {
+        uint32_t type = sh_field(e, i, 4);
+        uint32_t offset = sh_field(e, i, 16);
+        uint32_t size = sh_field(e, i, 20);
+        if (!in_file(e, offset, size)) continue;
+        if (type == SHT_ARM_EXIDX_) {
+            uint32_t base = sh_field(e, i, 12);
+            for (j = 0; j + 8u <= size; j += 8u) {
+                uint32_t word = read32(e->file + offset + j);
+                uint32_t target = base + j +
+                    (uint32_t)sign_extend(word & 0x7fffffffu, 31);
+                if (code_section_of(e, target) != e->section_count)
+                    add_evidence(starts, target, MODE_UNKNOWN);
+            }
+        } else if (type == SHT_DYNSYM_) {
+            for (j = 0; j + 16u <= size; j += 16u) {
+                const uint8_t *symbol = e->file + offset + j;
+                uint16_t index = read16(symbol + 14);
+                if ((symbol[12] & 0xfu) != STT_FUNC_ || index == 0 ||
+                    index >= 0xff00u) continue;
+                add_pointer(e, modes, read32(symbol + 4));
+                add_pointer(e, starts, read32(symbol + 4));
+            }
+        } else if (type == SHT_DYNAMIC_) {
+            for (j = 0; j + 8u <= size; j += 8u) {
+                uint32_t tag = read32(e->file + offset + j);
+                if (tag == DT_INIT_ || tag == DT_FINI_)
+                    add_pointer(e, modes, read32(e->file + offset + j + 4u));
+            }
+        }
+    }
+    if (entry != 0) add_pointer(e, modes, entry);
+    if (starts->failed) return;
+    qsort(starts->items, starts->count, sizeof(*starts->items),
+        compare_evidence);
+    for (i = 0; i < e->section_count; ++i) {
+        uint32_t offset = sh_field(e, i, 16);
+        uint32_t size = sh_field(e, i, 20);
+        if (sh_field(e, i, 4) != SHT_REL_ || !in_file(e, offset, size))
+            continue;
+        for (j = 0; j + 8u <= size; j += 8u) {
+            const uint8_t *word;
+            uint32_t value;
+            if ((read32(e->file + offset + j + 4u) & 0xffu) != R_ARM_RELATIVE_)
+                continue;
+            word = bytes_at(e, read32(e->file + offset + j), 4);
+            if (word == 0) continue;
+            value = read32(word);
+            /* Starts hold exidx entries (MODE_UNKNOWN) and .dynsym
+               functions (their mode): either names this pointer. */
+            if (has_evidence_exidx(starts, value & ~1u) ||
+                has_evidence(starts, value & ~1u, (value & 1u) ?
+                    MODE_THUMB : MODE_ARM))
+                add_pointer(e, modes, value);
+        }
+    }
+}
+
+static enum fn_mode evidence_mode(const struct evidence_list *modes,
+    uint32_t address)
+{
+    int arm = has_evidence(modes, address, MODE_ARM);
+    int thumb = has_evidence(modes, address, MODE_THUMB);
+    if (arm && thumb) return MODE_UNKNOWN;
+    return arm ? MODE_ARM : thumb ? MODE_THUMB : MODE_UNKNOWN;
+}
+
+static int decode_section(const struct elf_view *e, unsigned index,
+    const struct evidence_list *starts, const struct evidence_list *modes,
+    struct code_map_result *out)
+{
+    uint32_t base = sh_field(e, index, 12);
+    uint32_t size = sh_field(e, index, 20);
+    struct code_function *functions;
+    struct code_map_result section;
+    struct mapping_symbol *merged;
+    size_t count = 0;
+    size_t i;
+    int result;
+
+    functions = malloc(sizeof(*functions) *
+        (starts->count + modes->count + 1u));
+    if (functions == 0) return -1;
+    if (section_named(e, index, ".plt")) {
+        /* GNU PLT stubs are ARM and have no unwind entries. */
+        functions[count].start = base;
+        functions[count].mode = MODE_ARM;
+        count++;
+    } else {
+        for (i = 0; i < starts->count + modes->count; ++i) {
+            uint32_t address = i < starts->count ? starts->items[i].address :
+                modes->items[i - starts->count].address;
+            if (address < base || address - base >= size) continue;
+            functions[count].start = address;
+            functions[count].mode = evidence_mode(modes, address);
+            count++;
+        }
+        qsort(functions, count, sizeof(*functions), compare_evidence_fn);
+    }
+    /* Unique starts; each function runs to the next one. */
+    {
+        size_t unique = 0;
+        for (i = 0; i < count; ++i)
+            if (unique == 0 || functions[unique - 1].start != functions[i].start)
+                functions[unique++] = functions[i];
+        count = unique;
+        for (i = 0; i < count; ++i)
+            functions[i].end = i + 1 < count ? functions[i + 1].start :
+                base + size;
+    }
+    result = code_map_build(e->file + sh_field(e, index, 16), base, size,
+        functions, count, &section);
+    free(functions);
+    if (result != 0) return -1;
+    if (section.refused && !out->refused) {
+        out->refused = 1;
+        out->refused_address = section.refused_address;
+    }
+    merged = realloc(out->symbols, sizeof(*merged) *
+        (out->symbol_count + section.symbol_count + 1u));
+    if (merged == 0) {
+        code_map_result_free(&section);
+        return -1;
+    }
+    memcpy(merged + out->symbol_count, section.symbols,
+        sizeof(*merged) * section.symbol_count);
+    out->symbols = merged;
+    out->symbol_count += section.symbol_count;
+    code_map_result_free(&section);
+    return 0;
+}
+
+int code_map_from_elf(const uint8_t *file, size_t file_size,
+    struct code_map_result *out)
+{
+    struct elf_view e;
+    struct evidence_list starts;
+    struct evidence_list modes;
+    uint32_t shoff;
+    size_t i;
+    int thumb = 0;
+    int result = -1;
+
+    memset(out, 0, sizeof(*out));
+    memset(&starts, 0, sizeof(starts));
+    memset(&modes, 0, sizeof(modes));
+    if (file_size < EHDR_SIZE || memcmp(file, "\177ELF\001\001", 6) != 0 ||
+        read16(file + 18) != 40u /* EM_ARM */ ||
+        read16(file + 46) != SHDR_SIZE) return 0;
+    e.file = file;
+    e.size = file_size;
+    e.section_count = read16(file + 48);
+    shoff = read32(file + 32);
+    if (e.section_count == 0 ||
+        !in_file(&e, shoff, e.section_count * SHDR_SIZE)) return 0;
+    e.sections = file + shoff;
+
+    gather(&e, &starts, &modes);
+    if (starts.failed || modes.failed) goto done;
+    for (i = 0; i < modes.count; ++i)
+        if (modes.items[i].mode == MODE_THUMB) thumb = 1;
+    if (!thumb) {
+        result = 0;
+        goto done;
+    }
+    qsort(modes.items, modes.count, sizeof(*modes.items), compare_evidence);
+    for (i = 0; i < e.section_count; ++i) {
+        if (!code_section_at(&e, (unsigned)i)) continue;
+        if (decode_section(&e, (unsigned)i, &starts, &modes, out) != 0) {
+            code_map_result_free(out);
+            goto done;
+        }
+    }
+    qsort(out->symbols, out->symbol_count, sizeof(*out->symbols),
+        compare_symbols);
+    result = 0;
+done:
+    free(starts.items);
+    free(modes.items);
+    return result;
+}
