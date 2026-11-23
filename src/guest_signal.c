@@ -276,7 +276,12 @@ int guest_signal_deliver(ucontext_t *context, int linux_signal,
     }
     context->uc_mcontext.cpu.gpr[13] = (uint32_t)stack_pointer;
     context->uc_mcontext.cpu.gpr[14] = (uint32_t)restorer;
-    context->uc_mcontext.cpu.gpr[15] = action.handler;
+    /* Bit 0 of the handler picks its instruction set, as on Linux (the
+       restorer's bit 0 stays in lr, so the handler's bx lr interworks);
+       the interrupted code's IT state doesn't carry into the handler. */
+    context->uc_mcontext.cpu.spsr &= ~(uint32_t)(0x20u | 0x0600fc00u);
+    if ((action.handler & 1u) != 0) context->uc_mcontext.cpu.spsr |= 0x20u;
+    context->uc_mcontext.cpu.gpr[15] = action.handler & ~1u;
     if ((action.flags & LINUX_SA_RESETHAND) != 0)
         guest_actions[linux_signal].handler = 0;
     return 0;
