@@ -103,7 +103,7 @@ for guest in write-exit unknown-syscall exit-status initial-stack \
     file-vector-syscalls fallocate-fcntl-syscalls \
     large-offset-syscalls statx-syscalls file-owner-syscalls \
     socket-mmsg-syscalls resource-syscalls process-resource-syscalls mremap-syscalls \
-    runtime-thumb-map signal-thumb; do
+    runtime-thumb-map signal-thumb thumb-entry; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \

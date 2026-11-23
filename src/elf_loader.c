@@ -194,8 +194,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
         elf_header.e_ehsize != sizeof(Elf32_Ehdr) ||
         elf_header.e_phentsize != sizeof(Elf32_Phdr) ||
         elf_header.e_phnum == 0 || elf_header.e_phnum > MAX_LOAD_SEGMENTS ||
-        elf_header.e_phoff > (Elf32_Off)file_status.st_size ||
-        (elf_header.e_entry & 1u) != 0) {
+        elf_header.e_phoff > (Elf32_Off)file_status.st_size) {
         errno = ENOEXEC;
         goto done;
     }
@@ -323,8 +322,9 @@ int load_guest_image(const char *path, struct guest_image *image)
     }
 
     if (arm_patch_count() == 0 ||
-        !guest_memory_is_executable(image->entry, 4) ||
-        !guest_memory_is_executable(image->start_entry, 4) ||
+        /* Bit 0 of an entry point selects Thumb state. */
+        !guest_memory_is_executable(image->entry & ~(uintptr_t)1u, 2) ||
+        !guest_memory_is_executable(image->start_entry & ~(uintptr_t)1u, 2) ||
         guest_brk_initialize(image->initial_brk) != 0 ||
         guest_memory_finalize() != 0) {
         if (errno == 0) errno = ENOEXEC;

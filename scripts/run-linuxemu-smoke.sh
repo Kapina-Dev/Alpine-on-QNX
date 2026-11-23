@@ -52,6 +52,7 @@ unset LINUXEMU_ROOT
 run_guest entropy-syscalls 0
 run_guest cacheflush-syscalls 0
 run_guest signal-thumb 0
+run_guest thumb-entry 0
 run_guest thread-futex-syscalls 0
 
 echo "=== guest: file-syscalls ==="

@@ -33,7 +33,7 @@ expect_rejected()
     if [ "$status" -ne 1 ]; then failures=$((failures + 1)); fi
 }
 
-for mode in magic machine thumb-entry no-sections truncated alignment \
+for mode in magic machine no-sections truncated alignment \
     segment-bounds wx-segment section-mismatch overlap-load; do
     "$fixture_tool" "$static_guest" "$fixture_dir/$mode" "$mode" || exit 2
     expect_rejected "$mode" "$linuxemu" "$fixture_dir/$mode"

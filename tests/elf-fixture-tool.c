@@ -72,9 +72,6 @@ int main(int argc, char **argv)
     } else if (strcmp(argv[3], "machine") == 0) {
         elf->e_machine = 3;
         changed = 1;
-    } else if (strcmp(argv[3], "thumb-entry") == 0) {
-        elf->e_entry |= 1u;
-        changed = 1;
     } else if (strcmp(argv[3], "no-sections") == 0) {
         elf->e_shoff = 0;
         elf->e_shnum = 0;
