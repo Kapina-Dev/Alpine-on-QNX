@@ -149,11 +149,12 @@ static int code_section(const Elf32_Shdr *section)
         (section->sh_flags & SHF_EXECINSTR) != 0 && section->sh_size != 0;
 }
 
-struct mapping_symbol *arm_mapping_symbols_load(int fd,
-    const Elf32_Shdr *sections, size_t section_count, uint64_t file_size,
+int arm_mapping_symbols_load(int fd, const Elf32_Shdr *sections,
+    size_t section_count, uint64_t file_size, struct mapping_symbol **out,
     size_t *count)
 {
     struct mapping_symbol *symbols = 0;
+    int result = 0;
     Elf32_Sym *table = 0;
     char *strings = 0;
     size_t i;
@@ -182,8 +183,12 @@ struct mapping_symbol *arm_mapping_symbols_load(int fd,
                 (off64_t)symtab->sh_offset) != 0 ||
             read_exact_at(fd, strings, strtab->sh_size,
                 (off64_t)strtab->sh_offset) != 0) {
+            /* A table that is there but can't be read: patching the file
+               as ARM would rewrite its Thumb data, so fail instead. */
+            if (errno == 0) errno = ENOMEM;
             free(symbols);
             symbols = 0;
+            result = -1;
             break;
         }
         strings[strtab->sh_size - 1] = '\0';
@@ -208,7 +213,8 @@ struct mapping_symbol *arm_mapping_symbols_load(int fd,
         free(symbols);
         symbols = 0;
     }
-    return symbols;
+    *out = symbols;
+    return result;
 }
 
 int arm_patch_code_runs(uintptr_t start, size_t size, uintptr_t bias,
@@ -276,10 +282,25 @@ int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
         free(sections);
         return -1;
     }
-    symbols = arm_mapping_symbols_load(fd, sections, header.e_shnum,
-        (uint64_t)status.st_size, &symbol_count);
     mapping_start = (uint64_t)offset;
     mapping_end = mapping_start + length;
+    /* Read the symbol table only when the mapping holds code: libraries
+       are also mapped for their data segments. */
+    for (i = 0; i < header.e_shnum; ++i) {
+        uint64_t section_start = sections[i].sh_offset;
+        uint64_t section_end = section_start + sections[i].sh_size;
+        if (code_section(&sections[i]) && section_end >= section_start &&
+            section_start < mapping_end && section_end > mapping_start) break;
+    }
+    if (i == header.e_shnum) {
+        free(sections);
+        return 0;
+    }
+    if (arm_mapping_symbols_load(fd, sections, header.e_shnum,
+            (uint64_t)status.st_size, &symbols, &symbol_count) != 0) {
+        free(sections);
+        return -1;
+    }
     for (i = 0; i < header.e_shnum; ++i) {
         uint64_t section_start = sections[i].sh_offset;
         uint64_t section_end = section_start + sections[i].sh_size;

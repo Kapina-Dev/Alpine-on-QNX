@@ -79,17 +79,19 @@ void mapping_sort(struct mapping_symbol *symbols, size_t count)
 enum code_state mapping_state_at(const struct mapping_symbol *symbols,
     size_t count, uint32_t address, uint32_t limit, uint32_t *run_end)
 {
-    enum code_state state = CODE_STATE_ARM;
-    size_t i;
+    size_t low = 0;
+    size_t high = count;
 
-    *run_end = limit;
-    for (i = 0; i < count; ++i) {
-        if (symbols[i].address <= address) {
-            state = symbols[i].state;
-        } else {
-            if (symbols[i].address < limit) *run_end = symbols[i].address;
-            break;
-        }
+    /* Binary search for the first symbol past address: a library can have
+       a mapping symbol every few instructions, and callers walk it run by
+       run. */
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (symbols[middle].address <= address) low = middle + 1;
+        else high = middle;
     }
-    return state;
+    *run_end = limit;
+    if (low < count && symbols[low].address < limit)
+        *run_end = symbols[low].address;
+    return low == 0 ? CODE_STATE_ARM : symbols[low - 1].state;
 }

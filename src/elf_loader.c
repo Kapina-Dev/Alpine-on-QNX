@@ -112,8 +112,9 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
         free(sections);
         return -1;
     }
-    symbols = arm_mapping_symbols_load(fd, sections, elf_header->e_shnum,
-        (uint64_t)file_size, &symbol_count);
+    if (arm_mapping_symbols_load(fd, sections, elf_header->e_shnum,
+            (uint64_t)file_size, &symbols, &symbol_count) != 0)
+        goto done;
     for (i = 0; i < elf_header->e_shnum; ++i) {
         uintptr_t start;
         Elf32_Shdr *section = &sections[i];
@@ -131,7 +132,9 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
             goto done;
         }
         start = load_bias + section->sh_addr;
-        if ((start & 3u) != 0 || (section->sh_size & 3u) != 0 ||
+        /* Halfword-aligned: Thumb code can end on a halfword. ARM runs
+           are word-aligned by arm_patch_code_runs itself. */
+        if ((start & 1u) != 0 || (section->sh_size & 1u) != 0 ||
             !guest_memory_is_executable(start, section->sh_size) ||
             arm_patch_code_runs(start, section->sh_size, load_bias, symbols,
                 symbol_count) != 0) {

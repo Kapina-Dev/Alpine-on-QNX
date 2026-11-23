@@ -7,7 +7,9 @@
 #include "thumb_decode.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures;
 
@@ -168,6 +170,38 @@ int main(void)
         check(mapping_state_at(symbols, 0, 0x1200, 0x1300, &end)
             == CODE_STATE_ARM && end == 0x1300,
             "mapping: no symbols means arm to limit");
+    }
+
+    {
+        /* An unstripped Thumb library has about two mapping symbols per
+           function. Walking it run by run must not cost symbols x runs. */
+        enum { MANY = 200000 };
+        struct mapping_symbol *many = malloc(MANY * sizeof(*many));
+        uint32_t address = 0;
+        uint32_t end;
+        size_t runs = 0;
+        int states_ok = 1;
+        clock_t started;
+        size_t i;
+
+        for (i = 0; i < MANY; ++i) {
+            many[i].address = (uint32_t)(i * 8u);
+            many[i].state = (i & 1u) ? CODE_STATE_DATA : CODE_STATE_THUMB;
+        }
+        started = clock();
+        while (address < MANY * 8u) {
+            enum code_state state = mapping_state_at(many, MANY, address,
+                MANY * 8u, &end);
+            if (state != ((address / 8u) & 1u ? CODE_STATE_DATA :
+                    CODE_STATE_THUMB) || end != address + 8u)
+                states_ok = 0;
+            address = end;
+            runs++;
+        }
+        check(states_ok && runs == MANY, "mapping: many symbols, right runs");
+        check((double)(clock() - started) / CLOCKS_PER_SEC < 0.5,
+            "mapping: many symbols walked in under 0.5 s");
+        free(many);
     }
 
     printf("thumb_decode_test_failures=%d\n", failures);
