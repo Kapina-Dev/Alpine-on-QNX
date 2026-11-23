@@ -103,13 +103,16 @@ for guest in write-exit unknown-syscall exit-status initial-stack \
     file-vector-syscalls fallocate-fcntl-syscalls \
     large-offset-syscalls statx-syscalls file-owner-syscalls \
     socket-mmsg-syscalls resource-syscalls process-resource-syscalls mremap-syscalls \
-    runtime-thumb-map signal-thumb thumb-entry thumb-entry-odd; do
+    runtime-thumb-map signal-thumb thumb-entry thumb-entry-odd \
+    thumb-entry-stripped; do
     "$sdk_root/bin/as" -o "$project_dir/build/guest-tests/$guest.o" \
         "$project_dir/guest-tests/$guest.S"
     "$sdk_root/bin/ld" -T "$project_dir/guest-tests/minimal-arm.ld" \
         -o "$project_dir/build/guest-tests/$guest" \
         "$project_dir/build/guest-tests/$guest.o"
 done
+# No .symtab, so no mapping symbols: the loader decodes it (Phase 4 part 3).
+"$sdk_root/bin/strip" "$project_dir/build/guest-tests/thumb-entry-stripped"
 set +x
 
 "$sdk_root/bin/readelf" -h "$build_dir/hello"
