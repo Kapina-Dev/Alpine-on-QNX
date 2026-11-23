@@ -38,11 +38,30 @@ static void thumb16_info(uint16_t hw, uint32_t address, struct insn_info *out)
             address + 4u + (uint32_t)sign_extend((hw & 0xffu) << 1, 9), 1);
     } else if ((hw & 0xf800u) == 0xe000u) {
         /* b.n (T2) */
-        set_target(out, FLOW_BRANCH,
+        set_target(out, FLOW_JUMP,
             address + 4u + (uint32_t)sign_extend((hw & 0x7ffu) << 1, 12), 1);
     } else if ((hw & 0xf800u) == 0x4800u) {
         /* ldr Rt, [pc, #imm8*4] (T1) */
         set_literal(out, thumb_literal_base(address), 1, (hw & 0xffu) * 4u, 4);
+    } else if ((hw & 0xf500u) == 0xb100u) {
+        /* cbz/cbnz Rn, label: forward only */
+        set_target(out, FLOW_BRANCH, address + 4u +
+            ((((uint32_t)hw >> 9) & 1u) << 6) + (((uint32_t)hw >> 2) & 0x3eu),
+            1);
+    } else if ((hw & 0xff80u) == 0x4700u) {
+        out->flow = FLOW_STOP;          /* bx Rm */
+    } else if ((hw & 0xff80u) == 0x4780u) {
+        out->flow = FLOW_CALL;          /* blx Rm */
+    } else if ((hw & 0xff00u) == 0xbd00u) {
+        out->flow = FLOW_STOP;          /* pop {..., pc} */
+    } else if ((hw & 0xff87u) == 0x4687u || (hw & 0xff87u) == 0x4487u) {
+        out->flow = FLOW_STOP;          /* mov pc, Rm / add pc, Rm */
+    } else if ((hw & 0xff00u) == 0xde00u) {
+        out->flow = FLOW_STOP;          /* udf */
+    } else if ((hw & 0xff00u) == 0xbf00u && (hw & 0xfu) != 0) {
+        unsigned mask = hw & 0xfu;      /* it: length from the mask */
+        out->it_length = (mask & 1u) ? 4u : (mask & 2u) ? 3u :
+            (mask & 4u) ? 2u : 1u;
     }
 }
 
@@ -71,7 +90,7 @@ static void thumb32_branch(uint16_t hw0, uint16_t hw1, uint32_t address,
         int32_t offset = sign_extend(imm, 25);
         switch (hw1 & 0x5000u) {
         case 0x1000u: /* b.w (T4) */
-            set_target(out, FLOW_BRANCH, pc + (uint32_t)offset, 1);
+            set_target(out, FLOW_JUMP, pc + (uint32_t)offset, 1);
             break;
         case 0x5000u: /* bl */
             set_target(out, FLOW_CALL, pc + (uint32_t)offset, 1);
@@ -95,9 +114,20 @@ static void thumb32_info(uint16_t hw0, uint16_t hw1, uint32_t address,
         thumb32_branch(hw0, hw1, address, out);
         return;
     }
+    if (((hw0 & 0xffd0u) == 0xe890u || (hw0 & 0xffd0u) == 0xe910u) &&
+        (hw1 & 0x8000u) != 0) {
+        out->flow = FLOW_STOP; /* ldm/pop.w with pc */
+        return;
+    }
+    if (((hw0 & 0xfff0u) == 0xf850u || (hw0 & 0xfff0u) == 0xf8d0u) &&
+        (hw0 & 0xfu) != 15u && rt == 15u) {
+        out->flow = FLOW_STOP; /* ldr.w pc, [Rn, ...] */
+        return;
+    }
     switch (hw0 & 0xff7fu) {
     case 0xf85fu: /* ldr.w Rt, [pc, #+/-imm12] */
         set_literal(out, base, add, hw1 & 0xfffu, 4);
+        if (rt == 15u) out->flow = FLOW_STOP;
         return;
     case 0xf81fu: /* ldrb; Rt == pc is pld */
     case 0xf91fu: /* ldrsb; Rt == pc is pli */
@@ -161,9 +191,40 @@ int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
     }
     if (cond == 0xfu) return 0; /* unconditional space: pld and others */
     if ((word & 0x0e000000u) == 0x0a000000u) {
-        set_target(out, (word & 0x01000000u) ? FLOW_CALL : FLOW_BRANCH,
+        set_target(out, (word & 0x01000000u) ? FLOW_CALL :
+            cond == 0xeu ? FLOW_JUMP : FLOW_BRANCH,
             pc + (uint32_t)sign_extend((word & 0xffffffu) << 2, 26), 0);
-    } else if ((word & 0x0f3f0000u) == 0x051f0000u) {
+        return 0;
+    }
+    if ((word & 0x0fe0f010u) == 0x0080f000u &&
+        ((word >> 16) & 0xfu) == 15u && ((word >> 5) & 3u) == 0 &&
+        ((word >> 7) & 0x1fu) == 2u) {
+        /* add pc, pc, Rm, lsl #2: a row of branches follows */
+        out->flow = FLOW_TABLE;
+        out->table_reg = word & 0xfu;
+        out->table_entry_size = 4;
+        return 0;
+    }
+    if (cond == 0xeu) {
+        if ((word & 0x0ffffff0u) == 0x012fff10u ||        /* bx Rm */
+            (word & 0x0e108000u) == 0x08108000u ||        /* ldm with pc */
+            ((word & 0x0c50f000u) == 0x0410f000u &&       /* ldr pc, ... */
+             (word & 0x0e000010u) != 0x06000010u) ||      /* (not media) */
+            (word & 0xfff000f0u) == 0xe7f000f0u) {        /* udf */
+            out->flow = FLOW_STOP;
+            if ((word & 0x0f7f0000u) != 0x051f0000u) return 0;
+        } else if ((word & 0x0ffffff0u) == 0x012fff30u) { /* blx Rm */
+            out->flow = FLOW_CALL;
+            return 0;
+        } else if ((word & 0x0c00f000u) == 0x0000f000u &&
+            ((word >> 23) & 3u) != 2u &&                 /* not tst..cmn */
+            (word & 0x0e000090u) != 0x00000090u &&       /* not mul/ldrd.. */
+            (word & 0x0f900000u) != 0x01000000u) {       /* not misc */
+            out->flow = FLOW_STOP;                       /* mov pc, ... */
+            return 0;
+        }
+    }
+    if ((word & 0x0f3f0000u) == 0x051f0000u) {
         /* ldr/ldrb Rt, [pc, #+/-imm12] */
         set_literal(out, pc, add, word & 0xfffu,
             (word & 0x00400000u) ? 1u : 4u);
@@ -266,6 +327,9 @@ struct builder {
     uint8_t *next_data;
     uint8_t *reached;
     uint8_t *next_reached;
+    uint32_t *work;
+    size_t work_count;
+    size_t work_capacity;
 };
 
 static uint16_t read16(const uint8_t *p)
@@ -311,75 +375,170 @@ static void note(struct builder *b, const struct insn_info *info)
     }
 }
 
+/* Work list of addresses still to decode in the current function. */
+static void push(struct builder *b, uint32_t address)
+{
+    if (b->work_count < b->work_capacity) b->work[b->work_count++] = address;
+}
+
+/* A branch target to follow: inside the function, not already decoded and
+   not data. */
+static int followable(const struct builder *b, uint32_t address,
+    uint32_t start, uint32_t end)
+{
+    size_t offset;
+    if (address < start || address >= end) return 0;
+    offset = address - b->base;
+    return b->klass[offset] == BYTE_UNDECODED && !b->data[offset];
+}
+
+/*
+ * Length in bytes of the tbb/tbh table at table (entry_size 1 or 2) when
+ * no cmp bounds it: GCC puts the first case right after the table, so
+ * read entries until the table reaches the nearest target; that target
+ * must be exactly the table's (halfword-rounded) end and no target may
+ * point into the table. 0 when that doesn't hold.
+ */
+static uint32_t inferred_table_length(const struct builder *b, uint32_t table,
+    unsigned entry_size, uint32_t end)
+{
+    uint32_t nearest = UINT32_MAX;
+    uint32_t length = 0;
+    while (table + length < nearest) {
+        size_t offset = table - b->base + length;
+        uint32_t entry;
+        uint32_t target;
+        if (table + length + entry_size > end) return 0;
+        entry = entry_size == 1 ? b->bytes[offset] : read16(b->bytes + offset);
+        target = table + 2u * entry;
+        length += entry_size;
+        if (target < table + length) return 0;
+        if (target < nearest) nearest = target;
+    }
+    length = (length + 1u) & ~1u;
+    return table + length == nearest ? length : 0;
+}
+
+/* Follow Thumb control flow from start; the function is [start, end). */
 static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
 {
-    size_t offset = start - b->base;
-    size_t stop = end - b->base;
-    struct { int valid; unsigned reg; uint32_t imm; } recent[TABLE_CMP_WINDOW];
-    unsigned i;
-
-    memset(recent, 0, sizeof(recent));
     if ((start & 1u) != 0) return;
-    while (offset + 2u <= stop) {
-        uint16_t code[2];
-        struct insn_info info;
-        size_t available;
+    b->work_count = 0;
+    if (followable(b, start, start, end)) push(b, start);
+    while (b->work_count > 0) {
+        size_t offset = b->work[--b->work_count] - b->base;
+        size_t stop = end - b->base;
+        struct { int valid; unsigned reg; uint32_t imm; }
+            recent[TABLE_CMP_WINDOW];
+        unsigned it_left = 0;
+        unsigned i;
 
-        if (any_data(b, offset, 2)) { offset += 2u; continue; }
-        code[0] = read16(b->bytes + offset);
-        available = 1;
-        if (offset + 4u <= stop && !any_data(b, offset + 2u, 2)) {
-            code[1] = read16(b->bytes + offset + 2u);
-            available = 2;
-        }
-        if (thumb_insn_info(code, available, b->base + (uint32_t)offset,
-                &info) != 0) {
-            /* A 32-bit prefix cut by data or the end: padding, leave it. */
-            offset += 2u;
-            continue;
-        }
-        memset(b->klass + offset, BYTE_THUMB, info.width);
-        note(b, &info);
-        if (info.flow == FLOW_TABLE) {
-            uint32_t length = 0;
-            int bounded = 0;
-            for (i = 0; i < TABLE_CMP_WINDOW; ++i) {
-                if (recent[i].valid && recent[i].reg == info.table_reg) {
-                    bounded = recent[i].imm < 0x10000u;
-                    length = (recent[i].imm + 1u) * info.table_entry_size;
-                    length = (length + 1u) & ~1u;
-                    break;
-                }
+        memset(recent, 0, sizeof(recent));
+        while (offset + 2u <= stop && b->klass[offset] == BYTE_UNDECODED &&
+            !any_data(b, offset, 2)) {
+            uint16_t code[2];
+            struct insn_info info;
+            size_t available = 1;
+            uint32_t address = b->base + (uint32_t)offset;
+            int conditional = it_left > 0;
+            enum insn_flow flow;
+
+            code[0] = read16(b->bytes + offset);
+            if (offset + 4u <= stop && !any_data(b, offset + 2u, 2)) {
+                code[1] = read16(b->bytes + offset + 2u);
+                available = 2;
             }
-            if (!bounded) return; /* rest of the function: undecoded */
+            if (thumb_insn_info(code, available, address, &info) != 0) break;
+            if (info.width == 4 && b->klass[offset + 2u] != BYTE_UNDECODED)
+                break;
+            memset(b->klass + offset, BYTE_THUMB, info.width);
+            note(b, &info);
+            if (it_left > 0) it_left--;
+            flow = info.flow;
+            /* Inside an IT block a jump or return is conditional. */
+            if (conditional && (flow == FLOW_JUMP || flow == FLOW_STOP))
+                flow = flow == FLOW_JUMP ? FLOW_BRANCH : FLOW_NEXT;
+            if (info.it_length != 0) it_left = info.it_length;
+            if (info.target_valid && (flow == FLOW_BRANCH ||
+                    flow == FLOW_JUMP) &&
+                followable(b, info.target, start, end))
+                push(b, info.target);
+            if (flow == FLOW_JUMP || flow == FLOW_STOP) break;
+            if (flow == FLOW_TABLE) {
+                uint32_t table = address + 4u;
+                uint32_t length = 0;
+                for (i = 0; i < TABLE_CMP_WINDOW; ++i) {
+                    if (recent[i].valid && recent[i].reg == info.table_reg) {
+                        if (recent[i].imm < 0x10000u)
+                            length = ((recent[i].imm + 1u) *
+                                info.table_entry_size + 1u) & ~1u;
+                        break;
+                    }
+                }
+                if (length == 0)
+                    length = inferred_table_length(b, table,
+                        info.table_entry_size, end);
+                if (length == 0 || length > end - table) break;
+                memset(b->klass + (table - b->base), BYTE_DATA, length);
+                for (i = 0; i < length / info.table_entry_size; ++i) {
+                    size_t entry = table - b->base + i * info.table_entry_size;
+                    uint32_t value = info.table_entry_size == 1 ?
+                        b->bytes[entry] : read16(b->bytes + entry);
+                    if (followable(b, table + 2u * value, start, end))
+                        push(b, table + 2u * value);
+                }
+                break;
+            }
+            memmove(&recent[1], &recent[0],
+                sizeof(recent[0]) * (TABLE_CMP_WINDOW - 1u));
+            recent[0].valid = thumb_cmp_imm(code, available, &recent[0].reg,
+                &recent[0].imm);
             offset += info.width;
-            if (length > stop - offset) length = (uint32_t)(stop - offset);
-            memset(b->klass + offset, BYTE_DATA, length);
-            offset += length;
-            memset(recent, 0, sizeof(recent));
-            continue;
         }
-        memmove(&recent[1], &recent[0],
-            sizeof(recent[0]) * (TABLE_CMP_WINDOW - 1u));
-        recent[0].valid = thumb_cmp_imm(code, available, &recent[0].reg,
-            &recent[0].imm);
-        offset += info.width;
     }
 }
 
+/* Follow ARM control flow from start; the function is [start, end). */
 static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
 {
-    size_t offset = start - b->base;
-    size_t stop = end - b->base;
-
     if ((start & 3u) != 0) return;
-    for (; offset + 4u <= stop; offset += 4u) {
-        struct insn_info info;
-        if (any_data(b, offset, 4)) continue;
-        arm_insn_info(read32(b->bytes + offset), b->base + (uint32_t)offset,
-            &info);
-        memset(b->klass + offset, BYTE_ARM, 4);
-        note(b, &info);
+    b->work_count = 0;
+    if (followable(b, start, start, end)) push(b, start);
+    while (b->work_count > 0) {
+        size_t offset = b->work[--b->work_count] - b->base;
+        size_t stop = end - b->base;
+
+        if ((offset & 3u) != 0) continue;
+        while (offset + 4u <= stop && b->klass[offset] == BYTE_UNDECODED &&
+            !any_data(b, offset, 4)) {
+            struct insn_info info;
+            uint32_t address = b->base + (uint32_t)offset;
+            arm_insn_info(read32(b->bytes + offset), address, &info);
+            memset(b->klass + offset, BYTE_ARM, 4);
+            note(b, &info);
+            if (info.target_valid && (info.flow == FLOW_BRANCH ||
+                    info.flow == FLOW_JUMP) &&
+                followable(b, info.target, start, end))
+                push(b, info.target);
+            if (info.flow == FLOW_JUMP || info.flow == FLOW_STOP) break;
+            if (info.flow == FLOW_TABLE) {
+                /* add pc, pc, Rm, lsl #2: entry i is the instruction at
+                   address + 8 + 4i, a row of branches; a conditional add
+                   falls through to the default branch first. */
+                uint32_t entry = address + 8u;
+                if ((read32(b->bytes + offset) >> 28) != 0xeu &&
+                    followable(b, address + 4u, start, end))
+                    push(b, address + 4u);
+                while (entry + 4u <= end &&
+                    (read32(b->bytes + (entry - b->base)) & 0xff000000u) ==
+                        0xea000000u) {
+                    if (followable(b, entry, start, end)) push(b, entry);
+                    entry += 4u;
+                }
+                break;
+            }
+            offset += 4u;
+        }
     }
 }
 
@@ -546,8 +705,11 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     b.next_data = malloc(allocation);
     b.reached = calloc(allocation, 1);
     b.next_reached = malloc(allocation);
+    /* Each work entry is a distinct undecoded halfword. */
+    b.work_capacity = size / 2u + 1u;
+    b.work = malloc(sizeof(*b.work) * b.work_capacity);
     if (b.spans == 0 || b.klass == 0 || b.data == 0 || b.next_data == 0 ||
-        b.reached == 0 || b.next_reached == 0) goto done;
+        b.reached == 0 || b.next_reached == 0 || b.work == 0) goto done;
 
     for (round = 0;; ++round) {
         decode_round(&b);
@@ -581,6 +743,7 @@ done:
     free(b.next_data);
     free(b.reached);
     free(b.next_reached);
+    free(b.work);
     return result;
 }
 
@@ -741,6 +904,30 @@ static int has_evidence_exidx(const struct evidence_list *list,
     return 0;
 }
 
+/* address lies at or after an unwind-table start in the same code
+   section: inside the unwind table's coverage. ld merges adjacent entries
+   with the same unwind data, so a function inside a merged entry has no
+   start of its own. */
+static int in_exidx_coverage(const struct elf_view *e,
+    const struct evidence_list *list, uint32_t address)
+{
+    size_t low = 0;
+    size_t high = list->count;
+    unsigned section = code_section_of(e, address);
+    if (section == e->section_count) return 0;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (list->items[middle].address <= address) low = middle + 1;
+        else high = middle;
+    }
+    while (low > 0) {
+        const struct evidence *item = &list->items[--low];
+        if (item->mode == MODE_UNKNOWN)
+            return code_section_of(e, item->address) == section;
+    }
+    return 0;
+}
+
 static int compare_evidence_fn(const void *left, const void *right)
 {
     const struct code_function *a = left;
@@ -769,9 +956,11 @@ static int section_named(const struct elf_view *e, unsigned index,
 
 /* Unwind-table function starts (exidx entries hold no Thumb bit) and
    .dynsym functions: the starts. Thumb evidence: odd .dynsym functions,
-   e_entry, DT_INIT/DT_FINI; R_ARM_RELATIVE words only when they name one
-   of the starts, so an odd data pointer into code (a string in .text)
-   isn't taken for a function. */
+   e_entry, DT_INIT/DT_FINI, and R_ARM_RELATIVE words: an odd one inside
+   the unwind table's coverage or naming an odd .dynsym function, an even
+   one naming an unwind-table start or an even .dynsym function. An odd
+   data pointer into code outside that coverage (a string in .text before
+   the first unwind entry) isn't taken for a function. */
 static void gather(const struct elf_view *e, struct evidence_list *starts,
     struct evidence_list *modes)
 {
@@ -828,10 +1017,12 @@ static void gather(const struct elf_view *e, struct evidence_list *starts,
             if (word == 0) continue;
             value = read32(word);
             /* Starts hold exidx entries (MODE_UNKNOWN) and .dynsym
-               functions (their mode): either names this pointer. */
-            if (has_evidence_exidx(starts, value & ~1u) ||
-                has_evidence(starts, value & ~1u, (value & 1u) ?
-                    MODE_THUMB : MODE_ARM))
+               functions (their mode). */
+            if ((value & 1u) != 0 ?
+                    in_exidx_coverage(e, starts, value - 1u) ||
+                    has_evidence(starts, value - 1u, MODE_THUMB) :
+                    has_evidence_exidx(starts, value) ||
+                    has_evidence(starts, value, MODE_ARM))
                 add_pointer(e, modes, value);
         }
     }

@@ -101,14 +101,79 @@ static void test_insn_info(void)
     check_thumb_flow(0xf000, 0xf87e, 0x100, 4, FLOW_CALL, 0x200, 1, "bl");
     /* blx: target is Align(0x104 + 4, 4) + 0x2f8 = 0x400, ARM. */
     check_thumb_flow(0xf000, 0xe97c, 0x104, 4, FLOW_CALL, 0x400, 0, "blx");
-    check_thumb_flow(0xf000, 0xb87a, 0x108, 4, FLOW_BRANCH, 0x200, 1, "b.w");
-    check_thumb_flow(0xe01c, 0, 0x10c, 2, FLOW_BRANCH, 0x148, 1, "b.n");
+    check_thumb_flow(0xf000, 0xb87a, 0x108, 4, FLOW_JUMP, 0x200, 1, "b.w");
+    check_thumb_flow(0xe01c, 0, 0x10c, 2, FLOW_JUMP, 0x148, 1, "b.n");
     check_thumb_flow(0xd01b, 0, 0x10e, 2, FLOW_BRANCH, 0x148, 1, "beq.n");
     check_thumb_flow(0xf000, 0x8076, 0x110, 4, FLOW_BRANCH, 0x200, 1, "beq.w");
     /* Negative offsets: bl back 0x1000 from 0x2000 -> 0x1000. */
     check_thumb_flow(0xf7fe, 0xfffe, 0x2000, 4, FLOW_CALL, 0x1000, 1,
         "bl backwards");
-    check_thumb_flow(0xe7fe, 0, 0x300, 2, FLOW_BRANCH, 0x300, 1, "b.n self");
+    check_thumb_flow(0xe7fe, 0, 0x300, 2, FLOW_JUMP, 0x300, 1, "b.n self");
+
+
+    /* Where straight-line execution ends (checked against GNU as). */
+    {
+        static const struct { uint16_t hw0, hw1; enum insn_flow flow;
+            const char *name; } thumb[] = {
+            { 0x4770, 0, FLOW_STOP, "bx lr" },
+            { 0x4798, 0, FLOW_CALL, "blx r3" },
+            { 0xbd10, 0, FLOW_STOP, "pop {r4, pc}" },
+            { 0xe8bd, 0x8ff0, FLOW_STOP, "pop.w {..., pc}" },
+            { 0xe890, 0x8010, FLOW_STOP, "ldmia.w r0, {r4, pc}" },
+            { 0xf85d, 0xfb04, FLOW_STOP, "ldr.w pc, [sp], #4" },
+            { 0xf8d1, 0xf008, FLOW_STOP, "ldr.w pc, [r1, #8]" },
+            { 0xf850, 0xf021, FLOW_STOP, "ldr.w pc, [r0, r1, lsl #2]" },
+            { 0x469f, 0, FLOW_STOP, "mov pc, r3" },
+            { 0x4497, 0, FLOW_STOP, "add pc, r2" },
+            { 0xde00, 0, FLOW_STOP, "udf #0" },
+            { 0x4679, 0, FLOW_NEXT, "mov r1, pc" },
+            { 0xbd00 & 0x00ff, 0, FLOW_NEXT, "movs r0, r0" },
+            { 0xf8d1, 0x3008, FLOW_NEXT, "ldr.w r3, [r1, #8]" },
+        };
+        static const struct { uint32_t word; enum insn_flow flow;
+            const char *name; } arm[] = {
+            { 0xe12fff1e, FLOW_STOP, "bx lr" },
+            { 0xe12fff33, FLOW_CALL, "blx r3" },
+            { 0xe8bd8010, FLOW_STOP, "pop {r4, pc}" },
+            { 0xe8908002, FLOW_STOP, "ldm r0, {r1, pc}" },
+            { 0xe49df004, FLOW_STOP, "ldr pc, [sp], #4" },
+            { 0xe791f102, FLOW_STOP, "ldr pc, [r1, r2, lsl #2]" },
+            { 0xe1a0f00e, FLOW_STOP, "mov pc, lr" },
+            { 0xe7f000f0, FLOW_STOP, "udf" },
+            { 0xe08ff100, FLOW_TABLE, "add pc, pc, r0, lsl #2" },
+            { 0x908ff100, FLOW_TABLE, "addls pc, pc, r0, lsl #2" },
+            { 0x012fff1e, FLOW_NEXT, "bxeq lr" },
+            { 0x149df004, FLOW_NEXT, "popne {pc}" },
+            { 0xe15f0000, FLOW_NEXT, "cmp pc, r0" },
+            { 0xe1a00000, FLOW_NEXT, "nop (mov r0, r0)" },
+            { 0xe0010392, FLOW_NEXT, "mul r1, r2, r3" },
+        };
+        unsigned i;
+        char label[96];
+        for (i = 0; i < sizeof(thumb) / sizeof(thumb[0]); ++i) {
+            struct insn_info info = thumb_at(thumb[i].hw0, thumb[i].hw1, 0x100);
+            snprintf(label, sizeof(label), "thumb %s: flow", thumb[i].name);
+            check(info.flow == thumb[i].flow && !info.target_valid &&
+                info.it_length == 0, label);
+        }
+        for (i = 0; i < sizeof(arm) / sizeof(arm[0]); ++i) {
+            struct insn_info info = arm_at(arm[i].word, 0x200);
+            snprintf(label, sizeof(label), "arm %s: flow", arm[i].name);
+            check(info.flow == arm[i].flow && !info.target_valid, label);
+        }
+    }
+    check_thumb_flow(0xb15a, 0, 0x11e, 2, FLOW_BRANCH, 0x138, 1, "cbz");
+    check_thumb_flow(0xb953, 0, 0x120, 2, FLOW_BRANCH, 0x138, 1, "cbnz");
+    {
+        struct insn_info info = thumb_at(0xbf04, 0, 0x122);
+        check(info.flow == FLOW_NEXT && info.it_length == 2, "thumb itt eq");
+        info = thumb_at(0xbf14, 0, 0x128);
+        check(info.it_length == 2, "thumb ite ne");
+        info = thumb_at(0xbfc8, 0, 0x12e);
+        check(info.it_length == 1, "thumb it gt");
+        info = thumb_at(0xbf00, 0, 0x130);
+        check(info.it_length == 0, "thumb nop: no it block");
+    }
 
     /* svc and udf are not conditional branches. */
     {
@@ -179,7 +244,7 @@ static void test_insn_info(void)
     /* ARM. */
     check_arm_flow(0xeb00003e, 0x300, FLOW_CALL, 0x400, 0, "bl");
     check_arm_flow(0xfb00007d, 0x304, FLOW_CALL, 0x502, 1, "blx");
-    check_arm_flow(0xea00003c, 0x308, FLOW_BRANCH, 0x400, 0, "b");
+    check_arm_flow(0xea00003c, 0x308, FLOW_JUMP, 0x400, 0, "b");
     check_arm_flow(0x1a00003b, 0x30c, FLOW_BRANCH, 0x400, 0, "bne");
     check_arm_flow(0xebfffffe, 0x1000, FLOW_CALL, 0x1000, 0, "bl self");
     check_arm_literal(0xe59f0008, 0x310, 0x320, 4, "ldr U=1");
@@ -297,7 +362,9 @@ static void test_map_builder(void)
     }
     /* (d) unbounded tbb, an svc after the table: refused at the svc. */
     {
-        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0101, 0x0101,
+        /* Entries 0: a target inside the table, so no length can be
+           inferred either. */
+        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0000, 0x0000,
             0xdf00, 0x4770 };
         struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
@@ -307,7 +374,7 @@ static void test_map_builder(void)
     }
     /* (e) unbounded tbb, no pattern after: not refused, rest not code. */
     {
-        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0101, 0x0101,
+        uint16_t code[] = { 0xbf00, 0xbf00, 0xe8df, 0xf003, 0x0000, 0x0000,
             0xbf00, 0x4770 };
         struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
         struct code_map_result r = build_thumb(code, 8, f, 1);
@@ -426,8 +493,68 @@ static void test_map_builder(void)
             state_at(&r, 0x1010) == CODE_STATE_THUMB, "map m: tail call");
         code_map_result_free(&r);
     }
+    /* (n) tbh bounded by a register compare: the length is inferred
+       from the entries (the first case starts right after the table). */
+    {
+        uint16_t code[] = { 0x4299 /* cmp r1, r3 */, 0xd804 /* bhi 0x100e */,
+            0xe8df, 0xf011 /* tbh [pc, r1, lsl #1], table at 0x1008 */,
+            0x0002, 0x0003 /* -> 0x100c, 0x100e */,
+            0xdf00 /* case 0: svc */, 0x4770 /* case 1: bx lr */ };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 8, f, 1);
+        check(r.refused == 0, "map n: inferred table, not refused");
+        check(state_at(&r, 0x1008) == CODE_STATE_DATA &&
+            state_at(&r, 0x100a) == CODE_STATE_DATA &&
+            state_at(&r, 0x100c) == CODE_STATE_THUMB &&
+            state_at(&r, 0x100e) == CODE_STATE_THUMB,
+            "map n: table data, cases Thumb");
+        code_map_result_free(&r);
+    }
+    /* (o) a return inside an IT block is conditional: decoding goes on. */
+    {
+        uint16_t code[] = { 0xbf08 /* it eq */, 0xbd00 /* popeq {pc} */,
+            0xdf00 /* svc */, 0x4770 };
+        struct code_function f[] = { { 0x1000, 0x1008, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 4, f, 1);
+        check(r.refused == 0 && state_at(&r, 0x1004) == CODE_STATE_THUMB,
+            "map o: conditional return in an IT block");
+        code_map_result_free(&r);
+    }
+    /* (p) a pool after a return, reached only through adr (not a load
+       the decoder knows): never decoded as code; it holds a pattern, so
+       the section is refused rather than the pool patched. */
+    {
+        uint16_t code[] = { 0xa301 /* adr r3, 0x1008 */, 0xbf00, 0x4770,
+            0xbf00, 0xdf00, 0xdf00 };
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB } };
+        struct code_map_result r = build_thumb(code, 6, f, 1);
+        check(state_at(&r, 0x1008) == CODE_STATE_DATA,
+            "map p: adr pool not decoded as code");
+        check(r.refused == 1 && r.refused_address == 0x1008,
+            "map p: refused at the pool's pattern");
+        code_map_result_free(&r);
+    }
+    /* (q) ARM switch: addls pc, pc, r0, lsl #2 then a row of branches. */
+    {
+        uint16_t code[] = {
+            0x0001, 0xe350 /* 0x1000 cmp r0, #1 */,
+            0xf100, 0x908f /* 0x1004 addls pc, pc, r0, lsl #2 */,
+            0x0001, 0xea00 /* 0x1008 b 0x1014 (default) */,
+            0x0001, 0xea00 /* 0x100c b 0x1018 (case 0) */,
+            0x0002, 0xea00 /* 0x1010 b 0x1020 (case 1) */,
+            0xff1e, 0xe12f /* 0x1014 bx lr */,
+            0x0000, 0xef00 /* 0x1018 svc 0 */,
+            0xff1e, 0xe12f /* 0x101c bx lr */,
+            0x0f70, 0xee1d /* 0x1020 mrc p15, 0, r0, c13, c0, 3 */,
+            0xff1e, 0xe12f /* 0x1024 bx lr */ };
+        struct code_function f[] = { { 0x1000, 0x1028, MODE_ARM } };
+        struct code_map_result r = build_thumb(code, 20, f, 1);
+        check(r.refused == 0, "map q: ARM switch not refused");
+        check(state_at(&r, 0x1018) == CODE_STATE_ARM &&
+            state_at(&r, 0x1020) == CODE_STATE_ARM, "map q: cases are ARM");
+        code_map_result_free(&r);
+    }
 }
-
 /* ---- whole files: stripped fixtures against their unstripped twins ---- */
 
 static uint8_t *read_file(const char *path, size_t *size)
@@ -522,16 +649,107 @@ static size_t patch_sites(const uint8_t *file, const struct mapping_symbol *symb
             } else if (state == CODE_STATE_THUMB) {
                 uint32_t first = (address + 1u) & ~1u;
                 struct thumb_patch sites[64];
-                size_t n = thumb_scan((const uint16_t *)(bytes + first -
-                    le32(sh + 12)), (run_end - first) / 2u, sites, 64);
-                size_t k;
-                for (k = 0; k < n && k < 64 && found < capacity; ++k)
-                    out[found++] = (first + sites[k].offset) * 4u + 2u;
+                const uint16_t *code = (const uint16_t *)(bytes + first -
+                    le32(sh + 12));
+                size_t halfwords = (run_end - first) / 2u;
+                size_t done = 0;
+                /* thumb_scan in chunks; a chunk ends on a whole instruction. */
+                while (done < halfwords) {
+                    size_t chunk = halfwords - done > 4096 ? 4096 :
+                        halfwords - done;
+                    size_t n, k;
+                    if (done + chunk < halfwords &&
+                        thumb_is_32bit(code[done + chunk - 1])) {
+                        size_t i = done;
+                        while (i < done + chunk)
+                            i += thumb_is_32bit(code[i]) ? 2 : 1;
+                        chunk = i - done;
+                    }
+                    n = thumb_scan(code + done, chunk, sites, 64);
+                    for (k = 0; k < n && k < 64 && found < capacity; ++k)
+                        out[found++] = (first + (uint32_t)(done * 2u) +
+                            sites[k].offset) * 4u + 2u;
+                    done += chunk;
+                }
             }
             address = run_end;
         }
     }
     return found;
+}
+
+/* Patch sites of stripped (decoded) against full (its mapping symbols). */
+static void compare_pair(const char *full_path, const char *stripped_path)
+{
+    size_t full_size, stripped_size;
+    uint8_t *full = read_file(full_path, &full_size);
+    uint8_t *stripped = read_file(stripped_path, &stripped_size);
+    static struct mapping_symbol truth[1u << 20];
+    static uint32_t want[1u << 16], got[1u << 16];
+    size_t truth_count, want_count, got_count, k;
+    struct code_map_result r;
+
+    check(full != 0 && stripped != 0, "pair: readable");
+    if (full == 0 || stripped == 0) return;
+    truth_count = symtab_mapping(full, truth, 1u << 20);
+    want_count = patch_sites(full, truth, truth_count, want, 1u << 16);
+    printf("  mapping symbols %zu, patch sites %zu\n", truth_count, want_count);
+    check(code_map_from_elf(stripped, stripped_size, &r) == 0,
+        "pair: decoded");
+    if (r.refused)
+        printf("  refused at %#x\n", r.refused_address);
+    check(!r.refused, "pair: not refused");
+    got_count = patch_sites(stripped, r.symbols, r.symbol_count, got, 1u << 16);
+    check(got_count == want_count &&
+        memcmp(got, want, want_count * sizeof(want[0])) == 0,
+        "pair: same patch sites");
+    /* Byte by byte: code the symbols call data (a pool or table decoded
+       as instructions, where a false patch could land) must not happen;
+       code left undecoded is only coverage. */
+    {
+        unsigned count = le16(full + 48);
+        unsigned i;
+        size_t as_code_wrongly = 0, wrong_mode = 0, missed = 0, total = 0;
+        uint32_t first_wrong = 0;
+        for (i = 0; i < count; ++i) {
+            const uint8_t *sh = SHDR(full, i);
+            uint32_t a, end;
+            if (le32(sh + 4) != 1 || (le32(sh + 8) & 4u) == 0) continue;
+            end = le32(sh + 12) + le32(sh + 20);
+            for (a = le32(sh + 12); a < end; ++a) {
+                uint32_t e1, e2;
+                enum code_state t = mapping_state_at(truth, truth_count, a,
+                    end, &e1);
+                enum code_state d = mapping_state_at(r.symbols,
+                    r.symbol_count, a, end, &e2);
+                total++;
+                if (t == CODE_STATE_DATA && d != CODE_STATE_DATA) {
+                    if (as_code_wrongly++ == 0) first_wrong = a;
+                } else if (t != CODE_STATE_DATA && d != CODE_STATE_DATA &&
+                    t != d) {
+                    if (wrong_mode++ == 0 && first_wrong == 0) first_wrong = a;
+                } else if (t != CODE_STATE_DATA && d == CODE_STATE_DATA)
+                    missed++;
+            }
+        }
+        printf("  code bytes %zu: data decoded as code %zu, wrong mode %zu, "
+            "code left undecoded %zu (first wrong %#x)\n", total,
+            as_code_wrongly, wrong_mode, missed, first_wrong);
+        check(wrong_mode == 0, "pair: no code decoded in the wrong mode");
+        check(as_code_wrongly == 0, "pair: no data decoded as code");
+    }
+    for (k = 0; k < want_count || k < got_count; ++k)
+        if (k >= want_count || k >= got_count || want[k] != got[k]) {
+            printf("  first difference at site %zu: want %#x/%u got %#x/%u\n",
+                k, k < want_count ? want[k] / 4u : 0,
+                k < want_count ? want[k] % 4u : 0,
+                k < got_count ? got[k] / 4u : 0,
+                k < got_count ? got[k] % 4u : 0);
+            break;
+        }
+    code_map_result_free(&r);
+    free(full);
+    free(stripped);
 }
 
 static void test_fixture_files(void)
@@ -606,8 +824,14 @@ static void test_fixture_files(void)
     free(unknown);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* code-map-test UNSTRIPPED STRIPPED: compare one pair only. */
+    if (argc == 3) {
+        compare_pair(argv[1], argv[2]);
+        printf("code_map_test_failures=%d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     test_insn_info();
     test_map_builder();
     test_fixture_files();

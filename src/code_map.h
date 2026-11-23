@@ -12,7 +12,13 @@
  * (tests/code-map-test.c) and cross-compiled into the emulator.
  */
 
-enum insn_flow { FLOW_NEXT, FLOW_CALL, FLOW_BRANCH, FLOW_TABLE, FLOW_STOP };
+/* FLOW_NEXT: falls through. FLOW_CALL: returns (target if direct).
+   FLOW_BRANCH: conditional, target or fall through. FLOW_JUMP:
+   unconditional, to target only. FLOW_STOP: never falls through, target
+   unknown (return, indirect jump, udf). FLOW_TABLE: tbb/tbh, or ARM
+   add pc, pc, Rm, lsl #2 (followed by a row of branches). */
+enum insn_flow { FLOW_NEXT, FLOW_CALL, FLOW_BRANCH, FLOW_JUMP, FLOW_STOP,
+    FLOW_TABLE };
 
 struct insn_info {
     unsigned width;            /* 2 or 4 */
@@ -24,7 +30,8 @@ struct insn_info {
     uint32_t literal;          /* absolute address of the data */
     unsigned literal_size;     /* 1, 2, 4 or 8 */
     unsigned table_reg;        /* FLOW_TABLE: index register */
-    unsigned table_entry_size; /* FLOW_TABLE: 1 (tbb) or 2 (tbh) */
+    unsigned table_entry_size; /* FLOW_TABLE: 1 (tbb), 2 (tbh), 4 (ARM) */
+    unsigned it_length;        /* Thumb IT: instructions it makes conditional */
 };
 
 /* Decode the Thumb instruction at code[0] (address is its link address).
