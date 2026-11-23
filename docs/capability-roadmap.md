@@ -851,8 +851,21 @@ Thumb runtime patching, on branch `phase4b-thumb-runtime`. Design and plan:
 - Thumb signal handlers, Thumb `sa_restorer`s and Thumb entry points work.
 - A Thumb-2 library loaded through musl's `dlopen` (`thumb-dlopen`, in
   `run-loader-process-stress`) makes Thumb system calls and TLS reads.
+- Mapping-symbol lookup is a binary search; code sections may end on a
+  halfword (final review).
 
-**Gate results** (core `ae2d4dde…`): full device regression
+**Follow-ups.**
+
+- Every file mapping of an ARM ELF is patched whatever its protection, so a
+  tool that reads ELF files through `mmap` (a linker, `objcopy`) sees traps
+  where system calls were. Older than this part; this part relies on it for
+  pages mapped writable and made executable later.
+- A mapping cut inside a Thumb run is decoded from the cut; kuser-helper
+  returns to Thumb code and traps inside IT blocks don't handle Thumb state
+  fully (final review minors).
+
+**Gate results** (core `638f56e9…`, after the final review's fixes; the
+run before them, core `ae2d4dde…`, gave the same results): full device regression
 `linuxemu_full_regression_failures=0`; corpus 10 of 11, the same apps.
 
 **Next parts.** Stripped-binary decoding (stage 2 above), then the Android

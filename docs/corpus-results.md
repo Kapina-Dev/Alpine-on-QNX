@@ -411,10 +411,12 @@ the interpreter's.
 ## Phase 4 part 2: 2026-11-23
 
 - **Device:** Passport, QNX 8.0.0, as the ordinary user, charging.
-- **Linuxemu:** branch `phase4b-thumb-runtime`, core sha256
-  `ae2d4dde7bf092451ee0d19695c872bedca073edcfcac268934bf49fd87da1ab`.
+- **Linuxemu:** branch `phase4b-thumb-runtime` after the final review's
+  fixes, core sha256
+  `638f56e9b1eb1311cf85a29a9f5ee8fa30f8203b5569dade056ac483b02a5546`.
   Runtime-mapped libraries are patched by mapping symbol, and `mprotect`
-  no longer re-scans file pages.
+  no longer re-scans file pages. The run before those fixes (core
+  `ae2d4dde…`) scored the same.
 - **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
 
 ```text

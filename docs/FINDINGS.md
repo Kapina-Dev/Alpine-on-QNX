@@ -1490,9 +1490,22 @@ with the JIT off too, so it is V8's memory set-up, not code generation
   unstripped) through musl's `dlopen`: on the part 1 core it exits 2 (data
   word rewritten); now its Thumb `svc` and Thumb TLS read work.
 
+**Final review fixes (each failed first):**
+- Mapping-symbol lookup was a linear scan per run, so walking a library
+  cost symbols x runs (200k symbols: 8.8 s on the host); it is a binary
+  search now (19 ms). The symbol table is read only when a mapping holds
+  code, and one that exists but can't be read fails the mapping instead of
+  falling back to the ARM-only scan.
+- Code sections had to be a multiple of 4 bytes, so a Thumb program whose
+  `.text` ends on a halfword was refused (`thumb-entry-odd`, 26 bytes);
+  halfword alignment is enough now.
+
 **Gate:** full device regression `linuxemu_full_regression_failures=0`
-(core `ae2d4dde7bf092451ee0d19695c872bedca073edcfcac268934bf49fd87da1ab`);
-corpus 10 of 11, the same apps as in part 1.
+and corpus 10 of 11 (the same apps as in part 1), on core
+`638f56e9b1eb1311cf85a29a9f5ee8fa30f8203b5569dade056ac483b02a5546` and on the core before the review fixes
+(`ae2d4dde…`). One earlier regression run on the fixed core lost its SSH
+connection during `run-event-smoke` when the phone's sshd went away (the
+open io-pkt problem, not reproduced on the rerun).
 
 **Still not covered:** stripped libraries (no `.symtab`, so no mapping
 symbols; most AOSP libraries), the Android gate items and the
