@@ -270,6 +270,11 @@ The Phase 9 fixture sources are under `guest-tests`. To rebuild their pinned ARM
 binaries, temporarily install Alpine `build-base` in the test rootfs and run
 `sh scripts/build-phase9-fixtures.sh`.
 
+The Thumb `dlopen` fixtures (`thumb-module-armhf.so`, a Thumb-2 library, and
+`thumb-dlopen-armhf`, which loads it) are rebuilt the same way with
+`sh scripts/build-thumb-fixtures.sh`. They are left unstripped on purpose:
+Linuxemu patches a runtime-mapped library by its mapping symbols.
+
 Run the pinned Python 3.14.7 suite from the clean 16-package rootfs:
 
 ```sh

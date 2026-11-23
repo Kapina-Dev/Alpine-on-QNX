@@ -497,8 +497,14 @@ Limits of the Phase 3 part 4 calls (socket async I/O) and the libuv fixes:
 Other limits:
 
 - ARM `svc #0` patching is supported. Thumb `svc` and TLS reads are patched
-  only in statically loaded binaries that carry a symbol table, not in
-  libraries mapped at run time.
+  in files that carry a symbol table with ARM mapping symbols (`$a`, `$t`,
+  `$d`): the program, its interpreter, and libraries mapped at run time.
+  Their data runs are left alone. A file without a symbol table (a stripped
+  library) is still scanned as ARM only, so its Thumb code isn't patched.
+  Memory made executable with `mprotect` is not patched again: file pages
+  were patched when they were mapped, and anonymous memory isn't patched.
+- Thumb entry points and Thumb signal handlers (address bit 0 set) run in
+  Thumb state.
 - Priority-inheritance and robust-list futex operations are unsupported.
   Process-shared futexes do not synchronize separate Linuxemu host processes.
 - Socket ancillary data other than `SCM_RIGHTS`, unlisted options, arbitrary

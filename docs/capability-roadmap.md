@@ -837,6 +837,27 @@ run before them, core `aa9fe375…`, gave the same results).
   stripped-binary decoding, the Android gate items and the modified-bionic
   decision: the next parts of Phase 4.
 
+### Phase 4 part 2 status: done (2026-11-23)
+
+Thumb runtime patching, on branch `phase4b-thumb-runtime`. Design and plan:
+`docs/superpowers/specs/2026-11-23-phase4b-thumb-runtime-design.md` and
+`docs/superpowers/plans/2026-11-23-phase4b-thumb-runtime.md`.
+
+**What landed.**
+
+- Libraries mapped at run time are patched by mapping symbol: ARM, Thumb,
+  and data left alone. Files without a symbol table keep the ARM-only scan.
+- `mprotect` no longer re-scans file pages (they were patched at `mmap`).
+- Thumb signal handlers, Thumb `sa_restorer`s and Thumb entry points work.
+- A Thumb-2 library loaded through musl's `dlopen` (`thumb-dlopen`, in
+  `run-loader-process-stress`) makes Thumb system calls and TLS reads.
+
+**Gate results** (core `ae2d4dde…`): full device regression
+`linuxemu_full_regression_failures=0`; corpus 10 of 11, the same apps.
+
+**Next parts.** Stripped-binary decoding (stage 2 above), then the Android
+gate items and the modified-bionic decision.
+
 ## Phase 5: synthetic Linux procfs
 
 Do not expose a mounted QNX procfs as Linux `/proc`; its semantics and layouts

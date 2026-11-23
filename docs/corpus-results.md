@@ -407,3 +407,20 @@ calls in anonymous memory.
 LuaJIT runs as the JIT check outside the corpus (`run-jit-smoke`, in the
 full regression): compatible, JIT on with traces compiled, output equal to
 the interpreter's.
+
+## Phase 4 part 2: 2026-11-23
+
+- **Device:** Passport, QNX 8.0.0, as the ordinary user, charging.
+- **Linuxemu:** branch `phase4b-thumb-runtime`, core sha256
+  `ae2d4dde7bf092451ee0d19695c872bedca073edcfcac268934bf49fd87da1ab`.
+  Runtime-mapped libraries are patched by mapping symbol, and `mprotect`
+  no longer re-scans file pages.
+- **Rootfs, packages, harness:** unchanged from the 2026-11-17 baseline.
+
+```text
+corpus apps=11 compatible=10
+```
+
+The same ten apps are compatible. Node.js still fails at start-up with the
+same SIGSEGV at address 0 (V8's memory set-up, Phase 6). Alpine's packages
+are ARM code, so this part changes no corpus app's patching.

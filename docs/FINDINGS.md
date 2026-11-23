@@ -1461,3 +1461,39 @@ are the same on both cores: `madvise` `ENOSYS` (17), `mremap`
 record: Node crashes before its JIT flips any memory. The crash happens
 with the JIT off too, so it is V8's memory set-up, not code generation
 (the `madvise`/`mremap` work of Phase 6), as the roadmap expected.
+
+## 2026-11-23 — Phase 4 part 2: Thumb runtime patching (Passport, devuser)
+
+**Change:**
+- Libraries mapped at run time are now split by mapping symbol (`$a`,
+  `$t`, `$d`) like the program and its interpreter: ARM runs are patched as
+  ARM, Thumb runs as Thumb, data runs not at all. The split code moved from
+  `elf_loader.c` to `arm_patch.c` (`arm_mapping_symbols_load`,
+  `arm_patch_code_runs`). A file with no symbol table is still scanned as
+  ARM only.
+- `mprotect` no longer re-scans file pages: they were patched, with the
+  right modes, when they were mapped, and the ARM-only rescan rewrote data
+  in Thumb code.
+- A signal handler with address bit 0 set runs in Thumb state (CPSR T set,
+  IT bits cleared); an ARM handler gets T cleared. A Thumb `sa_restorer`
+  works because `lr` keeps its bit 0.
+- A Thumb entry point (`e_entry` bit 0) is accepted; `linuxemu_enter_guest`
+  already starts the guest with `bx`.
+
+**Tests (each failed first):**
+- `runtime-thumb-map` maps its own Thumb page at run time, read-execute
+  and (`flip`) read-write then `mprotect` read-execute. Before: exit 73,
+  the `$d` word `0xef000000` rewritten to a trap, in both modes.
+- `signal-thumb`: before, the Thumb handler ran as ARM (fatal SIGILL).
+- `thumb-entry`: before, refused with ENOEXEC.
+- `thumb-dlopen-armhf` loads `thumb-module-armhf.so` (a Thumb-2 library,
+  unstripped) through musl's `dlopen`: on the part 1 core it exits 2 (data
+  word rewritten); now its Thumb `svc` and Thumb TLS read work.
+
+**Gate:** full device regression `linuxemu_full_regression_failures=0`
+(core `ae2d4dde7bf092451ee0d19695c872bedca073edcfcac268934bf49fd87da1ab`);
+corpus 10 of 11, the same apps as in part 1.
+
+**Still not covered:** stripped libraries (no `.symtab`, so no mapping
+symbols; most AOSP libraries), the Android gate items and the
+modified-bionic decision.
