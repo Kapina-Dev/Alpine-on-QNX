@@ -89,6 +89,18 @@ int arm_patch_candidate(uintptr_t start, size_t length, uintptr_t *first);
 /* LINUXEMU_PATCH_ANONYMOUS=1: patch anonymous memory made executable. */
 void linux_syscall_set_patch_anonymous(int enabled);
 int arm_patch_thumb_range(uintptr_t start, size_t length);
+struct mapping_symbol;
+/* Mapping symbols ($a/$t/$d) of a file's .symtab at their link addresses
+   (st_value), sorted; only those in executable SHT_PROGBITS sections.
+   0 with *count = 0 when there are none. The caller frees the result. */
+struct mapping_symbol *arm_mapping_symbols_load(int fd,
+    const Elf32_Shdr *sections, size_t section_count, uint64_t file_size,
+    size_t *count);
+/* Patch [start, start + size) run by run: the code state at runtime address
+   a is the symbols' state at a - bias. ARM runs get arm_patch_range, Thumb
+   runs arm_patch_thumb_range, data runs nothing; no symbols means ARM. */
+int arm_patch_code_runs(uintptr_t start, size_t size, uintptr_t bias,
+    const struct mapping_symbol *symbols, size_t count);
 int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length);
 void arm_patch_forget_range(uintptr_t address, size_t length);

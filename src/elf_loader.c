@@ -84,103 +84,6 @@ static int section_in_executable_load(const Elf32_Shdr *section,
     return 0;
 }
 
-/*
- * Collect ARM mapping symbols ($a/$t/$d) from .symtab, biased to runtime
- * addresses and sorted. A binary without a symbol table yields none, and its
- * code is then patched as ARM, as before.
- */
-static struct mapping_symbol *load_mapping_symbols(int fd,
-    const Elf32_Shdr *sections, size_t section_count, off_t file_size,
-    uintptr_t load_bias, size_t *count)
-{
-    struct mapping_symbol *symbols = 0;
-    Elf32_Sym *table = 0;
-    char *strings = 0;
-    size_t i;
-
-    *count = 0;
-    for (i = 0; i < section_count; ++i) {
-        const Elf32_Shdr *symtab = &sections[i];
-        const Elf32_Shdr *strtab;
-        size_t entries;
-        size_t j;
-
-        if (symtab->sh_type != SHT_SYMTAB) continue;
-        if (symtab->sh_entsize != sizeof(Elf32_Sym) ||
-            symtab->sh_link >= section_count) break;
-        strtab = &sections[symtab->sh_link];
-        if (strtab->sh_size == 0 ||
-            !range_in_file(symtab->sh_offset, symtab->sh_size, file_size) ||
-            !range_in_file(strtab->sh_offset, strtab->sh_size, file_size))
-            break;
-        entries = symtab->sh_size / sizeof(Elf32_Sym);
-        table = malloc(symtab->sh_size);
-        strings = malloc(strtab->sh_size);
-        symbols = malloc((entries ? entries : 1) * sizeof(*symbols));
-        if (table == 0 || strings == 0 || symbols == 0 ||
-            read_exact_at(fd, table, symtab->sh_size,
-                (off64_t)symtab->sh_offset) != 0 ||
-            read_exact_at(fd, strings, strtab->sh_size,
-                (off64_t)strtab->sh_offset) != 0) {
-            free(symbols);
-            symbols = 0;
-            break;
-        }
-        strings[strtab->sh_size - 1] = '\0';
-        for (j = 0; j < entries; ++j) {
-            enum code_state state;
-            if (table[j].st_name >= strtab->sh_size ||
-                table[j].st_shndx == SHN_UNDEF ||
-                !mapping_symbol_state(strings + table[j].st_name, &state) ||
-                load_bias > UINTPTR_MAX - table[j].st_value) continue;
-            symbols[*count].address =
-                (uint32_t)(load_bias + table[j].st_value);
-            symbols[*count].state = state;
-            (*count)++;
-        }
-        mapping_sort(symbols, *count);
-        break;
-    }
-    free(table);
-    free(strings);
-    if (symbols != 0 && *count == 0) {
-        free(symbols);
-        symbols = 0;
-    }
-    return symbols;
-}
-
-/* Patch one executable section, run by run: ARM, Thumb, or data (skipped). */
-static int patch_section_runs(uintptr_t start, size_t size,
-    const struct mapping_symbol *symbols, size_t symbol_count)
-{
-    uintptr_t position = start;
-    uintptr_t end = start + size;
-
-    while (position < end) {
-        uint32_t run_end;
-        enum code_state state = mapping_state_at(symbols, symbol_count,
-            (uint32_t)position, (uint32_t)end, &run_end);
-        uintptr_t run_start = position;
-
-        if ((uintptr_t)run_end <= position) run_end = (uint32_t)end;
-        position = run_end;
-        if (state == CODE_STATE_ARM) {
-            uintptr_t first = (run_start + 3u) & ~(uintptr_t)3u;
-            uintptr_t last = (uintptr_t)run_end & ~(uintptr_t)3u;
-            if (last > first && arm_patch_range(first, last - first) != 0)
-                return -1;
-        } else if (state == CODE_STATE_THUMB) {
-            uintptr_t first = (run_start + 1u) & ~(uintptr_t)1u;
-            uintptr_t last = (uintptr_t)run_end & ~(uintptr_t)1u;
-            if (last > first &&
-                arm_patch_thumb_range(first, last - first) != 0)
-                return -1;
-        }
-    }
-    return 0;
-}
-
 static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
     const Elf32_Phdr *program_headers, uintptr_t load_bias, off_t file_size)
 {
@@ -209,8 +112,8 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
         free(sections);
         return -1;
     }
-    symbols = load_mapping_symbols(fd, sections, elf_header->e_shnum,
-        file_size, load_bias, &symbol_count);
+    symbols = arm_mapping_symbols_load(fd, sections, elf_header->e_shnum,
+        (uint64_t)file_size, &symbol_count);
     for (i = 0; i < elf_header->e_shnum; ++i) {
         uintptr_t start;
         Elf32_Shdr *section = &sections[i];
@@ -230,7 +133,7 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
         start = load_bias + section->sh_addr;
         if ((start & 3u) != 0 || (section->sh_size & 3u) != 0 ||
             !guest_memory_is_executable(start, section->sh_size) ||
-            patch_section_runs(start, section->sh_size, symbols,
+            arm_patch_code_runs(start, section->sh_size, load_bias, symbols,
                 symbol_count) != 0) {
             if (errno == 0) errno = ENOEXEC;
             goto done;

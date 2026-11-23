@@ -46,6 +46,7 @@ export LINUXEMU_ROOT=/
 run_guest exec-argv1 0 "$guest_dir/runtime-exec-syscalls"
 unset LINUXEMU_PATCH_ANONYMOUS
 run_guest runtime-exec-mixed 0
+run_guest runtime-thumb-map 0
 unset LINUXEMU_ROOT
 run_guest entropy-syscalls 0
 run_guest cacheflush-syscalls 0
