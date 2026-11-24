@@ -13,7 +13,9 @@ needs a modified bionic.
 
 The user chose (2026-11-24):
 
-- **Gate option (a): stop at the pid abort.** 32-bit bionic aborts at
+- **Gate option (a): stop at the pid abort.** (Planning later found that
+  Android 6.0's own libc has no pid check; goal 6 now aims at `main()`
+  and keeps (a) as the accepted fallback.) 32-bit bionic aborts at
   start-up when the pid is above 65535 ("32 bit bionic libc only accepts
   pid <= 65535"), and QNX pids are huge. Pid virtualisation is Phase 6, and
   phases go in order. So the gate ends at that abort: the linker has
@@ -117,8 +119,14 @@ The user chose (2026-11-24):
    - the linker maps and relocates all three libraries and their 7
      dependencies (bionic's linker loads every library before any
      constructor runs);
-   - libc's start-up runs and stops with bionic's pid message and exit
-     134, the expected end;
+   - libc's start-up runs. **Target:** `main()` runs, prints a line,
+     calls `syscall()` for `getpid` and `write`, and exits 0 (found while
+     planning: this image's `libc.so` and linker don't contain the
+     "pid <= 65535" check; it came from NDK r27's `libc.a`). **Accepted
+     fallback** (the user's option (a)): if start-up stops past linking
+     for a reason that belongs to a later phase (pids, tids, a missing
+     system call), the gate records where and why, and passes on the
+     other conditions. No Phase 5/6 work is done to get past it;
    - the number of patch sites Linuxemu reports per file equals the
      laptop's count for the same file.
 7. **Device gate, raw `syscall()`.** A static, stripped, Thumb NDK
