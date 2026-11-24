@@ -337,6 +337,12 @@ static void test_insn_info(void)
             "arm movt r3, #0x5678");
         info = arm_at(0xe59f3004, 0x400);
         check(info.dest_reg == 3, "arm ldr r3, [pc]: dest");
+        info = arm_at(0xe12fff1c, 0x400);
+        check(info.branch_reg == 12, "arm bx ip: branch register");
+        info = thumb_at(0x4798, 0, 0x400);
+        check(info.branch_reg == 3, "thumb blx r3: branch register");
+        info = thumb_at(0x4770, 0, 0x400);
+        check(info.branch_reg == 14, "thumb bx lr: branch register");
     }
 }
 
@@ -862,6 +868,41 @@ static void test_map_builder(void)
         r = build_thumb(code, 24, f, 1);
         check(r.refused == 0 && state_at(&r, 0x1020) == CODE_STATE_THUMB,
             "pcrel: movw/movt pair, ARM");
+        code_map_result_free(&r);
+    }
+    /* (pcrel5) lld's absolute long-branch thunk: movw ip; movt ip; bx ip
+       to an odd address that is an unwind-table start of unknown mode
+       (NDK libc.a's __set_errno_internal): the start becomes Thumb. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_ARM, 0 },
+            { 0x1020, 0x1030, MODE_UNKNOWN, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0xc021; code[1] = 0xe301; /* movw ip, #0x1021 */
+        code[2] = 0xc000; code[3] = 0xe340; /* movt ip, #0 */
+        code[4] = 0xff1c; code[5] = 0xe12f; /* bx ip */
+        code[16] = 0xee1d; code[17] = 0x0f70; /* mrc p15 TLS read */
+        code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 2);
+        check(r.refused == 0 && state_at(&r, 0x1020) == CODE_STATE_THUMB,
+            "pcrel: movw/movt; bx ip gives an unwind start its mode");
+        code_map_result_free(&r);
+    }
+    /* (pcrel6) ldr r3, =off; add r3, pc forms an odd address that is an
+       unwind-table start of unknown mode: it becomes Thumb. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 },
+            { 0x1020, 0x1030, MODE_UNKNOWN, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x4b01; code[1] = 0x447b; code[2] = 0x4798;
+        code[3] = 0x4770; code[4] = 0x001b; /* 0x1021 - 0x1006 */
+        code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 2);
+        check(r.refused == 0 && state_at(&r, 0x1020) == CODE_STATE_THUMB,
+            "pcrel: formed address gives an unwind start its mode");
         code_map_result_free(&r);
     }
     /* (w) A call to a function that never returns (__stack_chk_fail

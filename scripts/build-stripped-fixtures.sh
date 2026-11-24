@@ -30,7 +30,7 @@ rm -rf "$alpine_root$work"
 mkdir -p "$alpine_root$work"
 trap 'rm -rf "$alpine_root$work"' EXIT
 for source in stripped-mixed-module.c stripped-mixed-arm.c \
-    stripped-unknown-module.c stripped-compare.c; do
+    stripped-unknown-module.S stripped-compare.c; do
     cp "$project_dir/guest-tests/$source" "$alpine_root$work/$source"
 done
 
@@ -38,8 +38,8 @@ guest gcc $flags -mthumb -c -o $work/mixed-thumb.o $work/stripped-mixed-module.c
 guest gcc $flags -marm -c -o $work/mixed-arm.o $work/stripped-mixed-arm.c
 guest gcc -shared -static-libgcc -o $work/mixed.so $work/mixed-thumb.o $work/mixed-arm.o
 guest strip -o $work/mixed.stripped.so $work/mixed.so
-guest gcc $flags -mthumb -shared -static-libgcc -o $work/unknown.so \
-    $work/stripped-unknown-module.c
+guest gcc -shared -nostdlib -o $work/unknown.so \
+    $work/stripped-unknown-module.S
 guest strip $work/unknown.so
 guest gcc -O2 -marm -o $work/compare $work/stripped-compare.c
 

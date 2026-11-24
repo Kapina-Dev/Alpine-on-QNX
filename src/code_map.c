@@ -179,6 +179,11 @@ static void thumb_formation(const uint16_t *code, unsigned width,
 {
     uint16_t hw0 = code[0];
     out->dest_reg = 16;
+    out->branch_reg = 16;
+    if (width == 2 && (hw0 & 0xff07u) == 0x4700u) {
+        out->branch_reg = (hw0 >> 3) & 0xfu;    /* bx/blx Rm */
+        return;
+    }
     if (width == 2) {
         unsigned rd = ((hw0 >> 4) & 8u) | (hw0 & 7u);
         if ((hw0 & 0xff78u) == 0x4478u && rd != 15u) {
@@ -211,6 +216,7 @@ int thumb_insn_info(const uint16_t *code, size_t halfwords, uint32_t address,
     memset(out, 0, sizeof(*out));
     out->flow = FLOW_NEXT;
     out->dest_reg = 16;
+    out->branch_reg = 16;
     if (halfwords == 0) return -1;
     if (!thumb_is_32bit(code[0])) {
         out->width = 2;
@@ -230,6 +236,11 @@ static void arm_formation(uint32_t word, struct insn_info *out)
 {
     unsigned rd = (word >> 12) & 0xfu;
     out->dest_reg = 16;
+    out->branch_reg = 16;
+    if ((word & 0x0fffffd0u) == 0x012fff10u) {
+        out->branch_reg = word & 0xfu;          /* bx/blx Rm */
+        return;
+    }
     if (rd != 15u && (((word & 0x0fff0ff0u) == 0x008f0000u &&
             (word & 0xfu) == rd) ||
             ((word & 0x0ff00fffu) == 0x0080000fu &&
@@ -328,7 +339,7 @@ int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
 {
     int result = arm_insn_info_base(word, address, out);
     if ((word >> 28) != 0xfu) arm_formation(word, out);
-    else out->dest_reg = 16;
+    else out->dest_reg = out->branch_reg = 16;
     return result;
 }
 
@@ -436,6 +447,9 @@ struct builder {
     uint8_t *fresh;  /* marks this round's decoding made */
     const uint32_t *noreturn; /* sorted: calls there don't return */
     size_t noreturn_count;
+    uint32_t *strong_starts;  /* sorted starts of the caller's strong
+                                 functions */
+    size_t strong_count;
     size_t span_capacity;
     uint32_t *work;
     size_t work_count;
@@ -502,6 +516,13 @@ static void note(struct builder *b, const struct insn_info *info,
         b->next_reached[info->target - b->base] |= mark;
         b->fresh[info->target - b->base] |= mark;
     }
+}
+
+static int compare_u32(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return a < b ? -1 : a > b;
 }
 
 /* A call to address doesn't return (abort, __stack_chk_fail, ...). */
@@ -614,27 +635,55 @@ static void track_clear(struct reg_track *track)
     memset(track, 0, sizeof(*track) * 16u);
 }
 
-/* Update the tracked values for one decoded instruction; an add Rd, pc on
-   a known value forms an address. An odd one inside the section, outside
-   known data, is weak Thumb evidence (an even one may be a data pointer:
-   nothing). */
+static int strong_start(const struct builder *b, uint32_t address)
+{
+    size_t low = 0;
+    size_t high = b->strong_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (b->strong_starts[middle] == address) return 1;
+        if (b->strong_starts[middle] < address) low = middle + 1;
+        else high = middle;
+    }
+    return 0;
+}
+
+/* A formed address (bit 0: Thumb). One equal to a strong function start
+   gives that function its mode, like a call; any other is weak evidence.
+   An even address formed by add pc may be a data pointer: nothing. An
+   even target of bx/blx (absolute) is ARM code. */
+static void formation_evidence(struct builder *b, uint32_t formed,
+    int absolute)
+{
+    int thumb = (formed & 1u) != 0;
+    uint32_t target = formed & ~1u;
+    uint8_t mark;
+    if (!thumb && (!absolute || (target & 3u) != 0)) return;
+    if (!in_section(b, target) || b->data[target - b->base]) return;
+    if (strong_start(b, target))
+        mark = thumb ? REACHED_CALL_THUMB : REACHED_CALL_ARM;
+    else
+        mark = thumb ? REACHED_WEAK_THUMB : REACHED_WEAK_ARM;
+    b->next_reached[target - b->base] |= mark;
+    b->fresh[target - b->base] |= mark;
+}
+
+/* Update the tracked values for one decoded instruction. An add Rd, pc on
+   a known value forms an address; so does bx/blx Rm on a known value
+   (lld's absolute long-branch thunk: movw ip; movt ip; bx ip). */
 static void track_formation(struct builder *b, struct reg_track *track,
     const struct insn_info *info, const uint16_t *code, uint32_t word,
     uint32_t address, int thumb)
 {
     unsigned r;
+    if (info->pc_add && track[info->pc_add_reg].valid)
+        formation_evidence(b, track[info->pc_add_reg].value + address +
+            (thumb ? 4u : 8u), 0);
+    else if (info->branch_reg < 16u && track[info->branch_reg].valid)
+        formation_evidence(b, track[info->branch_reg].value, 1);
     if (info->flow == FLOW_CALL) {
         track_clear(track);
         return;
-    }
-    if (info->pc_add && track[info->pc_add_reg].valid) {
-        uint32_t formed = track[info->pc_add_reg].value + address +
-            (thumb ? 4u : 8u);
-        if ((formed & 1u) != 0 && in_section(b, formed - 1u) &&
-            !b->data[formed - 1u - b->base]) {
-            b->next_reached[formed - 1u - b->base] |= REACHED_WEAK_THUMB;
-            b->fresh[formed - 1u - b->base] |= REACHED_WEAK_THUMB;
-        }
     }
     for (r = 0; r < 16u; ++r) {
         if (!track[r].valid) continue;
@@ -1076,6 +1125,14 @@ int code_map_build_noreturn(const uint8_t *bytes, uint32_t base, size_t size,
     b.initial_count = function_count;
     b.noreturn = noreturn;
     b.noreturn_count = noreturn_count;
+    b.strong_starts = malloc(sizeof(*b.strong_starts) *
+        (function_count ? function_count : 1));
+    if (b.strong_starts == 0) goto done;
+    for (i = 0; i < function_count; ++i)
+        if (!functions[i].weak)
+            b.strong_starts[b.strong_count++] = functions[i].start;
+    qsort(b.strong_starts, b.strong_count, sizeof(*b.strong_starts),
+        compare_u32);
     b.klass = malloc(allocation);
     b.data = calloc(allocation, 1);
     b.next_data = malloc(allocation);
@@ -1143,6 +1200,7 @@ done:
     free(b.reached);
     free(b.next_reached);
     free(b.fresh);
+    free(b.strong_starts);
     free(b.work);
     return result;
 }
@@ -1674,12 +1732,6 @@ static size_t noreturn_targets(const struct elf_view *e, uint32_t *out,
     return found;
 }
 
-static int compare_u32(const void *left, const void *right)
-{
-    uint32_t a = *(const uint32_t *)left;
-    uint32_t b = *(const uint32_t *)right;
-    return a < b ? -1 : a > b;
-}
 
 static int elf_open(const uint8_t *file, size_t file_size, struct elf_view *e)
 {

@@ -38,6 +38,7 @@ struct insn_info {
     unsigned pc_add_reg;       /* its Rd */
     int movw, movt;            /* movw/movt Rd, #imm16 */
     uint16_t imm16;
+    unsigned branch_reg;       /* bx/blx Rm: Rm; 16 = none */
 };
 
 /* Decode the Thumb instruction at code[0] (address is its link address).
