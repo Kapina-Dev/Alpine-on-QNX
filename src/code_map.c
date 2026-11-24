@@ -1184,6 +1184,33 @@ static int section_named(const struct elf_view *e, unsigned index,
    have no start of its own, but the word may also point at data in code.
    One outside that coverage (a string in .text before the first unwind
    entry) is no evidence at all. */
+/* Whether symbol table section index names any $a/$t/$d. */
+static int has_mapping_symbols(const struct elf_view *e, unsigned index)
+{
+    uint32_t offset = sh_field(e, index, 16);
+    uint32_t size = sh_field(e, index, 20);
+    unsigned strings = sh_field(e, index, 24);
+    uint32_t string_offset, string_size, j;
+    if (strings >= e->section_count) return 0;
+    string_offset = sh_field(e, strings, 16);
+    string_size = sh_field(e, strings, 20);
+    if (!in_file(e, offset, size) ||
+        !in_file(e, string_offset, string_size)) return 0;
+    for (j = 0; j + 16u <= size; j += 16u) {
+        uint32_t name = read32(e->file + offset + j);
+        enum code_state state;
+        /* Mapping symbols are "$a", "$t", "$d" or with a ".suffix". */
+        if (name + 2u < string_size &&
+            e->file[string_offset + name] == '$' &&
+            memchr(e->file + string_offset + name, 0,
+                string_size - name) != 0 &&
+            mapping_symbol_state((const char *)e->file + string_offset +
+                name, &state))
+            return 1;
+    }
+    return 0;
+}
+
 static void gather(const struct elf_view *e, struct evidence_list *starts,
     struct evidence_list *modes, struct evidence_list *weak)
 {
@@ -1205,7 +1232,10 @@ static void gather(const struct elf_view *e, struct evidence_list *starts,
                 if (code_section_of(e, target) != e->section_count)
                     add_evidence(starts, target, MODE_UNKNOWN);
             }
-        } else if (type == SHT_DYNSYM_) {
+        } else if (type == SHT_DYNSYM_ ||
+            (type == SHT_SYMTAB_ && !has_mapping_symbols(e, i))) {
+            /* .symtab functions count like .dynsym ones when the table has
+               no mapping symbols (Android's linker keeps such a table). */
             for (j = 0; j + 16u <= size; j += 16u) {
                 const uint8_t *symbol = e->file + offset + j;
                 uint16_t index = read16(symbol + 14);

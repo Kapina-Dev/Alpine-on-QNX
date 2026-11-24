@@ -909,6 +909,10 @@ static void test_fixture_files(void)
     compare_pair("tests/fixtures/odd-pointer-arm.so",
         "tests/fixtures/odd-pointer-arm.stripped.so", 1);
 
+    /* .symtab without mapping symbols (Android's linker): its STT_FUNC
+       symbols are evidence; hidden's svc is only known Thumb from it. */
+    compare_pair("tests/fixtures/symtab-only-thumb.so",
+        "tests/fixtures/symtab-only-thumb.nomap.so", 0);
     /* Calls that never return, by name: abort and __stack_chk_fail's
        PLT entries (0x1f0, 0x1fc), not puts' (0x1e0 Thumb stub, 0x1e4). */
     {
