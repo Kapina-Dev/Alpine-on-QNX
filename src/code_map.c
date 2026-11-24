@@ -173,24 +173,82 @@ static void thumb32_info(uint16_t hw0, uint16_t hw1, uint32_t address,
     }
 }
 
+/* Address formation facts of a Thumb instruction (Phase 4 part 4). */
+static void thumb_formation(const uint16_t *code, unsigned width,
+    struct insn_info *out)
+{
+    uint16_t hw0 = code[0];
+    out->dest_reg = 16;
+    if (width == 2) {
+        unsigned rd = ((hw0 >> 4) & 8u) | (hw0 & 7u);
+        if ((hw0 & 0xff78u) == 0x4478u && rd != 15u) {
+            out->pc_add = 1;            /* add Rd, pc */
+            out->pc_add_reg = rd;
+        } else if ((hw0 & 0xf800u) == 0x4800u) {
+            out->dest_reg = (hw0 >> 8) & 7u;    /* ldr Rt, [pc, #imm] */
+        }
+        return;
+    }
+    {
+        uint16_t hw1 = code[1];
+        if (((hw0 & 0xfbf0u) == 0xf240u || (hw0 & 0xfbf0u) == 0xf2c0u) &&
+            (hw1 & 0x8000u) == 0) {
+            out->movw = (hw0 & 0xfbf0u) == 0xf240u;
+            out->movt = !out->movw;
+            out->dest_reg = (hw1 >> 8) & 0xfu;
+            out->imm16 = (uint16_t)(((hw0 & 0xfu) << 12) |
+                (((hw0 >> 10) & 1u) << 11) | (((hw1 >> 12) & 7u) << 8) |
+                (hw1 & 0xffu));
+        } else if ((hw0 & 0xff7fu) == 0xf85fu) {
+            out->dest_reg = hw1 >> 12;          /* ldr.w Rt, [pc, #imm] */
+        }
+    }
+}
+
 int thumb_insn_info(const uint16_t *code, size_t halfwords, uint32_t address,
     struct insn_info *out)
 {
     memset(out, 0, sizeof(*out));
     out->flow = FLOW_NEXT;
+    out->dest_reg = 16;
     if (halfwords == 0) return -1;
     if (!thumb_is_32bit(code[0])) {
         out->width = 2;
         thumb16_info(code[0], address, out);
+        thumb_formation(code, 2, out);
         return 0;
     }
     out->width = 4;
     if (halfwords < 2) return -1;
     thumb32_info(code[0], code[1], address, out);
+    thumb_formation(code, 4, out);
     return 0;
 }
 
-int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
+/* Address formation facts of an ARM instruction (Phase 4 part 4). */
+static void arm_formation(uint32_t word, struct insn_info *out)
+{
+    unsigned rd = (word >> 12) & 0xfu;
+    out->dest_reg = 16;
+    if (rd != 15u && (((word & 0x0fff0ff0u) == 0x008f0000u &&
+            (word & 0xfu) == rd) ||
+            ((word & 0x0ff00fffu) == 0x0080000fu &&
+            ((word >> 16) & 0xfu) == rd))) {
+        out->pc_add = 1;                /* add Rd, pc, Rd / add Rd, Rd, pc */
+        out->pc_add_reg = rd;
+    } else if ((word & 0x0ff00000u) == 0x03000000u ||
+        (word & 0x0ff00000u) == 0x03400000u) {
+        out->movw = (word & 0x0ff00000u) == 0x03000000u;
+        out->movt = !out->movw;
+        out->dest_reg = rd;
+        out->imm16 = (uint16_t)(((word >> 4) & 0xf000u) | (word & 0xfffu));
+    } else if ((word & 0x0f7f0000u) == 0x051f0000u) {
+        out->dest_reg = rd;             /* ldr Rt, [pc, #imm] */
+    }
+}
+
+static int arm_insn_info_base(uint32_t word, uint32_t address,
+    struct insn_info *out)
 {
     uint32_t cond = word >> 28;
     uint32_t pc = address + 8u;
@@ -264,6 +322,14 @@ int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
             (word & 0x100u) ? 8u : 4u);
     }
     return 0;
+}
+
+int arm_insn_info(uint32_t word, uint32_t address, struct insn_info *out)
+{
+    int result = arm_insn_info_base(word, address, out);
+    if ((word >> 28) != 0xfu) arm_formation(word, out);
+    else out->dest_reg = 16;
+    return result;
 }
 
 int thumb_cmp_imm(const uint16_t *code, size_t halfwords, unsigned *reg,
@@ -503,6 +569,111 @@ static uint32_t inferred_table_length(const struct builder *b, uint32_t table,
     return table + length == nearest ? length : 0;
 }
 
+/* Register values known from a word literal load or movw/movt, for
+   PC-relative address formation (ldr rX, =off; add rX, pc). Cleared on
+   anything that may write the register, a call, a branch target, or after
+   FORMATION_WINDOW instructions. */
+#define FORMATION_WINDOW 16u
+
+struct reg_track {
+    int valid;
+    uint32_t value;
+    unsigned age;
+};
+
+/* Conservative: 1 when the instruction may write register r. */
+static int thumb_may_write(const uint16_t *code, unsigned width, unsigned r)
+{
+    uint16_t hw0 = code[0];
+    if (width == 2) {
+        if ((hw0 & 0xfc00u) == 0x4400u)     /* high-register add/mov/cmp */
+            return (((hw0 >> 4) & 8u) | (hw0 & 7u)) == r;
+        if ((hw0 & 0xf000u) == 0xb000u || (hw0 & 0xf000u) == 0xc000u)
+            return r < 8u ? (hw0 & (1u << r)) != 0 ||
+                ((hw0 >> 8) & 7u) == r : 0; /* push/pop, ldm/stm */
+        return r < 8u && ((hw0 & 7u) == r || ((hw0 >> 8) & 7u) == r);
+    }
+    {
+        uint16_t hw1 = code[1];
+        if ((hw0 & 0xfe40u) == 0xe800u && (hw0 & 0x0010u) != 0)
+            return (hw1 & (1u << r)) != 0 || (hw0 & 0xfu) == r; /* ldm */
+        return ((hw1 >> 8) & 0xfu) == r || (hw1 >> 12) == r ||
+            (hw0 & 0xfu) == r;
+    }
+}
+
+static int arm_may_write(uint32_t word, unsigned r)
+{
+    if (((word >> 25) & 7u) == 4u)          /* ldm/stm */
+        return (word & (1u << r)) != 0 || ((word >> 16) & 0xfu) == r;
+    return ((word >> 12) & 0xfu) == r || ((word >> 16) & 0xfu) == r;
+}
+
+static void track_clear(struct reg_track *track)
+{
+    memset(track, 0, sizeof(*track) * 16u);
+}
+
+/* Update the tracked values for one decoded instruction; an add Rd, pc on
+   a known value forms an address. An odd one inside the section, outside
+   known data, is weak Thumb evidence (an even one may be a data pointer:
+   nothing). */
+static void track_formation(struct builder *b, struct reg_track *track,
+    const struct insn_info *info, const uint16_t *code, uint32_t word,
+    uint32_t address, int thumb)
+{
+    unsigned r;
+    if (info->flow == FLOW_CALL) {
+        track_clear(track);
+        return;
+    }
+    if (info->pc_add && track[info->pc_add_reg].valid) {
+        uint32_t formed = track[info->pc_add_reg].value + address +
+            (thumb ? 4u : 8u);
+        if ((formed & 1u) != 0 && in_section(b, formed - 1u) &&
+            !b->data[formed - 1u - b->base]) {
+            b->next_reached[formed - 1u - b->base] |= REACHED_WEAK_THUMB;
+            b->fresh[formed - 1u - b->base] |= REACHED_WEAK_THUMB;
+        }
+    }
+    for (r = 0; r < 16u; ++r) {
+        if (!track[r].valid) continue;
+        if (++track[r].age > FORMATION_WINDOW ||
+            (r != info->dest_reg && (thumb ?
+                thumb_may_write(code, info->width, r) :
+                arm_may_write(word, r))))
+            track[r].valid = 0;
+    }
+    if (info->dest_reg < 16u) {
+        unsigned d = info->dest_reg;
+        if (info->movw) {
+            track[d].valid = 1;
+            track[d].value = info->imm16;
+            track[d].age = 0;
+        } else if (info->movt) {
+            if (track[d].valid)
+                track[d].value = (track[d].value & 0xffffu) |
+                    ((uint32_t)info->imm16 << 16);
+        } else if (info->literal_valid && info->literal_size == 4u &&
+            in_section(b, info->literal) &&
+            in_section(b, info->literal + 3u)) {
+            track[d].valid = 1;
+            track[d].value = read32(b->bytes + (info->literal - b->base));
+            track[d].age = 0;
+        } else {
+            track[d].valid = 0;
+        }
+    }
+    if (info->pc_add) track[info->pc_add_reg].valid = 0;
+}
+
+/* A branch target: values arriving from elsewhere are unknown. */
+static int branch_target(const struct builder *b, size_t offset)
+{
+    return (b->reached[offset] & (REACHED_BRANCH_ARM | REACHED_BRANCH_THUMB |
+        REACHED_CALL_ARM | REACHED_CALL_THUMB)) != 0;
+}
+
 /* Follow Thumb control flow from start; the function is [start, end). */
 static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
 {
@@ -514,10 +685,12 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
         size_t stop = end - b->base;
         struct { int valid; unsigned reg; uint32_t imm; }
             recent[TABLE_CMP_WINDOW];
+        struct reg_track track[16];
         unsigned it_left = 0;
         unsigned i;
 
         memset(recent, 0, sizeof(recent));
+        track_clear(track);
         while (offset + 2u <= stop && b->klass[offset] == BYTE_UNDECODED &&
             !any_data(b, offset, 2)) {
             uint16_t code[2];
@@ -537,6 +710,8 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
                 break;
             memset(b->klass + offset, BYTE_THUMB, info.width);
             note(b, &info, start, end, 1);
+            if (branch_target(b, offset)) track_clear(track);
+            track_formation(b, track, &info, code, 0, address, 1);
             if (it_left > 0) it_left--;
             flow = info.flow;
             if (flow == FLOW_CALL && info.target_valid &&
@@ -610,8 +785,10 @@ static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
     while (b->work_count > 0) {
         size_t offset = b->work[--b->work_count] - b->base;
         size_t stop = end - b->base;
+        struct reg_track track[16];
 
         if ((offset & 3u) != 0) continue;
+        track_clear(track);
         while (offset + 4u <= stop && b->klass[offset] == BYTE_UNDECODED &&
             !any_data(b, offset, 4)) {
             struct insn_info info;
@@ -619,6 +796,9 @@ static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
             arm_insn_info(read32(b->bytes + offset), address, &info);
             memset(b->klass + offset, BYTE_ARM, 4);
             note(b, &info, start, end, 0);
+            if (branch_target(b, offset)) track_clear(track);
+            track_formation(b, track, &info, 0, read32(b->bytes + offset),
+                address, 0);
             /* An unconditional call that doesn't return (bl, or blx
                imm, which is 0xfa/0xfb). */
             if (info.flow == FLOW_CALL && info.target_valid &&

@@ -302,6 +302,42 @@ static void test_insn_info(void)
         info = arm_at(0xe5901004, 0x400); /* ldr r1, [r0, #4] */
         check(!info.literal_valid, "arm ldr [r0]: no literal");
     }
+    /* PC-relative address formation (Phase 4 part 4). */
+    {
+        struct insn_info info = thumb_at(0x447b, 0, 0x400);
+        check(info.pc_add && info.pc_add_reg == 3, "thumb add r3, pc");
+        info = thumb_at(0x44fb, 0, 0x400);
+        check(info.pc_add && info.pc_add_reg == 11, "thumb add r11, pc");
+        info = thumb_at(0x4487, 0, 0x400); /* add pc, r0: a jump */
+        check(!info.pc_add, "thumb add pc, r0: not an address");
+        info = thumb_at(0xf241, 0x2334, 0x400);
+        check(info.movw && info.dest_reg == 3 && info.imm16 == 0x1234,
+            "thumb movw r3, #0x1234");
+        info = thumb_at(0xf2c5, 0x6378, 0x400);
+        check(info.movt && info.dest_reg == 3 && info.imm16 == 0x5678,
+            "thumb movt r3, #0x5678");
+        info = thumb_at(0x4b01, 0, 0x400);
+        check(info.dest_reg == 3, "thumb ldr r3, [pc]: dest");
+        info = thumb_at(0xf8df, 0x5008, 0x400); /* ldr.w r5, [pc, #8] */
+        check(info.dest_reg == 5, "thumb ldr.w r5, [pc]: dest");
+        info = thumb_at(0x4770, 0, 0x400);
+        check(info.dest_reg == 16 && !info.pc_add && !info.movw &&
+            !info.movt, "thumb bx lr: nothing");
+        info = arm_at(0xe08f3003, 0x400);
+        check(info.pc_add && info.pc_add_reg == 3, "arm add r3, pc, r3");
+        info = arm_at(0xe083300f, 0x400);
+        check(info.pc_add && info.pc_add_reg == 3, "arm add r3, r3, pc");
+        info = arm_at(0xe08f3004, 0x400); /* add r3, pc, r4 */
+        check(!info.pc_add, "arm add r3, pc, r4: not formed from r3");
+        info = arm_at(0xe3013234, 0x400);
+        check(info.movw && info.dest_reg == 3 && info.imm16 == 0x1234,
+            "arm movw r3, #0x1234");
+        info = arm_at(0xe3453678, 0x400);
+        check(info.movt && info.dest_reg == 3 && info.imm16 == 0x5678,
+            "arm movt r3, #0x5678");
+        info = arm_at(0xe59f3004, 0x400);
+        check(info.dest_reg == 3, "arm ldr r3, [pc]: dest");
+    }
 }
 
 
@@ -753,6 +789,79 @@ static void test_map_builder(void)
             "map v: a start found only in data decoded as code is dropped");
         check(r.refused == 1 && r.refused_address == 0x1024,
             "map v: the unclassified pattern refuses");
+        code_map_result_free(&r);
+    }
+    /* (pcrel) ldr r3, =off; add r3, pc; blx r3: the formed odd address
+       names a Thumb function nothing else reaches, holding an svc. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x4b01;           /* ldr r3, [pc, #4] -> 0x1008 */
+        code[1] = 0x447b;           /* add r3, pc (pc = 0x1006) */
+        code[2] = 0x4798;           /* blx r3 */
+        code[3] = 0x4770;           /* bx lr */
+        code[4] = 0x001b;           /* 0x1008: 0x1021 - 0x1006 */
+        code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 1);
+        check(r.refused == 0 && state_at(&r, 0x1020) == CODE_STATE_THUMB &&
+            state_at(&r, 0x1008) == CODE_STATE_DATA,
+            "pcrel: ldr/add pc names a Thumb function");
+        code_map_result_free(&r);
+    }
+    /* (pcrel2) mov r3, r0 between the load and the add: no evidence. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x4b02;           /* ldr r3, [pc, #8] -> 0x100c */
+        code[1] = 0x4603;           /* mov r3, r0 */
+        code[2] = 0x447b;           /* add r3, pc (pc = 0x1008) */
+        code[3] = 0x4798;           /* blx r3 */
+        code[4] = 0x4770;           /* bx lr */
+        code[5] = 0xbf00;
+        code[6] = 0x0019;           /* 0x100c: 0x1021 - 0x1008 */
+        code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 1);
+        check(r.refused == 1 && r.refused_address == 0x1022 &&
+            state_at(&r, 0x1020) == CODE_STATE_DATA,
+            "pcrel: clobbered register gives nothing");
+        code_map_result_free(&r);
+    }
+    /* (pcrel3) The formed address is the function's own pool: nothing. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x4b01;           /* ldr r3, [pc, #4] -> 0x1008 */
+        code[1] = 0x447b;           /* add r3, pc (pc = 0x1006) */
+        code[2] = 0x4798;
+        code[3] = 0x4770;
+        code[4] = 0x0003;           /* 0x1009 - 0x1006: into this pool */
+        r = build_thumb(code, 24, f, 1);
+        check(r.refused == 0 && state_at(&r, 0x1008) == CODE_STATE_DATA &&
+            state_at(&r, 0x100a) == CODE_STATE_DATA,
+            "pcrel: formed address in data gives nothing");
+        code_map_result_free(&r);
+    }
+    /* (pcrel4) ARM movw/movt; add r3, pc, r3 forms a Thumb address. */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x1014, MODE_ARM, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x3011; code[1] = 0xe300; /* movw r3, #0x11 */
+        code[2] = 0x3000; code[3] = 0xe340; /* movt r3, #0 */
+        code[4] = 0x3003; code[5] = 0xe08f; /* add r3, pc, r3 (pc 0x1010) */
+        code[6] = 0xff33; code[7] = 0xe12f; /* blx r3 */
+        code[8] = 0xff1e; code[9] = 0xe12f; /* bx lr */
+        code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 1);
+        check(r.refused == 0 && state_at(&r, 0x1020) == CODE_STATE_THUMB,
+            "pcrel: movw/movt pair, ARM");
         code_map_result_free(&r);
     }
     /* (w) A call to a function that never returns (__stack_chk_fail

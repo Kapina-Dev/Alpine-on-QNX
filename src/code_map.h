@@ -32,6 +32,12 @@ struct insn_info {
     unsigned table_reg;        /* FLOW_TABLE: index register */
     unsigned table_entry_size; /* FLOW_TABLE: 1 (tbb), 2 (tbh), 4 (ARM) */
     unsigned it_length;        /* Thumb IT: instructions it makes conditional */
+    unsigned dest_reg;         /* written by a word literal load, movw or movt;
+                                  16 = none */
+    int pc_add;                /* add Rd, pc (Thumb) / add Rd, pc, Rd (ARM) */
+    unsigned pc_add_reg;       /* its Rd */
+    int movw, movt;            /* movw/movt Rd, #imm16 */
+    uint16_t imm16;
 };
 
 /* Decode the Thumb instruction at code[0] (address is its link address).
