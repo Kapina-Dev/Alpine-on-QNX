@@ -363,9 +363,20 @@ int arm_patch_code_runs(uintptr_t start, size_t size, uintptr_t bias,
     return 0;
 }
 
+void arm_patch_report(int fd, uint64_t offset, uint64_t length, size_t sites)
+{
+    struct stat64 status;
+    if (getenv("LINUXEMU_VERBOSE") == 0 || fstat64(fd, &status) != 0) return;
+    fprintf(stderr, "linuxemu: patch-sites ino=%llu offset=0x%llx "
+        "length=0x%llx sites=%lu\n", (unsigned long long)status.st_ino,
+        (unsigned long long)offset, (unsigned long long)length,
+        (unsigned long)sites);
+}
+
 int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     size_t length)
 {
+    size_t sites_before = arm_patch_count();
     Elf32_Ehdr header;
     Elf32_Shdr *sections = 0;
     struct mapping_symbol *symbols;
@@ -440,6 +451,9 @@ int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
     }
     free(symbols);
     free(sections);
+    if (result == 0)
+        arm_patch_report(fd, (uint64_t)offset, (uint64_t)length,
+            arm_patch_count() - sites_before);
     return result;
 }
 

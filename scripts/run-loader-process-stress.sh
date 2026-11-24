@@ -56,6 +56,32 @@ status=$?
 echo "stripped-compare exit=$status expected=0"
 if [ "$status" -ne 0 ]; then failures=$((failures + 1)); fi
 
+echo "=== stripped library: patch sites reported per mapping ==="
+# LINUXEMU_VERBOSE prints "linuxemu: patch-sites ino=... sites=N" per
+# patched file mapping. The stripped copy's total must equal the laptop's
+# count for the same file: build/code-map-survey guest-tests/fixtures
+# (sites= on stripped-mixed-armhf.stripped.so; rerun it when the fixture
+# is rebuilt).
+expected_stripped_sites=10
+sites_log=$(mktemp "${TMPDIR:-/tmp}/linuxemu-sites.XXXXXX") || exit 2
+LINUXEMU_VERBOSE=1 "$timeout_command" 30 "$linuxemu" \
+    --linuxemu-exec "$alpine_root" / \
+    "$fixture_dir/stripped-compare-armhf" /tmp/stripped-compare \
+    "$stripped_dir/stripped-mixed-armhf.so" \
+    "$stripped_dir/stripped-mixed-armhf.stripped.so" mixed \
+    >/dev/null 2>"$sites_log"
+stripped_ino=$(ls -i "$alpine_root$stripped_dir/stripped-mixed-armhf.stripped.so" |
+    awk '{print $1}')
+stripped_sites=$(awk -v ino="ino=$stripped_ino" '
+    $1 == "linuxemu:" && $2 == "patch-sites" && $3 == ino {
+        sub("sites=", "", $6); total += $6; seen = 1 }
+    END { print seen ? total : "none" }' "$sites_log")
+echo "stripped-sites reported=$stripped_sites expected=$expected_stripped_sites"
+if [ "$stripped_sites" != "$expected_stripped_sites" ]; then
+    failures=$((failures + 1))
+fi
+rm -f "$sites_log"
+
 echo "=== stripped library with an undecodable svc: refused ==="
 refusal_report=$(mktemp "${TMPDIR:-/tmp}/linuxemu-refusal.XXXXXX") || exit 2
 LINUXEMU_DIAGNOSTICS="$refusal_report" "$timeout_command" 30 "$linuxemu" \

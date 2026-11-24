@@ -93,6 +93,7 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
     size_t table_size;
     size_t i;
     size_t executable_sections = 0;
+    size_t sites_before = arm_patch_count();
     int result = -1;
 
     if (elf_header->e_shnum == 0 ||
@@ -147,6 +148,8 @@ static int patch_executable_sections(int fd, const Elf32_Ehdr *elf_header,
         errno = ENOEXEC;
         goto done;
     }
+    arm_patch_report(fd, 0, (uint64_t)file_size,
+        arm_patch_count() - sites_before);
     result = 0;
 done:
     free(symbols);

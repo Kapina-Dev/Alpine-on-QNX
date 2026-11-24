@@ -110,6 +110,9 @@ int arm_patch_elf_mapping(int fd, off64_t offset, uintptr_t address,
 void arm_patch_forget_range(uintptr_t address, size_t length);
 const struct arm_patch_site *arm_patch_lookup(uintptr_t address);
 size_t arm_patch_count(void);
+/* With LINUXEMU_VERBOSE: "linuxemu: patch-sites ino=<n> offset=0x<o>
+   length=0x<l> sites=<n>" for one patched file mapping. */
+void arm_patch_report(int fd, uint64_t offset, uint64_t length, size_t sites);
 int arm_patch_any_in_range(uintptr_t start, size_t length);
 void arm_patch_rollback(size_t patch_count);
 
