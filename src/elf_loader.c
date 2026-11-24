@@ -218,7 +218,11 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
             goto done;
         if (program_headers[i].p_type == PT_INTERP) interpreter_count++;
     }
-    if (interpreter_count > 1 || (interpreter_count != 0 && interpreter == 0)) {
+    /* Loading the interpreter itself (interpreter == 0): its own PT_INTERP
+       is ignored, as Linux's load_elf_interp does. Android's linker names
+       itself there so it can also be run directly. */
+    if (interpreter == 0) interpreter_count = 0;
+    if (interpreter_count > 1) {
         errno = ENOEXEC;
         goto done;
     }
@@ -226,7 +230,7 @@ static int load_elf_object(const char *path, uintptr_t dynamic_bias,
         ARRAY_COUNT(main_biases) : 1;
     for (i = 0; i < elf_header.e_phnum; ++i) {
         Elf32_Phdr *header = &program_headers[i];
-        if (header->p_type == PT_INTERP) {
+        if (header->p_type == PT_INTERP && interpreter != 0) {
             if (header->p_filesz < 2 || header->p_filesz > interpreter_capacity ||
                 read_exact_at(fd, interpreter, header->p_filesz,
                     (off64_t)header->p_offset) != 0 ||

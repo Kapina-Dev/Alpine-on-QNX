@@ -323,6 +323,30 @@ symbols when it has them, `-1` when refused). `--pairs` also compares
 every file that has mapping symbols (`libc.so`, `libart.so`) with its
 decoded map, like `code-map-test UNSTRIPPED STRIPPED`.
 
+The Android gate (Phase 4 part 4) runs Android's own linker and
+libraries on the device. On the laptop, after both fetch scripts,
+`sh scripts/build-android-gate.sh` builds two Thumb NDK test programs
+(`guest-tests/android-gate.c`, dynamic, and `guest-tests/android-syscall.c`,
+static with its own entry point), copies `/system/bin/linker` and the 10
+libraries the dynamic one needs, writes the laptop's patch-site count per
+file and packs `build/android/android-gate.tar`. Upload it to the device's
+`build/` (without `ssh -tt`) and run:
+
+```sh
+sh scripts/run-android-gate.sh   # android_gate_failures=0 expected
+```
+
+It checks that nothing is refused, that the linker links, and that each
+file's `LINUXEMU_VERBOSE` `patch-sites` count matches the laptop's. The
+static program must print and exit 0. The dynamic one aims at `main()`
+(`android_gate_dynamic=main`); today it reports
+`android_gate_dynamic=fallback`: every library is loaded and patched,
+then liblog waits forever on a mutex because 32-bit bionic keeps 16-bit
+thread ids (roadmap Phase 6). Each run has its own time limit
+(`ANDROID_GATE_TIME_LIMIT`, 60 s), because BerryCore's `timeout` never
+fires. The gate is not in the full regression: the Android files aren't
+in the repo.
+
 SQLite is the real-world check. On the laptop,
 `sh scripts/fetch-sqlite-amalgamation.sh` fetches the pinned 3.54.1
 amalgamation into `artifacts/sqlite/` (checked against

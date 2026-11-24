@@ -1201,6 +1201,16 @@ static int translate_protection(uint32_t linux_protection,
     return 0;
 }
 
+/* Whether descriptor is a file that starts with the ELF magic. */
+static int elf_file(int descriptor)
+{
+    unsigned char magic[4];
+    if (descriptor < 0 || pread64(descriptor, magic, sizeof(magic), 0) !=
+            (ssize_t)sizeof(magic)) return 0;
+    return magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' &&
+        magic[3] == 'F';
+}
+
 static int32_t linux_mmap2(ucontext_t *context)
 {
     uintptr_t requested_address = context->uc_mcontext.cpu.gpr[0];
@@ -1247,17 +1257,28 @@ static int32_t linux_mmap2(ucontext_t *context)
             "mmap-shared-exec", (const uint32_t *)context->uc_mcontext.cpu.gpr);
     offset = (off64_t)context->uc_mcontext.cpu.gpr[5] * 4096;
     host_descriptor = (int)context->uc_mcontext.cpu.gpr[4];
+    /* Linux ignores the fd and offset of an anonymous mapping (Android's
+       linker allocator passes fd 0); QNX rejects a real fd with MAP_ANON. */
+    if ((linux_flags & LINUX_MAP_ANONYMOUS) != 0) {
+        host_descriptor = -1;
+        offset = 0;
+    }
     /* Private file mappings that are executable or writable are read in
        with pread instead of mapped from the file: executable ones because
        of the code patching, writable ones because QNX's MAP_PRIVATE file
        mapping can return wrong pages (FINDINGS 2026-11-21: a library's
        data segment, its dynamic section included, differed from pread of
        the same bytes for a few minutes, and musl crashed in symbol lookup).
-       Read-only private mappings stay mapped from the file. */
+       Read-only private mappings of ELF files are copied too: Android's
+       linker maps each library's header page read-only, and on QNX that
+       mapping intermittently showed another file's bytes (the linker's
+       own; Phase 4 part 4). Other read-only private mappings (git packs,
+       data files) stay mapped from the file. */
     copy_file =
         (linux_flags & LINUX_MAP_PRIVATE) != 0 &&
         (linux_flags & LINUX_MAP_ANONYMOUS) == 0 &&
-        (host_protection & (PROT_EXEC | PROT_WRITE)) != 0;
+        ((host_protection & (PROT_EXEC | PROT_WRITE)) != 0 ||
+         elf_file(host_descriptor));
     if (copy_file) {
         host_flags |= MAP_ANON;
         host_descriptor = -1;

@@ -106,7 +106,34 @@ _start:
     cmn r0, #95
     bne fail_shared_exec
 
+    /* Anonymous mappings ignore the fd: Linux does, and Android's linker
+       allocator passes 0 (Phase 4 part 4). The page must work and be
+       zeroed. */
     mov r0, #0
+    mov r1, #0x1000
+    mov r2, #3
+    mov r3, #0x22
+    mov r4, #0
+    mov r5, #0
+    mov r7, #192
+    svc #0
+    cmn r0, #4096
+    bhi fail_anon_fd
+    ldr r1, [r0]
+    cmp r1, #0
+    bne fail_anon_fd
+    mov r1, #7
+    str r1, [r0]
+    mov r1, #0x1000
+    mov r7, #91
+    svc #0
+    cmp r0, #0
+    bne fail_anon_fd
+
+    mov r0, #0
+    b exit_guest
+fail_anon_fd:
+    mov r0, #61
     b exit_guest
 fail_shared_exec:
     mov r0, #60
