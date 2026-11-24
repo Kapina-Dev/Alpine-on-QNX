@@ -9,6 +9,7 @@
  * (arm-linux-gnueabihf), assembled at the addresses used below.
  */
 #include "code_map.h"
+#include "code-map-compare.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -671,126 +672,11 @@ static void test_map_builder(void)
 }
 /* ---- whole files: stripped fixtures against their unstripped twins ---- */
 
-static uint8_t *read_file(const char *path, size_t *size)
-{
-    FILE *file = fopen(path, "rb");
-    uint8_t *bytes;
-    long length;
-    if (file == 0) return 0;
-    fseek(file, 0, SEEK_END);
-    length = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    bytes = malloc((size_t)length);
-    if (bytes != 0 && fread(bytes, 1, (size_t)length, file) != (size_t)length) {
-        free(bytes);
-        bytes = 0;
-    }
-    fclose(file);
-    *size = (size_t)length;
-    return bytes;
-}
-
-static uint32_t le32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-        ((uint32_t)p[3] << 24);
-}
-
-static uint16_t le16(const uint8_t *p)
-{
-    return (uint16_t)(p[0] | (p[1] << 8));
-}
-
-#define SHDR(file, i) ((file) + le32((file) + 32) + 40u * (i))
-
-/* Mapping symbols from .symtab (the ground truth of an unstripped file). */
-static size_t symtab_mapping(const uint8_t *file, struct mapping_symbol *out,
-    size_t capacity)
-{
-    unsigned count = le16(file + 48);
-    unsigned i;
-    size_t found = 0;
-    for (i = 0; i < count; ++i) {
-        const uint8_t *sh = SHDR(file, i);
-        const uint8_t *strings;
-        uint32_t j;
-        if (le32(sh + 4) != 2) continue; /* SHT_SYMTAB */
-        strings = file + le32(SHDR(file, le32(sh + 24)) + 16);
-        for (j = 0; j < le32(sh + 20) / 16u; ++j) {
-            const uint8_t *sym = file + le32(sh + 16) + 16u * j;
-            enum code_state state;
-            uint16_t index = le16(sym + 14);
-            if (index == 0 || index >= count ||
-                (le32(SHDR(file, index) + 8) & 4u) == 0 ||
-                !mapping_symbol_state((const char *)strings + le32(sym),
-                    &state) || found == capacity)
-                continue;
-            out[found].address = le32(sym + 4);
-            out[found].state = state;
-            found++;
-        }
-    }
-    mapping_sort(out, found);
-    return found;
-}
-
-/* Patch sites (address * 4 + kind) the patcher would find in the file's
-   code sections, given mapping symbols. */
-static size_t patch_sites(const uint8_t *file, const struct mapping_symbol *symbols,
-    size_t symbol_count, uint32_t *out, size_t capacity)
-{
-    unsigned count = le16(file + 48);
-    unsigned i;
-    size_t found = 0;
-    for (i = 0; i < count; ++i) {
-        const uint8_t *sh = SHDR(file, i);
-        uint32_t address = le32(sh + 12);
-        uint32_t end = address + le32(sh + 20);
-        const uint8_t *bytes = file + le32(sh + 16);
-        if (le32(sh + 4) != 1 || (le32(sh + 8) & 4u) == 0) continue;
-        while (address < end) {
-            uint32_t run_end;
-            enum code_state state = mapping_state_at(symbols, symbol_count,
-                address, end, &run_end);
-            uint32_t a;
-            if (state == CODE_STATE_ARM) {
-                for (a = (address + 3u) & ~3u; a + 4u <= run_end; a += 4u) {
-                    uint32_t w = le32(bytes + a - le32(sh + 12));
-                    if ((w == 0xef000000u || (w & 0xffff0fffu) == 0xee1d0f70u)
-                        && found < capacity)
-                        out[found++] = a * 4u + 1u;
-                }
-            } else if (state == CODE_STATE_THUMB) {
-                uint32_t first = (address + 1u) & ~1u;
-                struct thumb_patch sites[64];
-                const uint16_t *code = (const uint16_t *)(bytes + first -
-                    le32(sh + 12));
-                size_t halfwords = (run_end - first) / 2u;
-                size_t done = 0;
-                /* thumb_scan in chunks; a chunk ends on a whole instruction. */
-                while (done < halfwords) {
-                    size_t chunk = halfwords - done > 4096 ? 4096 :
-                        halfwords - done;
-                    size_t n, k;
-                    if (done + chunk < halfwords &&
-                        thumb_is_32bit(code[done + chunk - 1])) {
-                        size_t i = done;
-                        while (i < done + chunk)
-                            i += thumb_is_32bit(code[i]) ? 2 : 1;
-                        chunk = i - done;
-                    }
-                    n = thumb_scan(code + done, chunk, sites, 64);
-                    for (k = 0; k < n && k < 64 && found < capacity; ++k)
-                        out[found++] = (first + (uint32_t)(done * 2u) +
-                            sites[k].offset) * 4u + 2u;
-                    done += chunk;
-                }
-            }
-            address = run_end;
-        }
-    }
-    return found;
-}
+#define read_file cm_read_file
+#define le32 cm_le32
+#define le16 cm_le16
+#define symtab_mapping cm_symtab_mapping
+#define patch_sites cm_patch_sites
 
 /* Patch sites of stripped (decoded) against full (its mapping symbols). */
 static void compare_pair(const char *full_path, const char *stripped_path,
@@ -799,71 +685,32 @@ static void compare_pair(const char *full_path, const char *stripped_path,
     size_t full_size, stripped_size;
     uint8_t *full = read_file(full_path, &full_size);
     uint8_t *stripped = read_file(stripped_path, &stripped_size);
-    static struct mapping_symbol truth[1u << 20];
-    static uint32_t want[1u << 16], got[1u << 16];
-    size_t truth_count, want_count, got_count, k;
-    struct code_map_result r;
+    struct cm_pair p;
 
     check(full != 0 && stripped != 0, "pair: readable");
-    if (full == 0 || stripped == 0) return;
-    truth_count = symtab_mapping(full, truth, 1u << 20);
-    want_count = patch_sites(full, truth, truth_count, want, 1u << 16);
-    printf("  mapping symbols %zu, patch sites %zu\n", truth_count, want_count);
-    check(code_map_from_elf(stripped, stripped_size, &r) == 0,
-        "pair: decoded");
-    if (r.refused)
-        printf("  refused at %#x\n", r.refused_address);
-    check(!r.refused, "pair: not refused");
-    got_count = patch_sites(stripped, r.symbols, r.symbol_count, got, 1u << 16);
-    check(got_count == want_count &&
-        memcmp(got, want, want_count * sizeof(want[0])) == 0,
-        "pair: same patch sites");
-    /* Byte by byte: code the symbols call data (a pool or table decoded
-       as instructions, where a false patch could land) must not happen;
-       code left undecoded is only coverage. */
-    {
-        unsigned count = le16(full + 48);
-        unsigned i;
-        size_t as_code_wrongly = 0, wrong_mode = 0, missed = 0, total = 0;
-        uint32_t first_wrong = 0;
-        for (i = 0; i < count; ++i) {
-            const uint8_t *sh = SHDR(full, i);
-            uint32_t a, end;
-            if (le32(sh + 4) != 1 || (le32(sh + 8) & 4u) == 0) continue;
-            end = le32(sh + 12) + le32(sh + 20);
-            for (a = le32(sh + 12); a < end; ++a) {
-                uint32_t e1, e2;
-                enum code_state t = mapping_state_at(truth, truth_count, a,
-                    end, &e1);
-                enum code_state d = mapping_state_at(r.symbols,
-                    r.symbol_count, a, end, &e2);
-                total++;
-                if (t == CODE_STATE_DATA && d != CODE_STATE_DATA) {
-                    if (as_code_wrongly++ == 0) first_wrong = a;
-                } else if (t != CODE_STATE_DATA && d != CODE_STATE_DATA &&
-                    t != d) {
-                    if (wrong_mode++ == 0 && first_wrong == 0) first_wrong = a;
-                } else if (t != CODE_STATE_DATA && d == CODE_STATE_DATA)
-                    missed++;
-            }
-        }
-        printf("  code bytes %zu: data decoded as code %zu, wrong mode %zu, "
-            "code left undecoded %zu (first wrong %#x)\n", total,
-            as_code_wrongly, wrong_mode, missed, first_wrong);
-        check(wrong_mode == 0, "pair: no code decoded in the wrong mode");
-        if (!allow_data_as_code)
-            check(as_code_wrongly == 0, "pair: no data decoded as code");
+    if (full == 0 || stripped == 0) {
+        free(full);
+        free(stripped);
+        return;
     }
-    for (k = 0; k < want_count || k < got_count; ++k)
-        if (k >= want_count || k >= got_count || want[k] != got[k]) {
-            printf("  first difference at site %zu: want %#x/%u got %#x/%u\n",
-                k, k < want_count ? want[k] / 4u : 0,
-                k < want_count ? want[k] % 4u : 0,
-                k < got_count ? got[k] / 4u : 0,
-                k < got_count ? got[k] % 4u : 0);
-            break;
-        }
-    code_map_result_free(&r);
+    check(cm_compare_pair(full, stripped, stripped_size, &p) == 0,
+        "pair: decoded");
+    printf("  mapping symbols %zu, patch sites %zu\n", p.truth_symbols,
+        p.want_sites);
+    if (p.refused)
+        printf("  refused at %#x\n", p.refused_address);
+    check(!p.refused, "pair: not refused");
+    check(p.same_sites, "pair: same patch sites");
+    printf("  code bytes %zu: data decoded as code %zu, wrong mode %zu, "
+        "code left undecoded %zu (first wrong %#x)\n", p.total,
+        p.data_as_code, p.wrong_mode, p.undecoded, p.first_wrong);
+    check(p.wrong_mode == 0, "pair: no code decoded in the wrong mode");
+    if (!allow_data_as_code)
+        check(p.data_as_code == 0, "pair: no data decoded as code");
+    if (p.first_difference >= 0)
+        printf("  first difference at site %ld: want %#x/%u got %#x/%u\n",
+            p.first_difference, p.want_at / 4u, p.want_at % 4u,
+            p.got_at / 4u, p.got_at % 4u);
     free(full);
     free(stripped);
 }

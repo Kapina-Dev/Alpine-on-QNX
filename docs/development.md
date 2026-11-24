@@ -289,8 +289,8 @@ runs both cases.
 The decoder (`src/code_map.c`) is pure and host-tested:
 
 ```sh
-gcc -std=gnu99 -Isrc -o build/code-map-test tests/code-map-test.c \
-    src/code_map.c src/thumb_decode.c
+gcc -std=gnu99 -Isrc -Itests -o build/code-map-test tests/code-map-test.c \
+    tests/code-map-compare.c src/code_map.c src/thumb_decode.c
 build/code-map-test                        # unit cases and the fixtures
 build/code-map-test UNSTRIPPED STRIPPED    # one pair against its symbols
 ```
@@ -300,6 +300,28 @@ unstripped file's mapping symbols, byte by byte: data decoded as code and
 code decoded in the wrong mode must both be 0 (code left undecoded is only
 coverage). Any ARM library with a symbol table and its `strip`ped copy
 works, for example one built on the laptop with `arm-linux-gnueabihf-gcc`.
+
+Android's own libraries are the larger check (Phase 4 part 4). On the
+laptop, `sh scripts/fetch-android-sysimg.sh` downloads Google's API 23
+armeabi-v7a emulator image (Android 6.0; SHA-1 checked), extracts
+`/system/bin`, `/system/lib` and `build.prop` to `build/android/system`
+and deletes the image; `sh scripts/fetch-android-ndk.sh` unpacks NDK
+r27c to `build/android/android-ndk-r27c`. Neither is ever committed. The
+survey runs the decoder over a whole tree:
+
+```sh
+gcc -std=gnu99 -O2 -Isrc -Itests -o build/code-map-survey \
+    tests/code-map-survey.c tests/code-map-compare.c src/code_map.c \
+    src/thumb_decode.c
+build/code-map-survey --pairs build/android/system
+```
+
+One `survey file=...` line per ARM ELF file: `refused`, `at` and
+`unsettled` describe the file as if fully stripped (the decoder ignores
+`.symtab`); `sites` is what Linuxemu patches (under the file's own mapping
+symbols when it has them, `-1` when refused). `--pairs` also compares
+every file that has mapping symbols (`libc.so`, `libart.so`) with its
+decoded map, like `code-map-test UNSTRIPPED STRIPPED`.
 
 SQLite is the real-world check. On the laptop,
 `sh scripts/fetch-sqlite-amalgamation.sh` fetches the pinned 3.54.1
