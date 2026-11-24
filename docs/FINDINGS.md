@@ -1699,3 +1699,11 @@ The decision is the user's. What the gate shows:
   the decoder, and it would add a bionic build to maintain.
 - What blocks `main()` is bionic's 16-bit thread ids, which a modified
   syscall layer doesn't touch; Phase 6's pid/tid virtualisation does.
+
+### Modified bionic: decision (user, 2026-11-24)
+
+**Patching alone.** The Android track runs stock bionic and stock
+libraries, patched by Linuxemu like any other guest code; Phase 9 does
+not ship a modified bionic. If a later phase finds code that patching
+can't reach safely (a refused library that matters, or a cost that
+patching can't meet), this decision is revisited with that evidence.

@@ -165,7 +165,8 @@ Android additions:
   intercepted.
 - Decision to record in `FINDINGS.md`: whether Part B also ships a **modified bionic**
   whose syscall stubs call the translator directly (belt and braces), or relies on
-  patching alone.
+  patching alone. **Decided 2026-11-24: patching alone** (`FINDINGS.md`, Phase 4
+  part 4).
 
 ## A5. Roadmap Phase 5 — synthetic procfs
 Implement as specified.

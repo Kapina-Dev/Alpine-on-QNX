@@ -787,7 +787,7 @@ work in ARM, Thumb, and mixed modes without modifying embedded data.
   `syscall()` calls are intercepted.
 - Record a decision in `FINDINGS.md`: either Phase 9 also ships a **modified
   bionic** whose syscall stubs call the translator directly, or the track relies
-  on patching alone.
+  on patching alone. **Decided 2026-11-24: patching alone** (Phase 4 part 4).
 
 ### Phase 4 part 1 status: done (2026-11-22)
 
@@ -948,8 +948,9 @@ decoder first, measured over a real Android `/system`.
 forever on a recursive mutex whose owner field holds a 16-bit thread id:
 the pid/tid virtualisation of Phase 6 (B0).
 
-**Modified bionic:** the evidence is in `FINDINGS.md` (2026-11-24); the
-decision is the user's (pending).
+**Modified bionic: decided, patching alone** (user, 2026-11-24). Phase 9
+ships stock bionic; the evidence and the decision are in `FINDINGS.md`
+(2026-11-24).
 
 **Gate results** (core `208d384375a16f64696fd5af013c186e74625b58c1212bb7875ec9b5bd9b40f6`): Android
 gate `android_gate_failures=0` (three runs, dynamic in the fallback);
