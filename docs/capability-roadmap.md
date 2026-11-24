@@ -919,6 +919,43 @@ same apps.
 **Next parts.** The Android gate items (AOSP 6.0.1 libraries through
 bionic's linker, a Thumb NDK binary) and the modified-bionic decision.
 
+### Phase 4 part 4 status: done (2026-11-24)
+
+The Android gate, on branch `phase4d-android-gate`. Design and plan:
+`docs/superpowers/specs/2026-11-24-phase4d-android-gate-design.md` and
+`docs/superpowers/plans/2026-11-24-phase4d-android-gate.md`. The user chose
+to stop at what start-up allows before Phase 6 and to fix and extend the
+decoder first, measured over a real Android `/system`.
+
+**What landed.**
+
+- Android 6.0's own `/system/bin/linker` loads libc, libm, libutils and
+  their seven dependencies from Google's API 23 image (Android 6.0, not
+  6.0.1: no 6.0.1 ARMv7 image exists; both API 23). Every file is
+  patched with exactly the laptop's patch-site count; nothing is
+  refused. A stripped static Thumb NDK program's raw `syscall()` and
+  inline Thumb `svc` are intercepted (`scripts/run-android-gate.sh`).
+- Decoder: interworking stubs, stale starts dropped after settling,
+  calls that never return, `.symtab` functions, addresses formed in code
+  (`ldr`/`movw`+`movt` + `add pc`, `bx`/`blx` on a known value). Survey
+  of the image (`tests/code-map-survey.c`): refusals 9 -> 7 of 339, 0
+  bytes in the wrong mode.
+- Linux ABI fixes the gate found: an interpreter's own `PT_INTERP` is
+  ignored; anonymous `mmap` ignores its fd; read-only private mappings of
+  ELF files are copied (QNX showed another file's bytes).
+
+**Not reached:** `main()` of a dynamic bionic program. liblog waits
+forever on a recursive mutex whose owner field holds a 16-bit thread id:
+the pid/tid virtualisation of Phase 6 (B0).
+
+**Modified bionic:** the evidence is in `FINDINGS.md` (2026-11-24); the
+decision is the user's (pending).
+
+**Gate results** (core `208d384375a16f64696fd5af013c186e74625b58c1212bb7875ec9b5bd9b40f6`): Android
+gate `android_gate_failures=0` (three runs, dynamic in the fallback);
+full device regression `linuxemu_full_regression_failures=0`; corpus 10
+of 11, the same apps.
+
 ## Phase 5: synthetic Linux procfs
 
 Do not expose a mounted QNX procfs as Linux `/proc`; its semantics and layouts

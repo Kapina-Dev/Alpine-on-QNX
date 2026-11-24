@@ -1576,3 +1576,104 @@ in fewer rounds.
 and corpus 10 of 11 (the same apps as in part 2), on core
 `50b74a6d781316483bf474a9e56188cf0915d55f3f87714e18e96388b7683d27` (after the final review's fixes) and on the core before them
 (`afe6095b…`).
+
+## 2026-11-24 — Phase 4 part 4: the Android gate (Passport, devuser; laptop host)
+
+**Inputs (checked):** Google's API 23 armeabi-v7a emulator image
+`armeabi-v7a-23_r06.zip` (SHA-1 `7cf2ad75…`) is **Android 6.0**, build
+3079352, not 6.0.1: Google published no 6.0.1 ARMv7 emulator image. Both
+are API 23. NDK r27c (SHA-1 `090e8083…`). Neither is committed:
+`scripts/fetch-android-sysimg.sh` and `scripts/fetch-android-ndk.sh`
+fetch them into `build/android/`.
+
+**Facts about the image:**
+- Only `libc.so` and `libart.so` keep mapping symbols; the other 216
+  libraries and `/system/bin/linker` don't. The linker keeps a `.symtab`
+  with 573 function symbols but no `$a`/`$t`/`$d`.
+- Android 6.0's libc and linker have **no "pid <= 65535" check**; the
+  abort the bionic probe hit came from NDK r27's `libc.a`.
+- GNU ld gives its Thumb->ARM stubs (`bx pc; nop`) no `$t`: libc's own
+  symbol table calls their first halfword ARM (207 stubs).
+- 41 libraries use Android's packed relocations (`SHT_ANDROID_REL`),
+  which the decoder doesn't read (coverage only; follow-up).
+
+**Decoder (`code-map-survey --pairs build/android/system`, 339 ARM ELF
+files, each decoded as if stripped):** refusals 9 -> 7 (the linker,
+`libOpenglSystemCommon` now decode; `bin/atrace`, `libart`, `libc`,
+`libEGL`, `libjavacore`, `libLLVM`, `libskia` still refused, and libc
+and libart load through their mapping symbols anyway). libc compared
+with its own symbols: code in the wrong mode 414 -> 0 bytes, data decoded
+as code 0, code left undecoded 28806 -> 12770 bytes. libart: wrong mode
+48 -> 0, data as code 854 -> 4 (an `sdiv` written as `.word` in ART's
+assembly, which runs but is marked `$d`). Changes:
+- `bx pc` at a word address goes to ARM at +4; a branch that changes
+  mode starts a function.
+- After the rounds settle, only starts the final decoding makes are kept
+  (an early round walking a pool as code had left a bogus start).
+- Calls to functions that never return (`__stack_chk_fail`, `abort`,
+  `__cxa_throw`, ... by `.dynsym` and PLT name) don't fall through into
+  the pool after them.
+- `.symtab` functions count as evidence when the table has no mapping
+  symbols (the linker).
+- Addresses formed in code (`ldr`/`movw`+`movt` then `add Rd, pc`, or
+  `bx`/`blx` on a known value: lld's long-branch thunk) are evidence:
+  odd ones weak Thumb starts, and one equal to an unwind-table start
+  gives it its mode. Part 3's refusal fixture formed its hidden
+  function's address that way, so it now decodes; the fixture is now
+  assembly with no evidence at all.
+
+**Linux ABI gaps the gate found (fixed):**
+- The loader refused an interpreter with its own `PT_INTERP`; Android's
+  linker names itself. Linux ignores it (`load_elf_interp`); so does
+  Linuxemu now.
+- Bionic's linker allocator maps anonymous memory with fd 0; Linux
+  ignores the fd, QNX rejected it (`EINVAL`).
+- The linker maps each library's header page read-only and
+  `MAP_PRIVATE`; on QNX that mapping intermittently showed another
+  file's bytes (the linker's own program headers in place of
+  `liblog.so`'s; a different library failed on each run). Read-only
+  private mappings of ELF files are now copied with `pread`, like the
+  writable and executable ones since 2026-11-21. Other read-only
+  mappings are unchanged.
+
+**Device gate (`scripts/run-android-gate.sh`, core
+`208d384375a16f64696fd5af013c186e74625b58c1212bb7875ec9b5bd9b40f6`):
+`android_gate_failures=0`, three runs out of three.**
+- Static, stripped Thumb NDK program with its own entry point: the NDK
+  `libc.a`'s `syscall()` (ARM `svc`), an inline Thumb `svc` and
+  `__errno`'s Thumb TLS read are patched (3 sites, as on the laptop);
+  output and exit 0 correct.
+- Dynamic Thumb program, `PT_INTERP /system/bin/linker`: the linker (60
+  sites) loads libc (232), libm, libutils, libbacktrace, libcutils,
+  liblog, libc++, libbase and libunwind, each patched with exactly the
+  laptop's count (292 in all, far below `MAX_PATCHES`); nothing refused;
+  libc's start-up code runs. `main()` is **not** reached: liblog, after
+  failing to reach logd, waits forever in `futex(FUTEX_WAIT_PRIVATE)` on
+  a recursive mutex whose owner field holds a 16-bit thread id
+  (`0x20ee4002`): bionic 6.0 keeps 16-bit tids and QNX tids are larger,
+  so the owner doesn't recognise itself. That is roadmap Phase 6 (pid
+  and tid virtualisation), the design's accepted fallback
+  (`android_gate_dynamic=fallback`).
+- Also seen, not fatal: old `sigaction` (NR 67, bionic's debuggerd
+  handlers) `ENOSYS`, `madvise` `ENOSYS`, `prctl(PR_SET_VMA)` `EINVAL`.
+- On the part 3 core (`50b74a6d…`) the gate fails: the static program is
+  refused and the linker fails to load (`Exec format error`).
+
+**Gate:** on the same core, full device regression
+`linuxemu_full_regression_failures=0` and corpus 10 of 11 (the same apps
+as in part 3; Node still fails at start-up).
+
+### Modified bionic: evidence
+
+The decision is the user's. What the gate shows:
+- Patching alone covered everything the linker loaded, including the
+  linker itself and libc's 232 sites, with no refusal and the laptop's
+  exact counts; libc keeps its mapping symbols, so its stubs never
+  needed decoding.
+- A modified bionic (syscall stubs calling the translator directly)
+  would change only libc's and the linker's stubs. It would not remove
+  the need to patch other libraries' inline system calls and TLS reads
+  (the NDK's `__errno` reads TPIDRURO inline), app native libraries, or
+  the decoder, and it would add a bionic build to maintain.
+- What blocks `main()` is bionic's 16-bit thread ids, which a modified
+  syscall layer doesn't touch; Phase 6's pid/tid virtualisation does.
