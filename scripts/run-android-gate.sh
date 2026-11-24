@@ -10,11 +10,12 @@
 # each file's patch sites as the laptop counted them (expected-sites.txt;
 # the largest patch-sites line per file: the linker also maps small
 # read-only pieces of a file), the static program's output and exit 0.
-# The dynamic program aims at main() (android_gate_dynamic=main); if
-# start-up stops past linking, it reports android_gate_dynamic=fallback
-# with the trace tail and passes on the other checks (the design's
-# accepted fallback: pids, tids and missing calls belong to later
-# phases). Not part of the full regression: the Android files aren't in
+# The dynamic program aims at main() (android_gate_dynamic=main). The
+# design's accepted fallback is start-up stopping past linking for a
+# later phase's reason; today that is liblog's futex wait on a 16-bit
+# owner tid (Phase 6), reported as android_gate_dynamic=fallback only
+# when both runs time out with a futex wait as the last call. Any other
+# stop (a crash, an exit) fails. Not part of the full regression: the Android files aren't in
 # the repo.
 set -u
 
@@ -151,7 +152,19 @@ else
     run trace /data/android-gate LINUXEMU_SYSTRACE=1
     echo "--- traced rerun: exit $(cat "$work/trace.status"), last 20 lines"
     tail -20 "$work/trace.err"
-    echo "android_gate_dynamic=fallback"
+    # The accepted fallback is the known Phase 6 stop only: both runs
+    # still waiting when killed, the trace's last call a futex wait
+    # (bionic's 16-bit owner tids). A crash or any other end fails.
+    last_call=$(grep "syscall=" "$work/trace.err" | tail -1 |
+        sed 's/.*syscall=\(0x[0-9a-f]*\).*/\1/')
+    if [ "$status" -eq 124 ] && [ "$(cat "$work/trace.status")" -eq 124 ] &&
+        [ "$last_call" = "0x000000f0" ]; then
+        echo "android_gate_dynamic=fallback"
+    else
+        echo "dynamic stop=unexpected (exit $status, last call $last_call)"
+        echo "android_gate_dynamic=failed"
+        failures=$((failures + 1))
+    fi
 fi
 
 echo "android_gate_failures=$failures"

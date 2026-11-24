@@ -1663,6 +1663,28 @@ assembly, which runs but is marked `$d`). Changes:
 `linuxemu_full_regression_failures=0` and corpus 10 of 11 (the same apps
 as in part 3; Node still fails at start-up).
 
+**Final review follow-ups (open):**
+- The cause of the wrong header page is unknown. It is the second sighting
+  of QNX `MAP_PRIVATE` file mappings showing wrong bytes (first:
+  2026-11-21). The gate re-extracts its root before every run, so stale
+  pages of a reused inode are a candidate. Only ELF files are copied now:
+  read-only private mappings of other files (ICU data, locale archives,
+  git packs) are still mapped from the file and may be exposed the same
+  way. A device check (re-extract, then compare `mmap` with `pread` of a
+  non-ELF file) would tell.
+- `code-map-survey --pairs-symtab` hides a file's mapping symbols so its
+  `.symtab` functions are the evidence: libc and libart decode with 0
+  bytes in the wrong mode and the same patch sites. It also showed a
+  pre-existing hazard: a stripped file with **no Thumb evidence** still
+  gets part 1's ARM-only scan over its whole code sections, literal pools
+  included. Our own `stripped-compare-armhf` keeps `0xef000000` (an `svc`
+  pattern) as data at 0xfd8; a stripped copy would have that word
+  patched. Unchanged by part 4 (files without Thumb evidence are patched
+  as before); decoding ARM-only stripped files is a separate decision.
+- Decoding is 2-3.5x slower than part 3's on large files (libart 0.7 s ->
+  2.5 s on the laptop, reaching the 8-prune limit): each prune drops one
+  level of stale starts. Pruning transitively would fix it.
+
 ### Modified bionic: evidence
 
 The decision is the user's. What the gate shows:

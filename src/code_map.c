@@ -610,8 +610,10 @@ static int thumb_may_write(const uint16_t *code, unsigned width, unsigned r)
         if ((hw0 & 0xfc00u) == 0x4400u)     /* high-register add/mov/cmp */
             return (((hw0 >> 4) & 8u) | (hw0 & 7u)) == r;
         if ((hw0 & 0xf000u) == 0xb000u || (hw0 & 0xf000u) == 0xc000u)
+            /* push/pop, ldm/stm lists; and Rd in bits 0-2 (sxth, uxtb,
+               rev, ... in the 0xb000 block). */
             return r < 8u ? (hw0 & (1u << r)) != 0 ||
-                ((hw0 >> 8) & 7u) == r : 0; /* push/pop, ldm/stm */
+                ((hw0 >> 8) & 7u) == r || (hw0 & 7u) == r : 0;
         return r < 8u && ((hw0 & 7u) == r || ((hw0 >> 8) & 7u) == r);
     }
     {
@@ -625,6 +627,11 @@ static int thumb_may_write(const uint16_t *code, unsigned width, unsigned r)
 
 static int arm_may_write(uint32_t word, unsigned r)
 {
+    unsigned rt = (word >> 12) & 0xfu;
+    /* ldrd / ldrexd also write Rt + 1. */
+    if (((word & 0x0e1000f0u) == 0x000000d0u ||
+            (word & 0x0ff000f0u) == 0x01b00090u) && rt + 1u == r)
+        return 1;
     if (((word >> 25) & 7u) == 4u)          /* ldm/stm */
         return (word & (1u << r)) != 0 || ((word >> 16) & 0xfu) == r;
     return ((word >> 12) & 0xfu) == r || ((word >> 16) & 0xfu) == r;

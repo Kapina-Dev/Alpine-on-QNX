@@ -954,7 +954,10 @@ decision is the user's (pending).
 **Gate results** (core `208d384375a16f64696fd5af013c186e74625b58c1212bb7875ec9b5bd9b40f6`): Android
 gate `android_gate_failures=0` (three runs, dynamic in the fallback);
 full device regression `linuxemu_full_regression_failures=0`; corpus 10
-of 11, the same apps.
+of 11, the same apps. After the final review's fixes (core
+`63f0f7c13551e0fe2fdb41ade6d459c5e5eed8c916d1ba7f7838adc48fe1242d`): Android gate
+`android_gate_failures=0`, `run-loader-process-stress` and
+`run-linuxemu-smoke` 0 failures.
 
 ## Phase 5: synthetic Linux procfs
 

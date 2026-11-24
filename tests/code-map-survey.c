@@ -11,6 +11,8 @@
  * else under the decoded map (-1 when refused): what Linuxemu patches.
  * With --pairs, files with mapping symbols are also compared with their
  * decoded map (pair file=... wrong_mode= data_as_code= undecoded=).
+ * With --pairs-symtab, they are compared again with their mapping symbols
+ * hidden, so their .symtab functions are the evidence (symtab-pair ...).
  *
  * Build: gcc -std=gnu99 -O2 -Isrc -Itests -o build/code-map-survey \
  *   tests/code-map-survey.c tests/code-map-compare.c src/code_map.c \
@@ -27,6 +29,36 @@
 #include <sys/stat.h>
 
 static int pairs;
+static int pairs_symtab;
+
+/* A copy of file whose mapping symbols are renamed ("$a" -> "Xa"), so
+   code_map_from_elf takes its .symtab functions as evidence (the
+   linker's case) while the original still holds the truth. */
+static uint8_t *hide_mapping_symbols(const uint8_t *file, size_t size)
+{
+    uint8_t *copy = malloc(size);
+    unsigned count = cm_le16(file + 48), i;
+    if (copy == 0) return 0;
+    memcpy(copy, file, size);
+    for (i = 0; i < count; ++i) {
+        const uint8_t *sh = file + cm_le32(file + 32) + 40u * i;
+        uint32_t offset, entries, j, strings;
+        if (cm_le32(sh + 4) != 2) continue;
+        offset = cm_le32(sh + 16);
+        entries = cm_le32(sh + 20) / 16u;
+        strings = cm_le32(file + cm_le32(file + 32) + 40u *
+            cm_le32(sh + 24) + 16);
+        for (j = 0; j < entries; ++j) {
+            uint32_t name = strings + cm_le32(file + offset + 16u * j);
+            enum code_state state;
+            if (name < size && file[name] == '$' &&
+                memchr(file + name, 0, size - name) != 0 &&
+                mapping_symbol_state((const char *)file + name, &state))
+                copy[name] = 'X';
+        }
+    }
+    return copy;
+}
 static size_t root_length;
 static unsigned files, refused_files, no_thumb_files;
 
@@ -77,6 +109,20 @@ static void survey(const char *path)
                 name, p.wrong_mode, p.data_as_code, p.undecoded, p.stub_bytes,
                 (unsigned)p.first_wrong, p.same_sites);
     }
+    if (pairs_symtab && own != 0) {
+        uint8_t *hidden = hide_mapping_symbols(file, size);
+        struct cm_pair p;
+        if (hidden != 0 && cm_compare_pair(file, hidden, size, &p) == 0)
+            printf("symtab-pair file=%s wrong_mode=%zu data_as_code=%zu "
+                "undecoded=%zu stub_bytes=%zu first_wrong=0x%x same_sites=%d"
+                " want_sites=%zu got_sites=%zu first_difference=%ld"
+                " want=0x%x/%u got=0x%x/%u\n",
+                name, p.wrong_mode, p.data_as_code, p.undecoded, p.stub_bytes,
+                (unsigned)p.first_wrong, p.same_sites, p.want_sites,
+                p.got_sites, p.first_difference, p.want_at / 4u,
+                p.want_at % 4u, p.got_at / 4u, p.got_at % 4u);
+        free(hidden);
+    }
     free(file);
 }
 
@@ -91,12 +137,13 @@ static int visit(const char *path, const struct stat *status, int type,
 int main(int argc, char **argv)
 {
     int i = 1;
-    if (i < argc && strcmp(argv[i], "--pairs") == 0) {
-        pairs = 1;
-        i++;
+    for (; i < argc && strncmp(argv[i], "--", 2) == 0; ++i) {
+        if (strcmp(argv[i], "--pairs") == 0) pairs = 1;
+        else if (strcmp(argv[i], "--pairs-symtab") == 0) pairs_symtab = 1;
+        else break;
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: code-map-survey [--pairs] DIR...\n");
+        fprintf(stderr, "usage: code-map-survey [--pairs] [--pairs-symtab] DIR...\n");
         return 2;
     }
     for (; i < argc; ++i) {

@@ -836,6 +836,48 @@ static void test_map_builder(void)
             "pcrel: clobbered register gives nothing");
         code_map_result_free(&r);
     }
+    /* (pcrel2b) Other writes between the load and the add: uxtb, rev,
+       sxth, revsh (Thumb 0xb2xx/0xbaxx, Rd in bits 0-2). */
+    {
+        static const uint16_t clobbers[] = { 0xb2c3 /* uxtb r3, r0 */,
+            0xba03 /* rev r3, r0 */, 0xb203 /* sxth r3, r0 */,
+            0xbac3 /* revsh r3, r0 */ };
+        size_t k;
+        int all = 1;
+        for (k = 0; k < sizeof(clobbers) / sizeof(clobbers[0]); ++k) {
+            uint16_t code[24];
+            struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 } };
+            struct code_map_result r;
+            memset(code, 0, sizeof(code));
+            code[0] = 0x4b02; code[1] = clobbers[k]; code[2] = 0x447b;
+            code[3] = 0x4798; code[4] = 0x4770; code[5] = 0xbf00;
+            code[6] = 0x0019;
+            code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+            r = build_thumb(code, 24, f, 1);
+            if (!(r.refused == 1 && state_at(&r, 0x1020) == CODE_STATE_DATA))
+                all = 0;
+            code_map_result_free(&r);
+        }
+        check(all, "pcrel: extend/reverse into the register gives nothing");
+    }
+    /* (pcrel2c) ARM: ldrd r2, r3, [r0] writes r3 (Rt + 1). */
+    {
+        uint16_t code[24];
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_ARM, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x300d; code[1] = 0xe300;  /* movw r3, #0xd */
+        code[2] = 0x3000; code[3] = 0xe340;  /* movt r3, #0 */
+        code[4] = 0x20d0; code[5] = 0xe1c0;  /* ldrd r2, r3, [r0] */
+        code[6] = 0x3003; code[7] = 0xe08f;  /* add r3, pc, r3 (pc 0x1014) */
+        code[8] = 0xff33; code[9] = 0xe12f;  /* blx r3 */
+        code[10] = 0xff1e; code[11] = 0xe12f; /* bx lr */
+        code[16] = 0x2714; code[17] = 0xdf00; code[18] = 0x4770;
+        r = build_thumb(code, 24, f, 1);
+        check(r.refused == 1 && state_at(&r, 0x1020) == CODE_STATE_DATA,
+            "pcrel: ARM ldrd into the register gives nothing");
+        code_map_result_free(&r);
+    }
     /* (pcrel3) The formed address is the function's own pool: nothing. */
     {
         uint16_t code[24];
@@ -1063,6 +1105,30 @@ static void test_fixture_files(void)
        symbols are evidence; hidden's svc is only known Thumb from it. */
     compare_pair("tests/fixtures/symtab-only-thumb.so",
         "tests/fixtures/symtab-only-thumb.nomap.so", 0);
+    /* A .symtab name offset near 2^32 must not read past the string
+       table (final review: name + 2 wrapped). */
+    {
+        size_t size;
+        uint8_t *file = read_file("tests/fixtures/symtab-only-thumb.nomap.so",
+            &size);
+        struct code_map_result r;
+        int ok = 0;
+        if (file != 0) {
+            unsigned count = le16(file + 48), i;
+            for (i = 0; i < count; ++i) {
+                const uint8_t *sh = file + le32(file + 32) + 40u * i;
+                if (le32(sh + 4) == 2 && le32(sh + 20) >= 32u) {
+                    uint8_t *symbol = file + le32(sh + 16) + 16u;
+                    symbol[0] = symbol[1] = symbol[2] = symbol[3] = 0xff;
+                    symbol[0] = 0xfe;
+                }
+            }
+            ok = code_map_from_elf(file, size, &r) == 0;
+            if (ok) code_map_result_free(&r);
+        }
+        check(ok, "fixtures: .symtab name offset near 2^32 is ignored");
+        free(file);
+    }
     /* Calls that never return, by name: abort and __stack_chk_fail's
        PLT entries (0x1f0, 0x1fc), not puts' (0x1e0 Thumb stub, 0x1e4). */
     {

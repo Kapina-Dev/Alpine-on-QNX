@@ -321,7 +321,9 @@ One `survey file=...` line per ARM ELF file: `refused`, `at` and
 `.symtab`); `sites` is what Linuxemu patches (under the file's own mapping
 symbols when it has them, `-1` when refused). `--pairs` also compares
 every file that has mapping symbols (`libc.so`, `libart.so`) with its
-decoded map, like `code-map-test UNSTRIPPED STRIPPED`.
+decoded map, like `code-map-test UNSTRIPPED STRIPPED`. `--pairs-symtab`
+compares them again with their mapping symbols hidden, so their `.symtab`
+functions are the evidence (the linker's case).
 
 The Android gate (Phase 4 part 4) runs Android's own linker and
 libraries on the device. On the laptop, after both fetch scripts,
