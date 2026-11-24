@@ -73,8 +73,8 @@ static void survey(const char *path)
         struct cm_pair p;
         if (cm_compare_pair(file, file, size, &p) == 0)
             printf("pair file=%s wrong_mode=%zu data_as_code=%zu "
-                "undecoded=%zu first_wrong=0x%x same_sites=%d\n", name,
-                p.wrong_mode, p.data_as_code, p.undecoded,
+                "undecoded=%zu stub_bytes=%zu first_wrong=0x%x same_sites=%d\n",
+                name, p.wrong_mode, p.data_as_code, p.undecoded, p.stub_bytes,
                 (unsigned)p.first_wrong, p.same_sites);
     }
     free(file);

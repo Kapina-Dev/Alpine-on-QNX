@@ -51,6 +51,11 @@ static void thumb16_info(uint16_t hw, uint32_t address, struct insn_info *out)
         set_target(out, FLOW_BRANCH, address + 4u +
             ((((uint32_t)hw >> 9) & 1u) << 6) + (((uint32_t)hw >> 2) & 0x3eu),
             1);
+    } else if (hw == 0x4778u && (address & 3u) == 0) {
+        /* bx pc at a word address: to ARM at address + 4 (the linker's
+           Thumb->ARM stub, bx pc; nop). At address % 4 == 2 the ARM target
+           would be unaligned (unpredictable): a stop like any bx. */
+        set_target(out, FLOW_JUMP, address + 4u, 0);
     } else if ((hw & 0xff80u) == 0x4700u) {
         out->flow = FLOW_STOP;          /* bx Rm */
     } else if ((hw & 0xff80u) == 0x4780u) {
@@ -329,6 +334,7 @@ enum byte_class { BYTE_UNDECODED = 0, BYTE_DATA, BYTE_ARM, BYTE_THUMB };
    the whole, in case they don't. */
 #define DATA_ROUNDS 8u
 #define MAX_ROUNDS 256u
+#define MAX_PRUNES 8u
 
 struct span {
     uint32_t start;
@@ -361,6 +367,9 @@ struct builder {
     uint8_t *next_data;
     uint8_t *reached;
     uint8_t *next_reached;
+    uint8_t *fresh;  /* marks this round's decoding made */
+    const uint32_t *noreturn; /* sorted: calls there don't return */
+    size_t noreturn_count;
     size_t span_capacity;
     uint32_t *work;
     size_t work_count;
@@ -393,11 +402,12 @@ static int any_data(const struct builder *b, size_t offset, size_t length)
     return 0;
 }
 
-/* Record what an instruction of the function [start, end) reads and
-   reaches. A branch out of the function is a tail call: it starts a
-   function like a call. */
+/* Record what an instruction of the function [start, end), decoded in
+   mode thumb, reads and reaches. A branch out of the function is a tail
+   call, and a branch that changes mode starts another function: both
+   start a function like a call. */
 static void note(struct builder *b, const struct insn_info *info,
-    uint32_t start, uint32_t end)
+    uint32_t start, uint32_t end, int thumb)
 {
     uint32_t i;
     if (info->literal_valid && (info->literal_size == 0 || b->weak_pass)) {
@@ -414,7 +424,8 @@ static void note(struct builder *b, const struct insn_info *info,
     }
     if (info->target_valid && in_section(b, info->target)) {
         uint8_t mark;
-        int outside = info->target < start || info->target >= end;
+        int outside = info->target < start || info->target >= end ||
+            info->target_thumb != thumb;
         if (b->weak_pass)
             mark = info->target_thumb ? REACHED_WEAK_THUMB : REACHED_WEAK_ARM;
         else if (info->flow == FLOW_CALL || outside)
@@ -423,7 +434,22 @@ static void note(struct builder *b, const struct insn_info *info,
             mark = info->target_thumb ? REACHED_BRANCH_THUMB :
                 REACHED_BRANCH_ARM;
         b->next_reached[info->target - b->base] |= mark;
+        b->fresh[info->target - b->base] |= mark;
     }
+}
+
+/* A call to address doesn't return (abort, __stack_chk_fail, ...). */
+static int is_noreturn(const struct builder *b, uint32_t address)
+{
+    size_t low = 0;
+    size_t high = b->noreturn_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (b->noreturn[middle] == address) return 1;
+        if (b->noreturn[middle] < address) low = middle + 1;
+        else high = middle;
+    }
+    return 0;
 }
 
 /* Work list of addresses still to decode in the current function. */
@@ -510,15 +536,18 @@ static void decode_thumb(struct builder *b, uint32_t start, uint32_t end)
             if (info.width == 4 && b->klass[offset + 2u] != BYTE_UNDECODED)
                 break;
             memset(b->klass + offset, BYTE_THUMB, info.width);
-            note(b, &info, start, end);
+            note(b, &info, start, end, 1);
             if (it_left > 0) it_left--;
             flow = info.flow;
+            if (flow == FLOW_CALL && info.target_valid &&
+                is_noreturn(b, info.target))
+                flow = FLOW_STOP;
             /* Inside an IT block a jump or return is conditional. */
             if (conditional && (flow == FLOW_JUMP || flow == FLOW_STOP))
                 flow = flow == FLOW_JUMP ? FLOW_BRANCH : FLOW_NEXT;
             if (info.it_length != 0) it_left = info.it_length;
-            if (info.target_valid && (flow == FLOW_BRANCH ||
-                    flow == FLOW_JUMP) &&
+            if (info.target_valid && info.target_thumb && (flow ==
+                    FLOW_BRANCH || flow == FLOW_JUMP) &&
                 followable(b, info.target, start, end))
                 push(b, info.target);
             if (flow == FLOW_JUMP || flow == FLOW_STOP) break;
@@ -589,7 +618,13 @@ static void decode_arm(struct builder *b, uint32_t start, uint32_t end)
             uint32_t address = b->base + (uint32_t)offset;
             arm_insn_info(read32(b->bytes + offset), address, &info);
             memset(b->klass + offset, BYTE_ARM, 4);
-            note(b, &info, start, end);
+            note(b, &info, start, end, 0);
+            /* An unconditional call that doesn't return (bl, or blx
+               imm, which is 0xfa/0xfb). */
+            if (info.flow == FLOW_CALL && info.target_valid &&
+                is_noreturn(b, info.target) &&
+                (read32(b->bytes + offset) >> 28) >= 0xeu)
+                break;
             if (info.target_valid && (info.flow == FLOW_BRANCH ||
                     info.flow == FLOW_JUMP) &&
                 followable(b, info.target, start, end))
@@ -758,6 +793,7 @@ static void decode_round(struct builder *b)
     memset(b->next_data, 0, b->size);
     /* Starts accumulate: a round only adds marks. */
     memcpy(b->next_reached, b->reached, b->size);
+    memset(b->fresh, 0, b->size);
     for (i = 0; i < b->span_count; ++i) {
         const struct span *f = &b->spans[i];
         b->weak_pass = f->weak;
@@ -769,7 +805,7 @@ static void decode_round(struct builder *b)
         if (b->data[i] == DATA_LOADED) b->klass[i] = BYTE_DATA;
         /* A target in bytes trusted as data came from data decoded as
            code somewhere: drop it, so it can't start a function. */
-        if (b->klass[i] == BYTE_DATA) b->next_reached[i] = 0;
+        if (b->klass[i] == BYTE_DATA) b->next_reached[i] = b->fresh[i] = 0;
     }
 }
 
@@ -825,10 +861,20 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     struct code_function *functions, size_t function_count,
     struct code_map_result *out)
 {
+    return code_map_build_noreturn(bytes, base, size, functions,
+        function_count, 0, 0, out);
+}
+
+int code_map_build_noreturn(const uint8_t *bytes, uint32_t base, size_t size,
+    struct code_function *functions, size_t function_count,
+    const uint32_t *noreturn, size_t noreturn_count,
+    struct code_map_result *out)
+{
     struct builder b;
     size_t allocation = size ? size : 1;
     unsigned data_rounds;
     unsigned round;
+    unsigned prunes = 0;
     size_t i;
     long site;
     int result = -1;
@@ -848,21 +894,35 @@ int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     }
     b.initial = functions;
     b.initial_count = function_count;
+    b.noreturn = noreturn;
+    b.noreturn_count = noreturn_count;
     b.klass = malloc(allocation);
     b.data = calloc(allocation, 1);
     b.next_data = malloc(allocation);
     b.reached = calloc(allocation, 1);
     b.next_reached = malloc(allocation);
+    b.fresh = malloc(allocation);
     if (b.klass == 0 || b.data == 0 || b.next_data == 0 ||
-        b.reached == 0 || b.next_reached == 0) goto done;
+        b.reached == 0 || b.next_reached == 0 || b.fresh == 0) goto done;
 
     for (data_rounds = 0, round = 0;; ++round) {
         int reached_changed;
         decode_round(&b);
         if (b.failed) goto done;
         reached_changed = memcmp(b.reached, b.next_reached, size) != 0;
-        if (!reached_changed && memcmp(b.data, b.next_data, size) == 0)
-            break;
+        if (!reached_changed && memcmp(b.data, b.next_data, size) == 0) {
+            /* Settled. Starts accumulate, so a start that only bytes
+               later found to be data gave (a pool walked as code in an
+               early round) is still here: keep only the starts the final
+               decoding makes, and settle again. */
+            if (prunes == MAX_PRUNES ||
+                memcmp(b.reached, b.fresh, size) == 0)
+                break;
+            prunes++;
+            memcpy(b.reached, b.fresh, size);
+            data_rounds = 0;
+            continue;
+        }
         if (reached_changed) data_rounds = 0;
         if ((!reached_changed && ++data_rounds == DATA_ROUNDS) ||
             round + 1u == MAX_ROUNDS) {
@@ -902,6 +962,7 @@ done:
     free(b.next_data);
     free(b.reached);
     free(b.next_reached);
+    free(b.fresh);
     free(b.work);
     return result;
 }
@@ -930,6 +991,7 @@ void code_map_result_free(struct code_map_result *result)
 #define DT_INIT_ 12u
 #define DT_FINI_ 13u
 #define R_ARM_RELATIVE_ 23u
+#define R_ARM_JUMP_SLOT_ 22u
 
 struct elf_view {
     const uint8_t *file;
@@ -1204,7 +1266,8 @@ static enum fn_mode evidence_mode(const struct evidence_list *modes,
 
 static int decode_section(const struct elf_view *e, unsigned index,
     const struct evidence_list *starts, const struct evidence_list *modes,
-    const struct evidence_list *weak, struct code_map_result *out)
+    const struct evidence_list *weak, const uint32_t *noreturn,
+    size_t noreturn_count, struct code_map_result *out)
 {
     uint32_t base = sh_field(e, index, 12);
     uint32_t size = sh_field(e, index, 20);
@@ -1260,8 +1323,8 @@ static int decode_section(const struct elf_view *e, unsigned index,
             count++;
         }
     }
-    result = code_map_build(e->file + sh_field(e, index, 16), base, size,
-        functions, count, &section);
+    result = code_map_build_noreturn(e->file + sh_field(e, index, 16), base,
+        size, functions, count, noreturn, noreturn_count, &section);
     free(functions);
     if (result != 0) return -1;
     if (section.unsettled) out->unsettled = 1;
@@ -1283,6 +1346,178 @@ static int decode_section(const struct elf_view *e, unsigned index,
     return 0;
 }
 
+/* Functions that never return, by name. A name listed wrongly only costs
+   coverage (the code after the call stays undecoded), never a patch. */
+static const char *const noreturn_names[] = {
+    "__stack_chk_fail", "abort", "exit", "_exit", "_Exit", "__assert",
+    "__assert2", "__assert_fail", "__cxa_throw", "__cxa_rethrow",
+    "__cxa_pure_virtual", "__cxa_deleted_virtual", "__cxa_bad_cast",
+    "__cxa_bad_typeid", "__cxa_call_unexpected", "_Unwind_Resume",
+    "longjmp", "_longjmp", "siglongjmp", "pthread_exit",
+    "__fortify_chk_fail", "__libc_fatal", "__android_log_assert",
+    "_ZSt9terminatev",
+};
+
+static int noreturn_name(const struct elf_view *e, unsigned strings,
+    uint32_t name)
+{
+    uint32_t offset = sh_field(e, strings, 16);
+    uint32_t size = sh_field(e, strings, 20);
+    size_t i;
+    if (name >= size || !in_file(e, offset, size)) return 0;
+    for (i = 0; i < sizeof(noreturn_names) / sizeof(noreturn_names[0]); ++i) {
+        size_t length = strlen(noreturn_names[i]) + 1u;
+        if (length <= size - name &&
+            memcmp(e->file + offset + name, noreturn_names[i], length) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static uint32_t arm_immediate(uint32_t word)
+{
+    uint32_t value = word & 0xffu;
+    unsigned rotate = ((word >> 8) & 0xfu) * 2u;
+    return rotate ? (value >> rotate) | (value << (32u - rotate)) : value;
+}
+
+/* Link addresses (no Thumb bit) that a call to never returns: .dynsym
+   functions with a listed name, and the PLT entries (and their Thumb
+   bx pc stubs) whose R_ARM_JUMP_SLOT names one. Returns how many exist;
+   writes at most capacity. */
+static size_t noreturn_targets(const struct elf_view *e, uint32_t *out,
+    size_t capacity)
+{
+    size_t found = 0;
+    unsigned dynsym = e->section_count;
+    unsigned i;
+    uint32_t j;
+
+    for (i = 0; i < e->section_count; ++i)
+        if (sh_field(e, i, 4) == SHT_DYNSYM_) dynsym = i;
+    if (dynsym == e->section_count) return 0;
+    {
+        uint32_t offset = sh_field(e, dynsym, 16);
+        uint32_t size = sh_field(e, dynsym, 20);
+        unsigned strings = sh_field(e, dynsym, 24);
+        if (!in_file(e, offset, size) || strings >= e->section_count)
+            return 0;
+        for (j = 0; j + 16u <= size; j += 16u) {
+            const uint8_t *symbol = e->file + offset + j;
+            uint16_t index = read16(symbol + 14);
+            if ((symbol[12] & 0xfu) != STT_FUNC_ || index == 0 ||
+                index >= 0xff00u ||
+                !noreturn_name(e, strings, read32(symbol)))
+                continue;
+            if (found < capacity) out[found] = read32(symbol + 4) & ~1u;
+            found++;
+        }
+    }
+    for (i = 0; i < e->section_count; ++i) {
+        uint32_t plt_base, plt_size, plt_offset, p;
+        if (!section_named(e, i, ".plt")) continue;
+        plt_base = sh_field(e, i, 12);
+        plt_size = sh_field(e, i, 20);
+        plt_offset = sh_field(e, i, 16);
+        if (!in_file(e, plt_offset, plt_size)) continue;
+        /* add ip, pc, #a; add ip, ip, #b; ldr pc, [ip, #c]! */
+        for (p = 0; p + 12u <= plt_size; p += 4u) {
+            uint32_t w0 = read32(e->file + plt_offset + p);
+            uint32_t w1 = read32(e->file + plt_offset + p + 4u);
+            uint32_t w2 = read32(e->file + plt_offset + p + 8u);
+            uint32_t got;
+            unsigned r;
+            int named = 0;
+            if ((w0 & 0xfffff000u) != 0xe28fc000u ||
+                (w1 & 0xfffff000u) != 0xe28cc000u ||
+                (w2 & 0xfffff000u) != 0xe5bcf000u) continue;
+            got = plt_base + p + 8u + arm_immediate(w0) + arm_immediate(w1) +
+                (w2 & 0xfffu);
+            for (r = 0; r < e->section_count && !named; ++r) {
+                uint32_t offset = sh_field(e, r, 16);
+                uint32_t size = sh_field(e, r, 20);
+                unsigned strings = sh_field(e, dynsym, 24);
+                uint32_t k;
+                if (sh_field(e, r, 4) != SHT_REL_ ||
+                    sh_field(e, r, 24) != dynsym ||
+                    !in_file(e, offset, size)) continue;
+                for (k = 0; k + 8u <= size; k += 8u) {
+                    uint32_t info = read32(e->file + offset + k + 4u);
+                    uint32_t symbol = info >> 8;
+                    if ((info & 0xffu) != R_ARM_JUMP_SLOT_ ||
+                        read32(e->file + offset + k) != got) continue;
+                    if ((symbol + 1u) * 16u <= sh_field(e, dynsym, 20))
+                        named = noreturn_name(e, strings, read32(e->file +
+                            sh_field(e, dynsym, 16) + symbol * 16u));
+                    break;
+                }
+            }
+            if (!named) continue;
+            if (found < capacity) out[found] = plt_base + p;
+            found++;
+            if (p >= 4u && read16(e->file + plt_offset + p - 4u) == 0x4778u) {
+                if (found < capacity) out[found] = plt_base + p - 4u;
+                found++;
+            }
+        }
+    }
+    return found;
+}
+
+static int compare_u32(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+static int elf_open(const uint8_t *file, size_t file_size, struct elf_view *e)
+{
+    uint32_t shoff;
+    if (file_size < EHDR_SIZE || memcmp(file, "\177ELF\001\001", 6) != 0 ||
+        read16(file + 18) != 40u /* EM_ARM */ ||
+        read16(file + 46) != SHDR_SIZE) return 0;
+    e->file = file;
+    e->size = file_size;
+    e->section_count = read16(file + 48);
+    shoff = read32(file + 32);
+    if (e->section_count == 0 ||
+        !in_file(e, shoff, e->section_count * SHDR_SIZE)) return 0;
+    e->sections = file + shoff;
+    return 1;
+}
+
+/* Sorted, unique noreturn targets in a malloc'd array (0 when none). */
+static uint32_t *noreturn_list(const struct elf_view *e, size_t *count)
+{
+    size_t n = noreturn_targets(e, 0, 0);
+    size_t i, unique = 0;
+    uint32_t *list;
+    *count = 0;
+    if (n == 0) return 0;
+    list = malloc(n * sizeof(*list));
+    if (list == 0) return 0;
+    noreturn_targets(e, list, n);
+    qsort(list, n, sizeof(*list), compare_u32);
+    for (i = 0; i < n; ++i)
+        if (unique == 0 || list[unique - 1] != list[i]) list[unique++] = list[i];
+    *count = unique;
+    return list;
+}
+
+size_t code_map_noreturn(const uint8_t *file, size_t file_size,
+    uint32_t *out, size_t capacity)
+{
+    struct elf_view e;
+    size_t count, i;
+    uint32_t *list;
+    if (!elf_open(file, file_size, &e)) return 0;
+    list = noreturn_list(&e, &count);
+    for (i = 0; i < count && i < capacity; ++i) out[i] = list[i];
+    free(list);
+    return count;
+}
+
 int code_map_from_elf(const uint8_t *file, size_t file_size,
     struct code_map_result *out)
 {
@@ -1290,7 +1525,8 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
     struct evidence_list starts;
     struct evidence_list modes;
     struct evidence_list weak;
-    uint32_t shoff;
+    uint32_t *noreturn = 0;
+    size_t noreturn_count = 0;
     size_t i;
     int thumb = 0;
     int result = -1;
@@ -1299,16 +1535,7 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
     memset(&starts, 0, sizeof(starts));
     memset(&modes, 0, sizeof(modes));
     memset(&weak, 0, sizeof(weak));
-    if (file_size < EHDR_SIZE || memcmp(file, "\177ELF\001\001", 6) != 0 ||
-        read16(file + 18) != 40u /* EM_ARM */ ||
-        read16(file + 46) != SHDR_SIZE) return 0;
-    e.file = file;
-    e.size = file_size;
-    e.section_count = read16(file + 48);
-    shoff = read32(file + 32);
-    if (e.section_count == 0 ||
-        !in_file(&e, shoff, e.section_count * SHDR_SIZE)) return 0;
-    e.sections = file + shoff;
+    if (!elf_open(file, file_size, &e)) return 0;
 
     gather(&e, &starts, &modes, &weak);
     if (starts.failed || modes.failed || weak.failed) goto done;
@@ -1320,9 +1547,11 @@ int code_map_from_elf(const uint8_t *file, size_t file_size,
         goto done;
     }
     qsort(modes.items, modes.count, sizeof(*modes.items), compare_evidence);
+    noreturn = noreturn_list(&e, &noreturn_count);
     for (i = 0; i < e.section_count; ++i) {
         if (!code_section_at(&e, (unsigned)i)) continue;
-        if (decode_section(&e, (unsigned)i, &starts, &modes, &weak, out) != 0) {
+        if (decode_section(&e, (unsigned)i, &starts, &modes, &weak,
+                noreturn, noreturn_count, out) != 0) {
             code_map_result_free(out);
             goto done;
         }
@@ -1334,5 +1563,6 @@ done:
     free(starts.items);
     free(modes.items);
     free(weak.items);
+    free(noreturn);
     return result;
 }

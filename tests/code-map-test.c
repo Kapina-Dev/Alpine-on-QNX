@@ -320,6 +320,20 @@ static struct code_map_result build_thumb(const uint16_t *code, size_t halfwords
     return result;
 }
 
+static struct code_map_result build_thumb_noreturn(const uint16_t *code,
+    size_t halfwords, struct code_function *functions, size_t count,
+    const uint32_t *noreturn, size_t noreturn_count)
+{
+    struct code_map_result result;
+    uint8_t bytes[256];
+    memcpy(bytes, code, halfwords * 2u);
+    memset(&result, 0, sizeof(result));
+    if (code_map_build_noreturn(bytes, 0x1000, halfwords * 2u, functions,
+            count, noreturn, noreturn_count, &result) != 0)
+        result.refused = -1;
+    return result;
+}
+
 static enum code_state state_at(const struct code_map_result *result,
     uint32_t address)
 {
@@ -669,6 +683,116 @@ static void test_map_builder(void)
             state_at(&r, 0x1020) == CODE_STATE_ARM, "map q: cases are ARM");
         code_map_result_free(&r);
     }
+    /* (stub) A linker-made Thumb->ARM stub (bx pc; nop, then ARM
+       ldr ip, [pc]; add pc, ip, pc and its offset word) right after an
+       ARM function, inside that function's merged unwind range, reached
+       by a Thumb b.w (Android libc's __udivdi3+0x110). */
+    {
+        uint16_t code[] = {
+            0x0000, 0xe1a0 /* 0x1000 arm nop */,
+            0xff1e, 0xe12f /* 0x1004 arm bx lr */,
+            0x4778, 0x46c0 /* 0x1008 thumb bx pc; nop */,
+            0xc000, 0xe59f /* 0x100c arm ldr ip, [pc] */,
+            0xf00f, 0xe08c /* 0x1010 arm add pc, ip, pc */,
+            0x0000, 0xef00 /* 0x1014 offset word (an svc pattern) */,
+            0xf7ff, 0xbff6 /* 0x1018 thumb b.w 0x1008 */,
+            0x4770, 0xbf00 /* 0x101c */ };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_ARM, 0 },
+            { 0x1018, 0x1020, MODE_THUMB, 0 } };
+        struct code_map_result r = build_thumb(code, 16, f, 2);
+        check(r.refused == 0, "stub: thumb b.w to bx-pc stub, not refused");
+        check(state_at(&r, 0x1008) == CODE_STATE_THUMB &&
+            state_at(&r, 0x100c) == CODE_STATE_ARM &&
+            state_at(&r, 0x1010) == CODE_STATE_ARM &&
+            state_at(&r, 0x1014) == CODE_STATE_DATA,
+            "stub: thumb bl to bx-pc stub after an ARM function");
+        code_map_result_free(&r);
+    }
+    /* (stub2) The same halfwords at a non-word-aligned address are not a
+       stub: no ARM function starts 4 bytes on. */
+    {
+        uint16_t code[] = {
+            0x0000, 0xe1a0 /* 0x1000 arm nop */,
+            0xff1e, 0xe12f /* 0x1004 arm bx lr */,
+            0xbf00, 0x4778 /* 0x100a thumb bx pc */,
+            0x46c0, 0xc000 /* 0x100e would be "ARM" here */,
+            0xe59f, 0xbf00,
+            0x0000, 0x0000,
+            0xf7ff, 0xbff7 /* 0x1018 thumb b.w 0x100a */,
+            0x4770, 0xbf00 };
+        struct code_function f[] = { { 0x1000, 0x1018, MODE_ARM, 0 },
+            { 0x1018, 0x1020, MODE_THUMB, 0 } };
+        struct code_map_result r = build_thumb(code, 16, f, 2);
+        check(state_at(&r, 0x100e) != CODE_STATE_ARM,
+            "stub: misaligned bx pc is not a stub");
+        code_map_result_free(&r);
+    }
+    /* (v) Round 1 falls through a call into a pool the function loads
+       (a call that doesn't return, like __stack_chk_fail) and decodes a
+       pool word as bl X. Round 2 knows the pool is data; X, a start only
+       that data gave, must go, or X's own unloaded pool (an svc pattern)
+       gets decoded as code (libart's art_quick_deoptimize). */
+    {
+        uint16_t code[34];
+        struct code_function f[] = { { 0x1000, 0x100c, MODE_THUMB, 0 },
+            { 0x1040, 0x1044, MODE_THUMB, 0 } };
+        struct code_map_result r;
+        memset(code, 0, sizeof(code));
+        code[0] = 0x4801;                     /* ldr r0, [pc, #4] -> 0x1008 */
+        code[1] = 0xf000; code[2] = 0xf81d;   /* bl 0x1040 */
+        code[3] = 0xbf00;
+        code[4] = 0xf000; code[5] = 0xf80a;   /* pool word = bl 0x1020 */
+        code[16] = 0xf000; code[17] = 0xf80e; /* X: bl 0x1040 */
+        code[18] = 0xdf00;                    /* X's pool: a pattern */
+        code[32] = 0x4770; code[33] = 0xbf00; /* 0x1040: bx lr */
+        r = build_thumb(code, 34, f, 2);
+        check(state_at(&r, 0x1008) == CODE_STATE_DATA,
+            "map v: loaded pool is data");
+        check(state_at(&r, 0x1020) == CODE_STATE_DATA &&
+            state_at(&r, 0x1024) == CODE_STATE_DATA,
+            "map v: a start found only in data decoded as code is dropped");
+        check(r.refused == 1 && r.refused_address == 0x1024,
+            "map v: the unclassified pattern refuses");
+        code_map_result_free(&r);
+    }
+    /* (w) A call to a function that never returns (__stack_chk_fail
+       through the PLT) is followed by a pool nothing decoded loads: no
+       fall through into it. Outside an IT block only. */
+    {
+        uint16_t code[] = {
+            0xf000, 0xf81e /* 0x1000 bl 0x1040 */,
+            0xdf00, 0x0000 /* 0x1004 pool word with a pattern */,
+            0xbf00, 0xbf00, 0xbf00, 0xbf00 };
+        uint16_t all[34];
+        uint32_t noreturn[] = { 0x1040 };
+        struct code_function f[] = { { 0x1000, 0x1010, MODE_THUMB, 0 },
+            { 0x1040, 0x1044, MODE_THUMB, 0 } };
+        struct code_map_result r;
+        memset(all, 0, sizeof(all));
+        memcpy(all, code, sizeof(code));
+        all[32] = 0x4770; all[33] = 0xbf00;
+        r = build_thumb_noreturn(all, 34, f, 2, noreturn, 1);
+        check(state_at(&r, 0x1000) == CODE_STATE_THUMB &&
+            state_at(&r, 0x1004) == CODE_STATE_DATA,
+            "map w: no fall through after a call that doesn't return");
+        check(r.refused == 1 && r.refused_address == 0x1004,
+            "map w: the pool's pattern refuses");
+        code_map_result_free(&r);
+        r = build_thumb_noreturn(all, 34, f, 2, 0, 0);
+        check(state_at(&r, 0x1004) == CODE_STATE_THUMB,
+            "map w: an ordinary call falls through");
+        code_map_result_free(&r);
+        /* itt eq; bleq 0x1040 ... : conditional, falls through */
+        memset(all, 0, sizeof(all));
+        all[0] = 0xbf08; /* it eq */
+        all[1] = 0xf000; all[2] = 0xf81d; /* bleq 0x1040 (from 0x1002) */
+        all[3] = 0xdf00;
+        all[32] = 0x4770; all[33] = 0xbf00;
+        r = build_thumb_noreturn(all, 34, f, 2, noreturn, 1);
+        check(state_at(&r, 0x1006) == CODE_STATE_THUMB,
+            "map w: a conditional call that doesn't return falls through");
+        code_map_result_free(&r);
+    }
 }
 /* ---- whole files: stripped fixtures against their unstripped twins ---- */
 
@@ -785,6 +909,17 @@ static void test_fixture_files(void)
     compare_pair("tests/fixtures/odd-pointer-arm.so",
         "tests/fixtures/odd-pointer-arm.stripped.so", 1);
 
+    /* Calls that never return, by name: abort and __stack_chk_fail's
+       PLT entries (0x1f0, 0x1fc), not puts' (0x1e0 Thumb stub, 0x1e4). */
+    {
+        size_t size;
+        uint8_t *file = read_file("tests/fixtures/noreturn-plt-arm.so", &size);
+        uint32_t found[8];
+        size_t n = file ? code_map_noreturn(file, size, found, 8) : 0;
+        check(n == 2 && found[0] == 0x1f0 && found[1] == 0x1fc,
+            "fixtures: noreturn PLT entries by name");
+        free(file);
+    }
     /* Not an ELF file: nothing. */
     check(code_map_from_elf((const uint8_t *)"hello", 5, &r) == 0 &&
         r.symbol_count == 0 && !r.refused, "fixtures: non-ELF ignored");

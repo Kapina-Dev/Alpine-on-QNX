@@ -125,6 +125,17 @@ size_t cm_patch_sites(const uint8_t *file,
     return found;
 }
 
+/* a lies in the bx pc halfword of a word-aligned bx pc; nop stub. */
+static int stub_byte(const uint8_t *file, const uint8_t *sh, uint32_t a)
+{
+    uint32_t w = a & ~3u;
+    uint32_t base = cm_le32(sh + 12);
+    const uint8_t *p = file + cm_le32(sh + 16) + (w - base);
+    if (w < base || w + 4u > base + cm_le32(sh + 20) || a - w >= 2u)
+        return 0;
+    return cm_le16(p) == 0x4778u && cm_le16(p + 2) == 0x46c0u;
+}
+
 int cm_compare_pair(const uint8_t *full, const uint8_t *stripped,
     size_t stripped_size, struct cm_pair *out)
 {
@@ -172,6 +183,11 @@ int cm_compare_pair(const uint8_t *full, const uint8_t *stripped,
             out->total++;
             if (t == CODE_STATE_DATA && d != CODE_STATE_DATA) {
                 if (out->data_as_code++ == 0) out->first_wrong = a;
+            } else if (t == CODE_STATE_ARM && d == CODE_STATE_THUMB &&
+                stub_byte(full, sh, a)) {
+                /* Linkers give their Thumb->ARM stubs no $t: the truth
+                   is wrong there, not the decoding. */
+                out->stub_bytes++;
             } else if (t != CODE_STATE_DATA && d != CODE_STATE_DATA &&
                 t != d) {
                 if (out->wrong_mode++ == 0 && out->first_wrong == 0)

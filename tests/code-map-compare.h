@@ -37,6 +37,7 @@ struct cm_pair {
     long first_difference;    /* index into the site lists, -1 if none */
     uint32_t want_at, got_at; /* the sites there (address * 4 + kind) */
     size_t total, data_as_code, wrong_mode, undecoded;
+    size_t stub_bytes;        /* Thumb stub halfwords the truth calls ARM */
     uint32_t first_wrong;
 };
 

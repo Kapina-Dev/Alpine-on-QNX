@@ -76,6 +76,12 @@ struct code_map_result {
 int code_map_build(const uint8_t *bytes, uint32_t base, size_t size,
     struct code_function *functions, size_t function_count,
     struct code_map_result *out);
+/* code_map_build with noreturn (sorted link addresses, no Thumb bit):
+   an unconditional call to one of them doesn't fall through. */
+int code_map_build_noreturn(const uint8_t *bytes, uint32_t base, size_t size,
+    struct code_function *functions, size_t function_count,
+    const uint32_t *noreturn, size_t noreturn_count,
+    struct code_map_result *out);
 void code_map_result_free(struct code_map_result *result);
 
 /*
@@ -90,5 +96,11 @@ void code_map_result_free(struct code_map_result *result);
  */
 int code_map_from_elf(const uint8_t *file, size_t file_size,
     struct code_map_result *out);
+
+/* Link addresses (no Thumb bit, sorted) that a call never returns from:
+   .dynsym functions and PLT entries named abort, __stack_chk_fail, ...
+   Returns how many; writes at most capacity. */
+size_t code_map_noreturn(const uint8_t *file, size_t file_size,
+    uint32_t *out, size_t capacity);
 
 #endif
